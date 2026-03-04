@@ -1105,6 +1105,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             self?.showAPIKeyInput(for: .gemini)
         })
         
+        // Add custom LLM base URL configuration
+        alert.addAction(UIAlertAction(title: "Configure Custom LLM Base URL", style: .default) { [weak self] _ in
+            self?.showCustomLLMBaseURLInput()
+        })
+        
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         
         present(alert, animated: true)
@@ -1199,6 +1204,40 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 self?.showMessage("\(providerName) API key cleared")
             })
         }
+        
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        
+        present(alert, animated: true)
+    }
+    
+    private func showCustomLLMBaseURLInput() {
+        let currentURL = LLMService.shared.getCustomLLMBaseURL()
+        
+        let alert = UIAlertController(
+            title: "Custom LLM Base URL",
+            message: "Optional: point the app to a self-hosted OpenAI-compatible endpoint.\n\nExample:\nhttp://YOUR_VM_IP:8000/v1",
+            preferredStyle: .alert
+        )
+        
+        alert.addTextField { textField in
+            textField.placeholder = "http://YOUR_VM_IP:8000/v1"
+            textField.text = currentURL.isEmpty ? nil : currentURL
+            textField.autocapitalizationType = .none
+            textField.autocorrectionType = .no
+            textField.keyboardType = .URL
+        }
+        
+        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
+            guard let text = alert.textFields?.first?.text else { return }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            LLMService.shared.setCustomLLMBaseURL(trimmed.isEmpty ? nil : trimmed)
+            self?.showMessage("Custom LLM base URL \(trimmed.isEmpty ? "cleared" : "saved")")
+        })
+        
+        alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { [weak self] _ in
+            LLMService.shared.setCustomLLMBaseURL(nil)
+            self?.showMessage("Custom LLM base URL cleared")
+        })
         
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         

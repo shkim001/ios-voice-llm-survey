@@ -17,8 +17,18 @@ enum APIProvider: String, CaseIterable {
 class LLMService {
     static let shared = LLMService()
     
-    private let openaiBaseURL = "https://api.openai.com/v1"
+  //  private let openaiBaseURL = "https://api.openai.com/v1"
+    private let openaiBaseURLDefault = "https://api.openai.com/v1"
     private let geminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
+    
+    /// When set (e.g. "http://YOUR_VM_IP:8000"), OpenAI requests use this base URL instead of api.openai.com (for GCP self-hosted LLM).
+    private let customLLMBaseURLKey = "LLM_Custom_Base_URL"
+       
+    private var openaiBaseURL: String {
+           let custom = UserDefaults.standard.string(forKey: customLLMBaseURLKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
+           if let url = custom, !url.isEmpty { return url }
+           return openaiBaseURLDefault
+    }
     
     private let apiProviderUserDefaultsKey = "LLM_API_Provider"
     private let openaiAPIKeyUserDefaultsKey = "OpenAI_API_Key"
@@ -78,6 +88,16 @@ class LLMService {
     // Method to check if API key is configured for specific provider
     func hasAPIKey(for provider: APIProvider) -> Bool {
         return !getAPIKey(for: provider).isEmpty
+    }
+    
+    /// Custom base URL for OpenAI-style endpoint (e.g. GCP VM). When set, use "OpenAI" provider and any non-empty API key (e.g. "gcp").
+    func getCustomLLMBaseURL() -> String {
+        return UserDefaults.standard.string(forKey: customLLMBaseURLKey) ?? ""
+    }
+        
+    func setCustomLLMBaseURL(_ url: String?) {
+        let trimmed = url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        UserDefaults.standard.set(trimmed.isEmpty ? nil : trimmed, forKey: customLLMBaseURLKey)
     }
     
     func generateSystemPrompt(questions: [Question]) -> String {
