@@ -207,7 +207,9 @@ class LLMService {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 60.0
+        // Local LLMs (e.g., Ollama on a VM) can take longer than OpenAI’s typical latency.
+        // Must be >= FastAPI's `requests.post(..., timeout=...)` to Ollama or iOS fails first.
+        request.timeoutInterval = 180.0
         
         // OpenAI API request body
         let requestBody: [String: Any] = [
@@ -295,7 +297,7 @@ class LLMService {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 60.0
+        request.timeoutInterval = 120.0
         
         // Gemini API request body
         let requestBody: [String: Any] = [
