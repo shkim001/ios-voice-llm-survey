@@ -1,0 +1,14 @@
+.DS_Store
+**/.DS_Store
+
+# Xcode user-specific files
+*.xcuserstate
+xcuserdata/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+

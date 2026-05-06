@@ -1,0 +1,245 @@
+import Foundation
+
+final class SurveyAPIClient {
+    static let shared = SurveyAPIClient()
+    private init() {}
+    
+    // MARK: - Settings
+    
+    private enum DefaultsKeys {
+        static let surveyAPIBaseURL = "SurveyAPI_Base_URL"
+        static let surveyAPIKey = "SurveyAPI_Key"
+    }
+    
+    var baseURLString: String {
+        get { UserDefaults.standard.string(forKey: DefaultsKeys.surveyAPIBaseURL) ?? "" }
+        set {
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            UserDefaults.standard.set(trimmed.isEmpty ? nil : trimmed, forKey: DefaultsKeys.surveyAPIBaseURL)
+        }
+    }
+    
+    var apiKey: String {
+        get { UserDefaults.standard.string(forKey: DefaultsKeys.surveyAPIKey) ?? "" }
+        set {
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            UserDefaults.standard.set(trimmed.isEmpty ? nil : trimmed, forKey: DefaultsKeys.surveyAPIKey)
+        }
+    }
+    
+    func isConfigured() -> Bool {
+        return !baseURLString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    
+    // MARK: - Models
+    
+    struct SessionCreateRequest: Encodable {
+        let questionnaireVersion: String
+        let appVersion: String?
+        let locale: String?
+        let respondentId: String?
+        
+        enum CodingKeys: String, CodingKey {
+            case questionnaireVersion = "questionnaire_version"
+            case appVersion = "app_version"
+            case locale
+            case respondentId = "respondent_id"
+        }
+    }
+    
+    struct SessionCreateResponse: Decodable {
+        let respondentId: String
+        let sessionId: String
+        let questionnaireVersion: String
+        
+        enum CodingKeys: String, CodingKey {
+            case respondentId = "respondent_id"
+            case sessionId = "session_id"
+            case questionnaireVersion = "questionnaire_version"
+        }
+    }
+    
+    struct AnswersBatch: Encodable {
+        let answers: [AnswerItem]
+    }
+    
+    struct AnswerItem: Encodable {
+        let questionId: String
+        let value: AnyJSON
+        
+        enum CodingKeys: String, CodingKey {
+            case questionId = "question_id"
+            case value
+        }
+    }
+    
+    // MARK: - API
+    
+    func createSession(questionnaireVersion: String, appVersion: String?, locale: String?) async throws -> SessionCreateResponse {
+        let body = SessionCreateRequest(
+            questionnaireVersion: questionnaireVersion,
+            appVersion: appVersion,
+            locale: locale,
+            respondentId: nil
+        )
+        return try await requestJSON(
+            method: "POST",
+            path: "/sessions",
+            body: body,
+            responseType: SessionCreateResponse.self
+        )
+    }
+    
+    func postAnswers(sessionId: String, answers: [[String: Any]]) async throws {
+        let items = answers.map { dict -> AnswerItem in
+            let qid = (dict["question_id"] as? String) ?? ""
+            let value = dict["value"] as? [String: Any] ?? [:]
+            return AnswerItem(questionId: qid, value: AnyJSON(value))
+        }.filter { !$0.questionId.isEmpty }
+        
+        let body = AnswersBatch(answers: items)
+        _ = try await requestData(
+            method: "POST",
+            path: "/sessions/\(sessionId)/answers",
+            body: body
+        )
+    }
+
+    struct TrajectoryBatch: Encodable {
+        let points: [PendingTrajectoryStore.Point]
+    }
+    
+    func postTrajectory(respondentId: String, points: [PendingTrajectoryStore.Point]) async throws {
+        let body = TrajectoryBatch(points: points)
+        _ = try await requestData(
+            method: "POST",
+            path: "/respondents/\(respondentId)/trajectory",
+            body: body
+        )
+    }
+    
+    // MARK: - Networking internals
+    
+    private func makeURL(path: String) throws -> URL {
+        let base = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty else {
+            throw SurveyAPIError.notConfigured
+        }
+        
+        var normalizedBase = base
+        if normalizedBase.hasSuffix("/") { normalizedBase.removeLast() }
+        
+        let normalizedPath = path.hasPrefix("/") ? path : "/" + path
+        guard let url = URL(string: normalizedBase + normalizedPath) else {
+            throw SurveyAPIError.invalidBaseURL
+        }
+        return url
+    }
+    
+    private func makeRequest(method: String, url: URL, bodyData: Data?) -> URLRequest {
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !apiKey.isEmpty {
+            req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        }
+        req.httpBody = bodyData
+        req.timeoutInterval = 20.0
+        return req
+    }
+    
+    private func requestJSON<T: Decodable, B: Encodable>(
+        method: String,
+        path: String,
+        body: B,
+        responseType: T.Type
+    ) async throws -> T {
+        let data = try await requestData(method: method, path: path, body: body)
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.decodingFailed(rawPreview: String(raw.prefix(300)))
+        }
+    }
+    
+    private func requestData<B: Encodable>(method: String, path: String, body: B) async throws -> Data {
+        let url = try makeURL(path: path)
+        let encoder = JSONEncoder()
+        let bodyData = try encoder.encode(body)
+        
+        let req = makeRequest(method: method, url: url, bodyData: bodyData)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        
+        guard let http = response as? HTTPURLResponse else {
+            throw SurveyAPIError.invalidHTTPResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.httpError(statusCode: http.statusCode, bodyPreview: String(raw.prefix(500)))
+        }
+        return data
+    }
+}
+
+// MARK: - Errors
+
+enum SurveyAPIError: LocalizedError {
+    case notConfigured
+    case invalidBaseURL
+    case invalidHTTPResponse
+    case httpError(statusCode: Int, bodyPreview: String)
+    case decodingFailed(rawPreview: String)
+    
+    var errorDescription: String? {
+        switch self {
+        case .notConfigured:
+            return "Survey API is not configured. Set Survey API Base URL in Settings."
+        case .invalidBaseURL:
+            return "Survey API base URL is invalid."
+        case .invalidHTTPResponse:
+            return "Invalid HTTP response from Survey API."
+        case .httpError(let status, let preview):
+            return "Survey API error (HTTP \(status)).\n\n\(preview)"
+        case .decodingFailed(let preview):
+            return "Failed to decode Survey API response.\n\n\(preview)"
+        }
+    }
+}
+
+// MARK: - AnyJSON (minimal heterogeneous JSON encoder)
+
+struct AnyJSON: Encodable {
+    private let value: Any
+    
+    init(_ value: Any) {
+        self.value = value
+    }
+    
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        
+        switch value {
+        case is NSNull:
+            try container.encodeNil()
+        case let v as String:
+            try container.encode(v)
+        case let v as Bool:
+            try container.encode(v)
+        case let v as Int:
+            try container.encode(v)
+        case let v as Double:
+            try container.encode(v)
+        case let v as Float:
+            try container.encode(v)
+        case let v as [String: Any]:
+            try container.encode(v.mapValues { AnyJSON($0) })
+        case let v as [Any]:
+            try container.encode(v.map { AnyJSON($0) })
+        default:
+            // Fallback: best-effort stringification to avoid crashing uploads
+            try container.encode(String(describing: value))
+        }
+    }
+}
+

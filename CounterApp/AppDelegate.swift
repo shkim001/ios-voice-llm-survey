@@ -5,6 +5,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         // Custom setup after the application launches
+        // Start trajectory tracking if Survey API is configured and we have a respondent identity.
+        TrajectoryTracker.shared.startIfPossible()
         return true
     }
 

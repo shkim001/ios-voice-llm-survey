@@ -20,11 +20,25 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private var audioPlayer: AVAudioPlayer?
     private var recordingURL: URL?
     
+    // Per-participant session (local-only separation)
+    private var sessionId: String?
+    private var sessionDirectoryURL: URL?
+    
+    // Cloud (Survey API / Cloud SQL) session
+    private var cloudRespondentId: String?
+    private var cloudSessionId: String?
+    
+    // Inactivity auto-reset
+    private var inactivityTimer: Timer?
+    private let inactivityTimeoutSeconds: TimeInterval = 180
+    
     // Questionnaire and analysis
     private var questionnaireData: QuestionnaireData?
     private var transcription: String?
     private var matchedQuestions: [MatchedQuestion] = []
     private var respondentInfo: RespondentInfo?
+    /// Set when pushing from `MapViewController`; passed into the respondent form until a successful submit.
+    var mapLocationPrefill: MapLocationPayload?
     
     // MARK: - Lifecycle
     override func viewDidLoad() {
@@ -32,6 +46,23 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         loadQuestionnaire()
         requestSpeechPermission()
         setupUI()
+        initializeSessionAndPurge()
+        resetInactivityTimer()
+        
+        // Best-effort: resend any pending uploads from prior runs
+        Task { [weak self] in
+            await self?.flushPendingSurveyUploads()
+        }
+    }
+    
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        resetInactivityTimer()
+    }
+    
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        invalidateInactivityTimer()
     }
     
     // MARK: - UI Setup
@@ -124,10 +155,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     
     // MARK: - Button Actions
     @IBAction func recordButtonTapped(_ sender: UIButton) {
+        resetInactivityTimer()
         // If not recording, show info form first
         if !isRecording {
-            // Clear previous respondent info when starting new recording
-            respondentInfo = nil
+            // Clear previous state when starting a new recording (same participant/session unless "Start next participant" was used)
             transcription = nil
             matchedQuestions = []
             
@@ -138,10 +169,18 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             exportButton.alpha = 0.5
             
             showRespondentInfoForm { [weak self] info in
-                self?.respondentInfo = info
+                guard let self = self else { return }
+                self.respondentInfo = info
+                
+                // Create a Cloud session up-front (best-effort). If it fails, we can still enqueue answers later.
+                Task { [weak self] in
+                    await self?.ensureCloudSessionCreated()
+                }
+                
                 // Start recording after info is submitted
-                self?.isRecording = true
-                self?.startRecording()
+                self.isRecording = true
+                self.startRecording()
+                self.resetInactivityTimer()
             }
             animateButton(sender)
             return
@@ -154,6 +193,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
     
     @IBAction func playButtonTapped(_ sender: UIButton) {
+        resetInactivityTimer()
         guard let url = recordingURL else {
             showMessage("No recording to play")
             return
@@ -191,6 +231,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
     
     @IBAction func llmButtonTapped(_ sender: UIButton) {
+        resetInactivityTimer()
         guard let recordingURL = recordingURL else {
             showMessage("No recording available. Please record first.")
             return
@@ -253,6 +294,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         self.llmButton.isEnabled = true
                         self.llmButton.alpha = 1.0
                     }
+                    
+                    // Best-effort: upload answers to Survey API (Cloud SQL) or enqueue if offline/unconfigured
+                    Task { [weak self] in
+                        await self?.uploadAnswersToCloud(transcription: transcription, matchedQuestions: matchedQuestions)
+                    }
                 } catch {
                     DispatchQueue.main.async {
                         let errorMessage = error.localizedDescription
@@ -281,6 +327,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
     
     @IBAction func exportButtonTapped(_ sender: UIButton) {
+        resetInactivityTimer()
         guard let transcription = transcription, !matchedQuestions.isEmpty else {
             showMessage("No analysis data to export")
             return
@@ -304,6 +351,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 "questionnaire_title": questionnaireData?.questionnaire.title ?? "Unknown"
             ],
             "timestamp": timestamp,
+            "session_id": sessionId ?? "",
             "respondent_info": [
                 "name": respondentInfo.name,
                 "age": respondentInfo.age,
@@ -337,21 +385,31 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             return
         }
         
-        // Save to app-specific directory
-        let fileName = "survey_results_\(Date().timeIntervalSince1970).json"
+        // Save into the current per-participant session folder
+        let fileName = "survey_results_\(sessionId ?? "unknown")_\(Date().timeIntervalSince1970).json"
         
-        guard let exportsDirectory = try? ensureExportsDirectory() else {
-            statusLabel.text = "Failed to create directory"
+        let sessionFileURL: URL
+        do {
+            let session = try SessionManager.shared.ensureCurrentSession()
+            sessionId = session.id
+            sessionDirectoryURL = session.directoryURL
+            sessionFileURL = session.directoryURL.appendingPathComponent(fileName)
+        } catch {
+            statusLabel.text = "Failed to create session directory"
             statusLabel.textColor = .systemRed
-            showMessage("Unable to create or access the export directory")
+            showMessage("Unable to create or access the session directory: \(error.localizedDescription)")
             animateButton(sender)
             return
         }
         
-        let fileURL = exportsDirectory.appendingPathComponent(fileName)
-        
         do {
-            try jsonData.write(to: fileURL)
+            try jsonData.write(to: sessionFileURL)
+            
+            // Mirror into SurveyExports as well (keeps aggregation/clear flows working)
+            if let exportsDirectory = try? ensureExportsDirectory() {
+                let mirrorURL = exportsDirectory.appendingPathComponent(fileName)
+                try? jsonData.write(to: mirrorURL)
+            }
             
             // Show export success
             statusLabel.text = "JSON exported successfully!\nSaved to App Folder"
@@ -360,7 +418,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             // Show success message with file location
             let alert = UIAlertController(
                 title: "Export Successful",
-                message: "File saved to:\n\(fileName)\n\nLocation: App Folder/SurveyExports\n\nYou can access it via Files app or iTunes File Sharing.",
+                message: "File saved to:\n\(fileName)\n\nLocation: App Folder/SurveySessions/\(sessionId ?? "unknown")\n\n(Also mirrored to App Folder/SurveyExports for aggregation.)",
                 preferredStyle: .alert
             )
             alert.addAction(UIAlertAction(title: "View JSON", style: .default) { _ in
@@ -369,13 +427,16 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             })
             alert.addAction(UIAlertAction(title: "Share", style: .default) { _ in
                 // Show share sheet
-                self.shareFile(url: fileURL)
+                self.shareFile(url: sessionFileURL)
+            })
+            alert.addAction(UIAlertAction(title: "Start next participant", style: .default) { [weak self] _ in
+                self?.startNextParticipant()
             })
             alert.addAction(UIAlertAction(title: "OK", style: .cancel))
             present(alert, animated: true)
             
             // Also print file path for debugging
-            print("File saved to: \(fileURL.path)")
+            print("File saved to: \(sessionFileURL.path)")
             
         } catch {
             statusLabel.text = "Export failed"
@@ -387,6 +448,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
     
     @IBAction func aggregateButtonTapped(_ sender: UIButton) {
+        resetInactivityTimer()
         animateButton(sender)
         
         // Show action menu
@@ -864,6 +926,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
     
     private func startRecording() {
+        resetInactivityTimer()
         let audioSession = AVAudioSession.sharedInstance()
         
         do {
@@ -874,10 +937,19 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             return
         }
         
-        let fileName = "recording_\(Date().timeIntervalSince1970).m4a"
-        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let url = documentsPath.appendingPathComponent(fileName)
-        recordingURL = url
+        let url: URL
+        do {
+            // Create/ensure per-participant session folder and store recording inside it
+            let session = try SessionManager.shared.ensureCurrentSession()
+            sessionId = session.id
+            sessionDirectoryURL = session.directoryURL
+            
+            url = try SessionManager.shared.makeRecordingURL()
+            recordingURL = url
+        } catch {
+            showMessage("Failed to create session/recording path: \(error.localizedDescription)")
+            return
+        }
         
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
@@ -900,6 +972,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
     
     private func stopRecording() {
+        resetInactivityTimer()
         audioRecorder?.stop()
         
         recordButton.setTitle("Start Recording", for: .normal)
@@ -920,6 +993,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     
     // MARK: - Speech Recognition
     private func transcribeAudio(url: URL, completion: @escaping (String?) -> Void) {
+        resetInactivityTimer()
         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")) else {
             completion(nil)
             return
@@ -984,6 +1058,95 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             UIView.animate(withDuration: 0.1) {
                 button.transform = CGAffineTransform.identity
             }
+        }
+    }
+    
+    // MARK: - Multi-user session helpers
+    
+    private func initializeSessionAndPurge() {
+        // Best-effort purge of old sessions (local-only retention)
+        SessionManager.shared.purgeOldSessions(keepLast: 50, maxAgeDays: 7)
+        
+        do {
+            let session = try SessionManager.shared.startNewSession()
+            sessionId = session.id
+            sessionDirectoryURL = session.directoryURL
+        } catch {
+            sessionId = nil
+            sessionDirectoryURL = nil
+        }
+    }
+    
+    private func startNextParticipant(discardCurrentRecording: Bool = true) {
+        // Stop any active recording/playback and optionally remove the current recording file
+        if isRecording {
+            isRecording = false
+            audioRecorder?.stop()
+        }
+        
+        if let player = audioPlayer, player.isPlaying {
+            player.stop()
+        }
+        audioPlayer = nil
+        audioRecorder = nil
+        
+        if discardCurrentRecording, let url = recordingURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+        
+        // Clear participant-specific state
+        respondentInfo = nil
+        transcription = nil
+        matchedQuestions = []
+        cloudRespondentId = nil
+        cloudSessionId = nil
+        TrajectoryTracker.shared.setCurrentIdentity(respondentId: nil, sessionId: nil)
+        recordedData = nil
+        recordingURL = nil
+        
+        // Reset UI state
+        recordButton.setTitle("Start Recording", for: .normal)
+        recordButton.backgroundColor = .systemRed
+        playButton.isEnabled = false
+        exportButton.isEnabled = false
+        playButton.alpha = 0.5
+        exportButton.alpha = 0.5
+        llmButton.isEnabled = false
+        llmButton.alpha = 0.5
+        
+        statusLabel.text = "Ready for next participant"
+        statusLabel.textColor = .systemGray
+        
+        // Start a fresh session
+        do {
+            let session = try SessionManager.shared.startNewSession()
+            sessionId = session.id
+            sessionDirectoryURL = session.directoryURL
+        } catch {
+            sessionId = nil
+            sessionDirectoryURL = nil
+        }
+        
+        resetInactivityTimer()
+    }
+    
+    // MARK: - Inactivity auto-reset
+    
+    private func resetInactivityTimer() {
+        invalidateInactivityTimer()
+        inactivityTimer = Timer.scheduledTimer(withTimeInterval: inactivityTimeoutSeconds, repeats: false) { [weak self] _ in
+            self?.handleInactivityTimeout()
+        }
+    }
+    
+    private func invalidateInactivityTimer() {
+        inactivityTimer?.invalidate()
+        inactivityTimer = nil
+    }
+    
+    private func handleInactivityTimeout() {
+        DispatchQueue.main.async {
+            self.startNextParticipant(discardCurrentRecording: true)
         }
     }
     
@@ -1108,6 +1271,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         // Add custom LLM base URL configuration
         alert.addAction(UIAlertAction(title: "Configure Custom LLM Base URL", style: .default) { [weak self] _ in
             self?.showCustomLLMBaseURLInput()
+        })
+        
+        // Survey API configuration (Cloud SQL persistence)
+        alert.addAction(UIAlertAction(title: "Configure Survey API Base URL", style: .default) { [weak self] _ in
+            self?.showSurveyAPIBaseURLInput()
+        })
+        alert.addAction(UIAlertAction(title: "Configure Survey API Key", style: .default) { [weak self] _ in
+            self?.showSurveyAPIKeyInput()
         })
         
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
@@ -1242,6 +1413,169 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         
         present(alert, animated: true)
+    }
+    
+    // MARK: - Survey API (Cloud SQL) Settings
+    
+    private func showSurveyAPIBaseURLInput() {
+        let current = SurveyAPIClient.shared.baseURLString
+        let alert = UIAlertController(
+            title: "Survey API Base URL",
+            message: "Set the base URL for your FastAPI server.\n\nExample:\nhttps://YOUR_DOMAIN\nor\nhttp://YOUR_VM_IP:8000",
+            preferredStyle: .alert
+        )
+        
+        alert.addTextField { textField in
+            textField.placeholder = "https://YOUR_DOMAIN"
+            textField.text = current.isEmpty ? nil : current
+            textField.autocapitalizationType = .none
+            textField.autocorrectionType = .no
+            textField.keyboardType = .URL
+        }
+        
+        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
+            let text = alert.textFields?.first?.text ?? ""
+            SurveyAPIClient.shared.baseURLString = text
+            self?.showMessage("Survey API base URL \(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "cleared" : "saved")")
+        })
+        
+        alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { [weak self] _ in
+            SurveyAPIClient.shared.baseURLString = ""
+            self?.showMessage("Survey API base URL cleared")
+        })
+        
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
+    }
+    
+    private func showSurveyAPIKeyInput() {
+        let current = SurveyAPIClient.shared.apiKey
+        let hasExisting = !current.isEmpty
+        let alert = UIAlertController(
+            title: "Survey API Key",
+            message: "Optional: set X-API-Key for your Survey API server.",
+            preferredStyle: .alert
+        )
+        
+        alert.addTextField { textField in
+            if hasExisting {
+                textField.placeholder = "API key is configured (enter new key to update)"
+                let masked = String(current.prefix(6)) + "..." + String(current.suffix(4))
+                textField.text = masked
+            } else {
+                textField.placeholder = "Enter API key (optional)"
+            }
+            textField.isSecureTextEntry = true
+            textField.autocapitalizationType = .none
+            textField.autocorrectionType = .no
+        }
+        
+        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
+            let text = (alert.textFields?.first?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if hasExisting {
+                let masked = String(current.prefix(6)) + "..." + String(current.suffix(4))
+                if text == masked {
+                    self?.showMessage("Survey API key unchanged")
+                    return
+                }
+            }
+            SurveyAPIClient.shared.apiKey = text
+            self?.showMessage(text.isEmpty ? "Survey API key cleared" : "Survey API key saved")
+        })
+        
+        if hasExisting {
+            alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { [weak self] _ in
+                SurveyAPIClient.shared.apiKey = ""
+                self?.showMessage("Survey API key cleared")
+            })
+        }
+        
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
+    }
+    
+    // MARK: - Survey API (Cloud SQL) Upload Flow
+    
+    private func appVersionString() -> String? {
+        let dict = Bundle.main.infoDictionary
+        let short = dict?["CFBundleShortVersionString"] as? String
+        let build = dict?["CFBundleVersion"] as? String
+        if let short, let build { return "\(short) (\(build))" }
+        return short ?? build
+    }
+    
+    private func ensureCloudSessionCreated() async {
+        guard SurveyAPIClient.shared.isConfigured() else { return }
+        if cloudSessionId != nil { return }
+        
+        do {
+            let resp = try await SurveyAPIClient.shared.createSession(
+                questionnaireVersion: "1",
+                appVersion: appVersionString(),
+                locale: Locale.current.identifier
+            )
+            cloudRespondentId = resp.respondentId
+            cloudSessionId = resp.sessionId
+            TrajectoryTracker.shared.setCurrentIdentity(respondentId: resp.respondentId, sessionId: resp.sessionId)
+        } catch {
+            // Best-effort: don't block the survey; answers will be enqueued on upload attempt.
+            print("Survey API createSession failed: \(error.localizedDescription)")
+        }
+    }
+    
+    private func uploadAnswersToCloud(transcription: String, matchedQuestions: [MatchedQuestion]) async {
+        guard !matchedQuestions.isEmpty else { return }
+        guard SurveyAPIClient.shared.isConfigured() else { return }
+        
+        if cloudSessionId == nil {
+            await ensureCloudSessionCreated()
+        }
+        guard let sid = cloudSessionId else { return }
+        
+        let info = respondentInfo
+        let answers: [[String: Any]] = matchedQuestions.map { mq in
+            let value: [String: Any] = [
+                "extracted_answer": mq.extractedAnswer,
+                "confidence": mq.confidence,
+                "clarification_needed": mq.clarificationNeeded,
+                "matched_question": mq.matchedQuestion,
+                "transcription": transcription,
+                "location": info?.location ?? ""
+            ]
+            return [
+                "question_id": String(mq.matchedQuestionId),
+                "value": value
+            ]
+        }
+        
+        do {
+            try await SurveyAPIClient.shared.postAnswers(sessionId: sid, answers: answers)
+        } catch {
+            PendingSurveyUploadStore.shared.enqueue(sessionId: sid, answers: answers)
+            print("Survey API postAnswers failed; enqueued pending batch: \(error.localizedDescription)")
+        }
+    }
+    
+    private func flushPendingSurveyUploads() async {
+        guard SurveyAPIClient.shared.isConfigured() else { return }
+        let batches = PendingSurveyUploadStore.shared.drain()
+        guard !batches.isEmpty else { return }
+        
+        for batch in batches {
+            let answers: [[String: Any]] = batch.answers.map { item in
+                let value: [String: Any] = item.value.mapValues { $0.value }
+                return [
+                    "question_id": item.questionId,
+                    "value": value
+                ]
+            }
+            do {
+                try await SurveyAPIClient.shared.postAnswers(sessionId: batch.sessionId, answers: answers)
+            } catch {
+                PendingSurveyUploadStore.shared.requeue(batch)
+                break
+            }
+        }
     }
     
     // MARK: - Respondent Info Form
