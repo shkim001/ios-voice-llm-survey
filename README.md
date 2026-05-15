@@ -1,174 +1,280 @@
 # Questionnaire LLM iOS App
 
-A Swift-based iOS application that helps field researchers collect qualitative feedback about specific locations or streets. The app can record audio, transcribe speech, and leverage LLM to match responses with questionnaire questions.
+A Swift iOS app for field researchers to collect location-based street assessments. Participants record spoken responses; the app transcribes audio, matches answers to survey questions with an LLM, and optionally uploads results and GPS trajectories to a backend (FastAPI + MySQL / Cloud SQL).
 
-## Feature Highlights
+## Architecture
 
-- **Audio Capture** – Start and stop recording with a single tap
-- **Immediate Playback** – Review the captured audio without leaving the app
-- **Speech-to-Text** – Convert recordings to text using Apple's Speech framework
-- **LLM Matching** – Send transcripts to LLM API (OpenAI or Gemini) and align answers with questionnaire items
-- **Multi-API Support** – Choose between OpenAI and Gemini API providers (OpenAI recommended for better results)
-- **API Key Management** – Configure API keys for both providers through in-app settings (no code modification required)
-- **JSON Export** – Save structured results for reporting or sharing
-- **On-Device Aggregation** – Summarize previously exported survey data into human-readable stats
-- **Questionnaire Browsing** – View the complete questionnaire question list within the app
-- **Respondent Information** – Collect and manage basic information about respondents
+```mermaid
+flowchart LR
+  iOS[iOS App]
+  LLM[LLM API]
+  API[Survey API / FastAPI]
+  DB[(MySQL / Cloud SQL)]
 
-## Project Structure
-
-```
-CounterApp/
-├── CounterApp.xcodeproj          # Xcode project file
-├── CounterApp/                    # Main application directory
-│   ├── AppDelegate.swift          # Application delegate
-│   ├── SceneDelegate.swift       # Scene delegate
-│   ├── ViewController.swift      # Main view controller (recording and playback)
-│   ├── QuestionnaireModels.swift # Questionnaire data models
-│   ├── LLMService.swift          # LLM API service
-│   ├── QuestionnaireViewController.swift  # Questionnaire browsing view
-│   ├── QuestionPageViewController.swift    # Question detail view
-│   ├── RespondentInfoViewController.swift # Respondent information view
-│   ├── LocationAggregationViewController.swift # Data aggregation view
-│   ├── questionnaire.json        # Questionnaire configuration file
-│   ├── Base.lproj/               # Storyboard files
-│   │   ├── Main.storyboard
-│   │   └── LaunchScreen.storyboard
-│   └── Assets.xcassets/          # Application assets
-├── CounterAppTests/              # Unit tests
-├── CounterAppUITests/            # UI tests
-└── README.md                     # This file
+  iOS -->|transcription + chat/completions| LLM
+  iOS -->|sessions, answers, trajectory| API
+  API --> DB
 ```
 
-## Getting Started
+| Component | Role |
+|-----------|------|
+| **iOS app** | Record audio, speech-to-text, LLM matching, local JSON export, optional cloud upload |
+| **LLM** | OpenAI, Gemini, or a **self-hosted OpenAI-compatible** endpoint on a VM |
+| **Survey API** (`server/`) | Persists respondents, sessions, answers, and trajectory points |
+| **MySQL** | Cloud SQL or any MySQL 8+ instance the Survey API connects to |
 
-### Prerequisites
+You can run in **local-only** mode (export JSON on device, no server) or **full study** mode (Survey API + database + optional VM LLM).
 
-- **macOS** – Required to run Xcode
-- **Xcode 15.0 or later** – For development and building the app
-- **iOS 17.0 or later** – Supports simulator or physical device
-- **Swift 5.0 or later** – Programming language version requirement
-- **LLM API Key** – OpenAI or Gemini API key for LLM functionality (can be configured in-app)
-  - **OpenAI API Key** (Recommended) – Get from: https://platform.openai.com/api-keys
-  - **Gemini API Key** (Alternative) – Get from: https://makersuite.google.com/app/apikey
-  - **Note**: OpenAI generally provides better results for this use case, but Gemini is also supported
+---
 
-### Running the App
+## Prerequisites
 
-1. **Clone or Download the Project**
+### iOS development
+
+- macOS with **Xcode 15+**
+- **iOS 17+** (simulator or physical device)
+- Apple Developer signing for device installs
+
+### LLM (pick one)
+
+- **OpenAI** API key — [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (recommended)
+- **Gemini** API key — [Google AI Studio](https://aistudio.google.com/apikey)
+- **Self-hosted** OpenAI-compatible API on a VM (Ollama + proxy, vLLM, etc.)
+
+### Survey API (optional, for cloud storage)
+
+- Python 3.10+
+- MySQL database (e.g. Google Cloud SQL) with schema for `respondents`, `survey_sessions`, `questions`, `answers`
+- A host to run `uvicorn` (GCP VM, Cloud Run, etc.)
+
+---
+
+## Quick start — iOS app
+
+1. **Clone the repository**
+
    ```bash
-   # If cloning from GitHub
-   git clone <repository-url>
-   cd week5/CounterApp
+   git clone https://github.com/kogawa-hash/ios-voice-llm-survey.git
+   cd ios-voice-llm-survey
    ```
 
-2. **Open the Project**
+2. **Open in Xcode**
+
    ```bash
    open CounterApp.xcodeproj
    ```
-   Or double-click `CounterApp.xcodeproj` in Finder
 
-3. **Select a Target Device**
-   - Choose a target device from the top toolbar in Xcode
-   - You can select an iOS simulator (e.g., iPhone 15, iPhone 15 Pro, etc.)
-   - Or connect a physical device for testing
+3. **Select a run destination** (simulator or connected iPhone) and press **⌘R**.
 
-4. **Verify Configuration Files**
-   - In Xcode's project navigator, ensure the `questionnaire.json` file is included in the `CounterApp` folder
-   - Check that the file is added to the project target (check Target Membership in File Inspector)
+4. **Confirm** `CounterApp/questionnaire.json` is present in the project (it ships with the app target).
 
-5. **Build and Run**
-   - Press **⌘ + R** or click the Run button in the top-left corner of Xcode
-   - The first run may take a few minutes as dependencies are downloaded and compiled
-   - If you encounter signing issues, configure your developer account in Signing & Capabilities
+5. **Configure the app** (gear icon in the navigation bar). See [In-app settings](#in-app-settings) below.
 
-6. **Configure LLM API Key**
-   - After launching the app, tap the **Settings** button in the top-right corner of the navigation bar
-   - **Select API Provider**: Choose between OpenAI or Gemini
-     - **OpenAI** (Recommended) – Generally provides better accuracy and results for questionnaire matching
-     - **Gemini** (Alternative) – Supported as an alternative option
-   - **Configure API Keys**: Enter API keys for your chosen provider(s)
-     - OpenAI API key: Get from https://platform.openai.com/api-keys
-     - Gemini API key: Get from https://makersuite.google.com/app/apikey
-   - The API keys will be securely stored in UserDefaults and persist across app launches
-   - **Important**: You must configure at least one API key before using the LLM Recognition feature
-   - **Note**: You can configure both API keys and switch between providers at any time in settings
+6. **Grant permissions** when prompted:
+   - Microphone — recording
+   - Speech recognition — transcription
+   - Location — trajectory upload when Survey API is configured (When In Use, then Always for background tracking)
 
-7. **Permission Settings**
-   - When using the recording feature for the first time, the app will request microphone permission
-   - When using the speech recognition feature for the first time, the app will request speech recognition permission
-   - Please tap "Allow" in the system permission dialog
-   - If you accidentally denied permission, you can re-authorize in Settings > Privacy & Security > Microphone/Speech Recognition
+---
 
-## Usage Guide
+## In-app settings
 
-### Basic Workflow
+Open **Settings** (gear) from the main screen.
 
-1. **Record Audio**
-   - Tap the "Record" button to start recording
-   - Tap again to stop recording
-   - Recording status will be displayed in the status label
+### LLM
 
-2. **Playback Recording**
-   - After recording, tap the "Play" button to playback the recording
-   - Ensure the recording was successful before proceeding
+| Setting | When to use |
+|---------|-------------|
+| **Select API Provider** | OpenAI (default) or Gemini |
+| **Configure OpenAI / Gemini API Key** | Required for cloud LLM providers |
+| **Configure Custom LLM Base URL** | Point at a self-hosted OpenAI-compatible API, e.g. `http://YOUR_VM_IP:11434/v1` |
 
-3. **Speech-to-Text**
-   - After recording, the app will automatically perform speech recognition
-   - Transcription results will be displayed on the interface
+**Self-hosted LLM (VM):**
 
-4. **LLM Matching**
-   - Tap the "LLM Recognition" button
-   - The app will send the transcription text to the selected LLM API (OpenAI or Gemini)
-   - Returns matched questionnaire questions and extracted answers
-   - **Note**: OpenAI is recommended for better accuracy, but you can switch to Gemini in settings if preferred
+1. Set provider to **OpenAI**.
+2. Set **Custom LLM Base URL** to your proxy base including `/v1` (the app calls `{baseURL}/chat/completions`).
+3. Enter any non-empty API key if your proxy does not require one (e.g. `local`).
+4. Your proxy must accept model name **`gpt-4o-mini`** (hardcoded in the app) or map that name to your local model.
+5. Allow long responses: the iOS client uses a **180s** timeout for OpenAI-style requests.
 
-5. **View Questionnaire**
-   - Tap the document icon in the navigation bar to view the complete questionnaire
-   - You can browse all questions and their types
+**Public OpenAI / Gemini:** leave Custom LLM Base URL empty and use a real API key for the selected provider.
 
-6. **Fill Respondent Information**
-   - You can fill in basic information about respondents during the questionnaire flow
-   - Includes name, age, gender, phone, and location
+### Survey API (cloud persistence)
 
-7. **Export Data**
-   - Tap the "Export JSON" button to export survey results
-   - Files will be saved to the app's Documents directory
-   - Can be accessed through the Files app or iTunes file sharing
+| Setting | When to use |
+|---------|-------------|
+| **Configure Survey API Base URL** | Base URL of your FastAPI server, e.g. `https://api.example.com` or `http://YOUR_VM_IP:8000` (no trailing slash required) |
+| **Configure Survey API Key** | Must match `API_KEY` in `server/.env` if the server enforces it; leave empty if `API_KEY` is unset |
 
-8. **Data Aggregation**
-   - Tap the "Aggregate" button to view statistics of exported data
-   - Can aggregate multiple survey results and generate reports
+When the Survey API is configured:
 
-## Key Concepts Covered
+- After **LLM Recognition**, matched answers are posted to `POST /sessions/{id}/answers`.
+- Failed uploads are **queued locally** and retried on the next launch.
+- **Trajectory** points are uploaded when a cloud session exists and location permission allows.
 
-This application covers the following core iOS development technologies:
+---
 
-- **UIKit Fundamentals** – View controllers, storyboards, and Auto Layout
-- **Audio APIs** – Recording and playback using `AVFoundation`
-- **Speech Recognition** – Converting audio files to text via the `Speech` framework
-- **Networking** – Calling LLM REST APIs (OpenAI and Gemini) using `URLSession`
-- **JSON Handling** – Decoding and encoding structured survey data using the `Codable` protocol
-- **File Management** – Writing export files to the app's documents directory using `FileManager`
-- **User Preferences** – Securely storing API keys and app settings using `UserDefaults`
-- **Navigation Controller** – Managing view hierarchy using `UINavigationController`
-- **Data Models** – Defining data models using Swift structs and enums
+## Survey API setup (`server/`)
 
-## Tech Stack
+### 1. Environment
 
-- **Development Language**: Swift 5.0+
-- **Minimum iOS Version**: iOS 17.0
-- **Development Tool**: Xcode 15.0+
-- **Main Frameworks**:
-  - `UIKit` - User interface
-  - `AVFoundation` - Audio recording and playback
-  - `Speech` - Speech recognition
-  - `Foundation` - Basic functionality (JSON, file management, etc.)
+```bash
+cd server
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```bash
+MYSQL_HOST=your-mysql-host
+MYSQL_PORT=3306
+MYSQL_USER=app_user
+MYSQL_PASSWORD=your-password
+MYSQL_DATABASE=survey
+
+# Optional: require X-API-Key header on all mutating routes (leave empty to disable)
+API_KEY=your-shared-secret
+```
+
+### 2. Install and run
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Verify:
+
+```bash
+curl http://localhost:8000/health
+# {"ok":true}
+```
+
+Use HTTPS in production, or configure firewall rules so only trusted clients reach the API.
+
+### 3. Database schema
+
+Ensure MySQL has tables for respondents, sessions, questions, and answers (your existing study schema). Then apply trajectory support:
+
+```bash
+mysql -h "$MYSQL_HOST" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" < schema.sql
+```
+
+### 4. Seed questionnaire rows
+
+Answer inserts reference `questions.id`. Load rows from the app’s questionnaire file:
+
+```bash
+export $(grep -v '^#' .env | xargs)
+python3 scripts/seed_questions.py ../CounterApp/questionnaire.json
+```
+
+### 5. API surface
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Health check |
+| `POST` | `/sessions` | Create respondent + session |
+| `POST` | `/sessions/{session_id}/answers` | Batch upload LLM-matched answers |
+| `POST` | `/respondents/{respondent_id}/trajectory` | Upload GPS points |
+| `GET` | `/respondents/{respondent_id}/trajectory` | Read back trajectory |
+| `POST` | `/llm-events` | Optional LLM telemetry |
+
+Authenticated requests send header `X-API-Key: <API_KEY>` when `API_KEY` is set in `.env`.
+
+### 6. Point the iOS app at the server
+
+In app **Settings**:
+
+- **Survey API Base URL** — e.g. `http://YOUR_VM_IP:8000`
+- **Survey API Key** — same value as `API_KEY` in `.env` (if used)
+
+---
+
+## Self-hosted LLM on a VM (outline)
+
+This repo does not include the LLM proxy itself; the iOS app expects an **OpenAI-compatible** HTTP API. A typical GCP setup:
+
+1. **VM** with Ollama (or similar) listening on an internal port (e.g. `11434`).
+2. **Small proxy** (FastAPI/Flask) that exposes `POST /v1/chat/completions`, forwards to Ollama, and maps model `gpt-4o-mini` to your local model name.
+3. **Firewall**: open the proxy port to your study devices (or use VPN), not necessarily the raw Ollama port.
+4. **iOS**: Custom LLM Base URL = `http://VM_IP:PROXY_PORT/v1`, provider = OpenAI, placeholder API key if unused.
+
+Use a **different port** than the Survey API unless a reverse proxy routes `/v1` vs `/sessions` on one host.
+
+**HTTP on device:** iOS blocks cleartext HTTP unless allowed in App Transport Security. `Info.plist` may list specific VM IPs; for a new host, add an ATS exception in Xcode or serve the LLM over HTTPS.
+
+---
+
+## Usage workflow
+
+1. **Record** — tap Record, speak, tap again to stop.
+2. **Play** (optional) — review the recording.
+3. **Transcribe** — runs automatically after recording (English locale).
+4. **LLM Recognition** — sends the transcript to the configured LLM; shows matched questions and extracted answers.
+5. **Respondent info** — prompted when exporting or as part of your study flow.
+6. **Export JSON** — saves session data under the app Documents directory (`SurveySessions/`).
+7. **Aggregate** — summarizes previously exported JSON files on device.
+
+If Survey API is configured, step 4 also uploads answers to the server (or enqueues them offline).
+
+---
+
+## Project structure
+
+```
+ios-voice-llm-survey/
+├── CounterApp.xcodeproj
+├── CounterApp/
+│   ├── ViewController.swift           # Main voice survey UI
+│   ├── LLMService.swift               # OpenAI / Gemini / custom base URL
+│   ├── SurveyAPIClient.swift          # FastAPI client
+│   ├── TrajectoryTracker.swift        # Location upload
+│   ├── SessionManager.swift           # Local session folders
+│   ├── PendingSurveyUploadStore.swift # Offline answer queue
+│   ├── MapViewController.swift        # Map-first entry (optional)
+│   ├── questionnaire.json
+│   └── ...
+├── CounterAppTests/
+├── CounterAppUITests/
+├── server/
+│   ├── app/main.py                    # FastAPI Survey API
+│   ├── schema.sql                     # trajectory_points table
+│   ├── scripts/seed_questions.py
+│   ├── requirements.txt
+│   └── .env.example
+└── README.md
+```
+
+---
+
+## Troubleshooting
+
+| Issue | What to check |
+|-------|----------------|
+| LLM timeout / failure | VM proxy running; model name mapping for `gpt-4o-mini`; timeout ≥ 180s on proxy chain |
+| Survey API 401 | `X-API-Key` in app matches `API_KEY` in `.env` |
+| Answers 400 / FK error | Run `seed_questions.py` so `questions` rows exist for each `question_id` |
+| iOS cannot reach HTTP server | ATS / use HTTPS; VM firewall allows device IP |
+| Trajectory not uploading | Survey API configured; cloud session created; Location **Always** allowed |
+| Cleartext blocked | Add VM host to `NSAppTransportSecurity` in `Info.plist` or use TLS |
+
+---
+
+## Tech stack
+
+- **iOS:** Swift, UIKit, AVFoundation, Speech, Core Location, MapKit
+- **Server:** FastAPI, uvicorn, PyMySQL, python-dotenv
+- **Database:** MySQL 8+ (Cloud SQL compatible)
+
+---
 
 ## Contributing
 
-Welcome to submit Issues and Pull Requests to improve this project!
+Issues and pull requests are welcome.
 
 ## License
 
-This project is intended for educational use. Feel free to adapt and extend it for your own research workflows.
+Educational and research use. Adapt freely for your own study workflows.
