@@ -3,7 +3,7 @@ import AVFoundation
 import Speech
 
 class ViewController: UIViewController, AVAudioPlayerDelegate {
-    
+
     // MARK: - Properties
     @IBOutlet weak var statusLabel: UILabel!
     @IBOutlet weak var recordButton: UIButton!
@@ -11,27 +11,28 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     @IBOutlet weak var llmButton: UIButton!
     @IBOutlet weak var exportButton: UIButton!
     @IBOutlet weak var aggregateButton: UIButton!
+    private var audioFilesButton: UIButton?
     private var clearButton: UIButton?  // Created programmatically
-    
+
     // Recording state
     private var isRecording = false
     private var recordedData: String?
     private var audioRecorder: AVAudioRecorder?
     private var audioPlayer: AVAudioPlayer?
     private var recordingURL: URL?
-    
+
     // Per-participant session (local-only separation)
     private var sessionId: String?
     private var sessionDirectoryURL: URL?
-    
+
     // Cloud (Survey API / Cloud SQL) session
     private var cloudRespondentId: String?
     private var cloudSessionId: String?
-    
+
     // Inactivity auto-reset
     private var inactivityTimer: Timer?
     private let inactivityTimeoutSeconds: TimeInterval = 180
-    
+
     // Questionnaire and analysis
     private var questionnaireData: QuestionnaireData?
     private var transcription: String?
@@ -39,7 +40,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private var respondentInfo: RespondentInfo?
     /// Set when pushing from `MapViewController`; passed into the respondent form until a successful submit.
     var mapLocationPrefill: MapLocationPayload?
-    
+
     // MARK: - Lifecycle
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -48,28 +49,28 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         setupUI()
         initializeSessionAndPurge()
         resetInactivityTimer()
-        
+
         // Best-effort: resend any pending uploads from prior runs
         Task { [weak self] in
             await self?.flushPendingSurveyUploads()
         }
     }
-    
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         resetInactivityTimer()
     }
-    
+
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         invalidateInactivityTimer()
     }
-    
+
     // MARK: - UI Setup
     private func setupUI() {
         // Set title
         title = "Voice Recognition"
-        
+
         // Add settings button to navigation bar
         let settingsButton = UIBarButtonItem(
             image: UIImage(systemName: "gearshape"),
@@ -77,7 +78,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             target: self,
             action: #selector(settingsButtonTapped)
         )
-        
+
         // Add questionnaire button to navigation bar
         let questionnaireButton = UIBarButtonItem(
             image: UIImage(systemName: "doc.text"),
@@ -85,37 +86,45 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             target: self,
             action: #selector(questionnaireButtonTapped)
         )
-        
+
         navigationItem.rightBarButtonItems = [settingsButton, questionnaireButton]
-        
+
         // Request microphone permission
         requestMicrophonePermission()
-        
+
         // Setup status label
         statusLabel.text = "Ready"
         statusLabel.font = UIFont.systemFont(ofSize: 18, weight: .regular)
         statusLabel.textAlignment = .center
         statusLabel.textColor = .systemGray
         statusLabel.numberOfLines = 0
-        
+
         // Check API key status
         checkAPIKeyStatus()
-        
+
         // Setup record button
         setupButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
-        
+
         // Setup play button
         setupButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
-        
+
         // Setup LLM button
         setupButton(llmButton, title: "LLM Recognition", backgroundColor: .systemBlue)
-        
+
         // Setup export button
         setupButton(exportButton, title: "Export JSON", backgroundColor: .systemGreen)
-        
+
         // Setup aggregate button
         setupButton(aggregateButton, title: "Aggregate Results", backgroundColor: .systemTeal)
-        
+
+        // Create and setup audio files button programmatically
+        let audioBtn = UIButton(type: .system)
+        audioBtn.translatesAutoresizingMaskIntoConstraints = false
+        setupButton(audioBtn, title: "Audio Files", backgroundColor: UIColor(red: 0.0, green: 0.36, blue: 0.16, alpha: 1.0))
+        audioBtn.addTarget(self, action: #selector(audioFilesButtonTapped(_:)), for: .touchUpInside)
+        view.addSubview(audioBtn)
+        self.audioFilesButton = audioBtn
+
         // Create and setup clear button programmatically
         let clearBtn = UIButton(type: .system)
         clearBtn.translatesAutoresizingMaskIntoConstraints = false
@@ -127,24 +136,31 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         clearBtn.addTarget(self, action: #selector(clearButtonTapped(_:)), for: .touchUpInside)
         view.addSubview(clearBtn)
         self.clearButton = clearBtn
-        
-        // Add constraints for clear button - positioned below aggregate button
+
+        // Add constraints for programmatic buttons positioned below aggregate button
         NSLayoutConstraint.activate([
-            clearBtn.topAnchor.constraint(equalTo: aggregateButton.bottomAnchor, constant: 16),
+            audioBtn.topAnchor.constraint(equalTo: aggregateButton.bottomAnchor, constant: 16),
+            audioBtn.leadingAnchor.constraint(equalTo: aggregateButton.leadingAnchor),
+            audioBtn.trailingAnchor.constraint(equalTo: aggregateButton.trailingAnchor),
+            audioBtn.heightAnchor.constraint(equalToConstant: 50),
+
+            clearBtn.topAnchor.constraint(equalTo: audioBtn.bottomAnchor, constant: 16),
             clearBtn.leadingAnchor.constraint(equalTo: aggregateButton.leadingAnchor),
             clearBtn.trailingAnchor.constraint(equalTo: aggregateButton.trailingAnchor),
             clearBtn.heightAnchor.constraint(equalToConstant: 50)
         ])
-        
+
         // Initial state: play, LLM and export buttons disabled
         playButton.isEnabled = false
         llmButton.isEnabled = false
         exportButton.isEnabled = false
+        audioBtn.isEnabled = true
         playButton.alpha = 0.5
         llmButton.alpha = 0.5
         exportButton.alpha = 0.5
+        audioBtn.alpha = 1.0
     }
-    
+
     private func setupButton(_ button: UIButton, title: String, backgroundColor: UIColor) {
         button.setTitle(title, for: .normal)
         button.backgroundColor = backgroundColor
@@ -152,7 +168,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         button.layer.cornerRadius = 12
         button.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
     }
-    
+
     // MARK: - Button Actions
     @IBAction func recordButtonTapped(_ sender: UIButton) {
         resetInactivityTimer()
@@ -161,22 +177,22 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             // Clear previous state when starting a new recording (same participant/session unless "Start next participant" was used)
             transcription = nil
             matchedQuestions = []
-            
+
             // Disable LLM and export buttons until new analysis is done
             llmButton.isEnabled = true  // Can start LLM analysis after recording
             exportButton.isEnabled = false
             llmButton.alpha = 1.0
             exportButton.alpha = 0.5
-            
+
             showRespondentInfoForm { [weak self] info in
                 guard let self = self else { return }
                 self.respondentInfo = info
-                
+
                 // Create a Cloud session up-front (best-effort). If it fails, we can still enqueue answers later.
                 Task { [weak self] in
                     await self?.ensureCloudSessionCreated()
                 }
-                
+
                 // Start recording after info is submitted
                 self.isRecording = true
                 self.startRecording()
@@ -185,26 +201,26 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             animateButton(sender)
             return
         }
-        
+
         // Stop recording
         isRecording = false
         stopRecording()
         animateButton(sender)
     }
-    
+
     @IBAction func playButtonTapped(_ sender: UIButton) {
         resetInactivityTimer()
         guard let url = recordingURL else {
             showMessage("No recording to play")
             return
         }
-        
+
         // Check if already playing
         if let player = audioPlayer, player.isPlaying {
             // Stop playing
             player.stop()
             audioPlayer = nil
-            
+
             playButton.setTitle("Play Recording", for: .normal)
             playButton.backgroundColor = .systemPurple
             statusLabel.text = "Playback stopped"
@@ -215,38 +231,38 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 audioPlayer = try AVAudioPlayer(contentsOf: url)
                 audioPlayer?.delegate = self
                 audioPlayer?.play()
-                
+
                 statusLabel.text = "Playing recording..."
                 statusLabel.textColor = .systemPurple
-                
+
                 playButton.setTitle("Stop Playback", for: .normal)
                 playButton.backgroundColor = .systemRed
-                
+
             } catch {
                 showMessage("Playback failed: \(error.localizedDescription)")
             }
         }
-        
+
         animateButton(sender)
     }
-    
+
     @IBAction func llmButtonTapped(_ sender: UIButton) {
         resetInactivityTimer()
         guard let recordingURL = recordingURL else {
             showMessage("No recording available. Please record first.")
             return
         }
-        
+
         // Disable button to prevent duplicate clicks
         llmButton.isEnabled = false
         llmButton.alpha = 0.5
         statusLabel.text = "Transcribing audio...\nPlease wait"
         statusLabel.textColor = .systemBlue
-        
+
         // Step 1: Transcribe audio
         transcribeAudio(url: recordingURL) { [weak self] transcription in
             guard let self = self else { return }
-            
+
             guard let transcription = transcription, !transcription.isEmpty else {
                 DispatchQueue.main.async {
                     self.statusLabel.text = "Transcription failed"
@@ -257,14 +273,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 }
                 return
             }
-            
+
             self.transcription = transcription
-            
+
             DispatchQueue.main.async {
                 self.statusLabel.text = "Analyzing with LLM...\nPlease wait"
                 self.statusLabel.textColor = .systemBlue
             }
-            
+
             // Step 2: Analyze with POE API
             guard let questions = self.questionnaireData?.questionnaire.questions else {
                 DispatchQueue.main.async {
@@ -275,29 +291,33 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 }
                 return
             }
-            
+
             Task {
                 do {
                     let matchedQuestions = try await LLMService.shared.analyzeTranscription(transcription, questions: questions)
-                    
+
                     DispatchQueue.main.async {
                         self.matchedQuestions = matchedQuestions
                         self.displayResults(transcription: transcription, matchedQuestions: matchedQuestions)
-                        
+
                         // Update recorded data
                         let resultSummary = matchedQuestions.map { "Q\($0.matchedQuestionId): \($0.extractedAnswer)" }.joined(separator: "\n")
                         self.recordedData = "Transcription: \(transcription)\n\nMatched Questions:\n\(resultSummary)"
-                        
+
                         self.statusLabel.text = "Analysis complete!\n\(matchedQuestions.count) question(s) matched"
                         self.statusLabel.textColor = .systemGreen
-                        
+
                         self.llmButton.isEnabled = true
                         self.llmButton.alpha = 1.0
                     }
-                    
-                    // Best-effort: upload answers to Survey API (Cloud SQL) or enqueue if offline/unconfigured
+
+                    // Best-effort: upload answers/audio to Survey API or enqueue answers if offline/unconfigured
                     Task { [weak self] in
-                        await self?.uploadAnswersToCloud(transcription: transcription, matchedQuestions: matchedQuestions)
+                        await self?.uploadAnswersToCloud(
+                            transcription: transcription,
+                            matchedQuestions: matchedQuestions,
+                            recordingURL: recordingURL
+                        )
                     }
                 } catch {
                     DispatchQueue.main.async {
@@ -306,7 +326,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         self.statusLabel.textColor = .systemRed
                         self.llmButton.isEnabled = true
                         self.llmButton.alpha = 1.0
-                        
+
                         // Show detailed error in alert
                         let alert = UIAlertController(
                             title: "API Call Failed",
@@ -315,35 +335,35 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         )
                         alert.addAction(UIAlertAction(title: "OK", style: .default))
                         self.present(alert, animated: true)
-                        
+
                         // Also log to console
                         print("LLM API Error: \(errorMessage)")
                     }
                 }
             }
         }
-        
+
         animateButton(sender)
     }
-    
+
     @IBAction func exportButtonTapped(_ sender: UIButton) {
         resetInactivityTimer()
         guard let transcription = transcription, !matchedQuestions.isEmpty else {
             showMessage("No analysis data to export")
             return
         }
-        
+
         guard let respondentInfo = respondentInfo else {
             showMessage("Missing respondent information")
             return
         }
-        
+
         // Create comprehensive JSON data
         let timestamp = Date().timeIntervalSince1970
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         let timestampString = dateFormatter.string(from: Date())
-        
+
         var exportData: [String: Any] = [
             "export_info": [
                 "export_time": timestampString,
@@ -370,7 +390,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 ]
             }
         ]
-        
+
         // Add questionnaire if available
         if let questionnaire = questionnaireData {
             exportData["questionnaire"] = [
@@ -378,16 +398,16 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 "description": questionnaire.questionnaire.description
             ]
         }
-        
+
         // Convert to JSON data
         guard let jsonData = try? JSONSerialization.data(withJSONObject: exportData, options: .prettyPrinted) else {
             showMessage("JSON conversion failed")
             return
         }
-        
+
         // Save into the current per-participant session folder
         let fileName = "survey_results_\(sessionId ?? "unknown")_\(Date().timeIntervalSince1970).json"
-        
+
         let sessionFileURL: URL
         do {
             let session = try SessionManager.shared.ensureCurrentSession()
@@ -401,20 +421,20 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             animateButton(sender)
             return
         }
-        
+
         do {
             try jsonData.write(to: sessionFileURL)
-            
+
             // Mirror into SurveyExports as well (keeps aggregation/clear flows working)
             if let exportsDirectory = try? ensureExportsDirectory() {
                 let mirrorURL = exportsDirectory.appendingPathComponent(fileName)
                 try? jsonData.write(to: mirrorURL)
             }
-            
+
             // Show export success
             statusLabel.text = "JSON exported successfully!\nSaved to App Folder"
             statusLabel.textColor = .systemGreen
-            
+
             // Show success message with file location
             let alert = UIAlertController(
                 title: "Export Successful",
@@ -434,94 +454,151 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             })
             alert.addAction(UIAlertAction(title: "OK", style: .cancel))
             present(alert, animated: true)
-            
+
             // Also print file path for debugging
             print("File saved to: \(sessionFileURL.path)")
-            
+
         } catch {
             statusLabel.text = "Export failed"
             statusLabel.textColor = .systemRed
             showMessage("Failed to save file: \(error.localizedDescription)")
         }
-        
+
         animateButton(sender)
     }
-    
+
     @IBAction func aggregateButtonTapped(_ sender: UIButton) {
         resetInactivityTimer()
         animateButton(sender)
-        
+
         // Show action menu
         let alert = UIAlertController(
             title: "Aggregate Results",
             message: "Please select an action",
             preferredStyle: .actionSheet
         )
-        
+
         // Option 1: View by Location
         alert.addAction(UIAlertAction(title: "View by Location", style: .default) { [weak self] _ in
             self?.performLocationAggregation()
         })
-        
+
         // Option 2: View All
         alert.addAction(UIAlertAction(title: "View All", style: .default) { [weak self] _ in
             self?.performAggregation(action: .view)
         })
-        
+
         // Option 3: Export JSON
         alert.addAction(UIAlertAction(title: "Export JSON", style: .default) { [weak self] _ in
             self?.performAggregation(action: .export)
         })
-        
+
         // Option 4: Cancel
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
+
         // iPad support
         if let popover = alert.popoverPresentationController {
             popover.sourceView = sender
             popover.sourceRect = sender.bounds
         }
-        
+
         present(alert, animated: true)
     }
-    
+
+    @objc private func audioFilesButtonTapped(_ sender: UIButton) {
+        resetInactivityTimer()
+        animateButton(sender)
+
+        guard !isRecording else {
+            showMessage("Audio files are unavailable while recording")
+            return
+        }
+
+        let alert = UIAlertController(
+            title: "Audio Files",
+            message: "Please select an action",
+            preferredStyle: .actionSheet
+        )
+
+        alert.addAction(UIAlertAction(title: "View by Location", style: .default) { [weak self] _ in
+            self?.showAudioFilesByLocation()
+        })
+
+        alert.addAction(UIAlertAction(title: "View All", style: .default) { [weak self] _ in
+            self?.showAllAudioFiles()
+        })
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = sender
+            popover.sourceRect = sender.bounds
+        }
+
+        present(alert, animated: true)
+    }
+
+    private func showAllAudioFiles() {
+        let recordings = AudioRecordingLibrary.loadRecordings()
+        guard !recordings.isEmpty else {
+            showMessage("No audio files found")
+            return
+        }
+
+        let vc = AudioFilesViewController(recordings: recordings)
+        let nav = UINavigationController(rootViewController: vc)
+        present(nav, animated: true)
+    }
+
+    private func showAudioFilesByLocation() {
+        let grouped = AudioRecordingLibrary.groupedByLocation()
+        guard !grouped.isEmpty else {
+            showMessage("No audio files found")
+            return
+        }
+
+        let vc = AudioLocationsViewController(groupedRecordings: grouped)
+        let nav = UINavigationController(rootViewController: vc)
+        present(nav, animated: true)
+    }
+
     @objc func clearButtonTapped(_ sender: UIButton) {
         animateButton(sender)
-        
+
         let alert = UIAlertController(
             title: "Clear JSON Files",
             message: "Are you sure you want to delete all exported JSON questionnaire response files? This action cannot be undone.",
             preferredStyle: .alert
         )
-        
+
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
             self?.clearAllJSONFiles()
         })
-        
+
         present(alert, animated: true)
     }
-    
+
     private func clearAllJSONFiles() {
         statusLabel.text = "Clearing JSON files..."
         statusLabel.textColor = .systemOrange
         clearButton?.isEnabled = false
         clearButton?.alpha = 0.5
-        
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            
+
             do {
                 let exportsDirectory = try self.ensureExportsDirectory()
                 let fileManager = FileManager.default
-                
+
                 // Get all JSON files
                 let fileURLs = try fileManager.contentsOfDirectory(
                     at: exportsDirectory,
                     includingPropertiesForKeys: nil,
                     options: [.skipsHiddenFiles]
                 ).filter { $0.pathExtension.lowercased() == "json" }
-                
+
                 var deletedCount = 0
                 for fileURL in fileURLs {
                     do {
@@ -531,13 +608,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         print("Failed to delete file \(fileURL.lastPathComponent): \(error)")
                     }
                 }
-                
+
                 DispatchQueue.main.async {
                     self.statusLabel.text = "Cleared \(deletedCount) JSON file(s)"
                     self.statusLabel.textColor = .systemGreen
                     self.clearButton?.isEnabled = true
                     self.clearButton?.alpha = 1.0
-                    
+
                     if deletedCount > 0 {
                         self.showMessage("Successfully deleted \(deletedCount) JSON questionnaire response file(s)")
                     } else {
@@ -555,13 +632,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
         }
     }
-    
+
     // Aggregation action type
     private enum AggregationAction {
         case view
         case export
     }
-    
+
     // Aggregation result data structure
     private struct AggregationResult {
         let summary: String
@@ -570,22 +647,22 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let questionTexts: [Int: String]
         let processedFiles: Int
     }
-    
+
     // Perform aggregation operation
     private func performAggregation(action: AggregationAction) {
         statusLabel.text = "Aggregating historical responses..."
         statusLabel.textColor = .systemBlue
         aggregateButton.isEnabled = false
         aggregateButton.alpha = 0.5
-        
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            
+
             do {
                 let exportsDirectory = try self.ensureExportsDirectory()
                 let fileManager = FileManager.default
                 let fileURLs = try fileManager.contentsOfDirectory(at: exportsDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).filter { $0.pathExtension.lowercased() == "json" }
-                
+
                 if fileURLs.isEmpty {
                     DispatchQueue.main.async {
                         self.statusLabel.text = "No historical data available for aggregation"
@@ -596,7 +673,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     }
                     return
                 }
-                
+
                 // Get all question IDs
                 let allQuestionIds: Set<Int>
                 if let questions = self.questionnaireData?.questionnaire.questions {
@@ -604,11 +681,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 } else {
                     allQuestionIds = Set()
                 }
-                
+
                 var statistics: [Int: [String: Int]] = [:]
                 var answerDisplayNames: [Int: [String: String]] = [:]
                 var questionTexts: [Int: String] = [:]
-                
+
                 // Initialize statistics for all questions
                 for questionId in allQuestionIds {
                     statistics[questionId] = [
@@ -617,23 +694,23 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         "unanswered": 0
                     ]
                 }
-                
+
                 if let questions = self.questionnaireData?.questionnaire.questions {
                     for question in questions {
                         questionTexts[question.id] = question.question
                     }
                 }
-                
+
                 let decoder = JSONDecoder()
                 var processedFiles = 0
                 var allResponseQuestionIds: Set<Int> = []
-                
+
                 // First pass: collect all question IDs that appear in responses
                 for fileURL in fileURLs {
                     do {
                         let data = try Data(contentsOf: fileURL)
                         let exportEntry = try decoder.decode(ExportedSurvey.self, from: data)
-                        
+
                         for item in exportEntry.matchedQuestions {
                             allResponseQuestionIds.insert(item.matchedQuestionId)
                         }
@@ -641,33 +718,33 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         print("Failed to process file \(fileURL.lastPathComponent): \(error)")
                     }
                 }
-                
+
                 // Second pass: process responses in each file
                 for fileURL in fileURLs {
                     do {
                         let data = try Data(contentsOf: fileURL)
                         let exportEntry = try decoder.decode(ExportedSurvey.self, from: data)
                         processedFiles += 1
-                        
+
                         // Track question IDs that appear in this response
                         var currentResponseQuestionIds: Set<Int> = []
-                        
+
                         for item in exportEntry.matchedQuestions {
                             currentResponseQuestionIds.insert(item.matchedQuestionId)
-                            
+
                             guard let answer = item.extractedAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty else {
                                 continue
                             }
-                            
+
                             // Classify answer type: yes, no, or other
                             let normalizedAnswer = answer.lowercased()
                             let answerType: String
-                            
-                            if normalizedAnswer.contains("yes") || 
+
+                            if normalizedAnswer.contains("yes") ||
                                normalizedAnswer.contains("good") || normalizedAnswer.contains("safe") ||
                                normalizedAnswer.contains("well") || normalizedAnswer.contains("appealing") {
                                 answerType = "yes"
-                            } else if normalizedAnswer.contains("no") || 
+                            } else if normalizedAnswer.contains("no") ||
                                       normalizedAnswer.contains("unsafe") || normalizedAnswer.contains("poor") ||
                                       normalizedAnswer.contains("unappealing") {
                                 answerType = "no"
@@ -675,13 +752,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                                 // Cannot determine, keep original answer for display
                                 answerType = normalizedAnswer
                             }
-                            
+
                             statistics[item.matchedQuestionId, default: [:]][answerType, default: 0] += 1
-                            
+
                             if answerDisplayNames[item.matchedQuestionId] == nil {
                                 answerDisplayNames[item.matchedQuestionId] = [:]
                             }
-                            
+
                             // Save original answer for display (if yes/no type, save an example)
                             if answerType == "yes" || answerType == "no" {
                                 if answerDisplayNames[item.matchedQuestionId]?[answerType] == nil {
@@ -690,24 +767,24 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                             } else {
                                 answerDisplayNames[item.matchedQuestionId]?[answerType] = answer
                             }
-                            
+
                             if questionTexts[item.matchedQuestionId] == nil {
                                 questionTexts[item.matchedQuestionId] = item.matchedQuestion
                             }
                         }
-                        
+
                         // For questions that don't appear in this response, mark as unanswered
                         for questionId in allQuestionIds {
                             if !currentResponseQuestionIds.contains(questionId) {
                                 statistics[questionId, default: [:]]["unanswered", default: 0] += 1
                             }
                         }
-                        
+
                     } catch {
                         print("Failed to process file \(fileURL.lastPathComponent): \(error)")
                     }
                 }
-                
+
                 if processedFiles == 0 {
                     DispatchQueue.main.async {
                         self.statusLabel.text = "No valid response data found"
@@ -718,39 +795,39 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     }
                     return
                 }
-                
+
                 var summary = "Analyzed \(processedFiles) export file(s).\n\n"
                 let sortedQuestionIds = allQuestionIds.sorted()
-                
+
                 for questionId in sortedQuestionIds {
                     let questionTitle = questionTexts[questionId] ?? "Question \(questionId)"
                     summary += "Question \(questionId): \(questionTitle)\n"
-                    
+
                     let answerCounts = statistics[questionId] ?? [:]
-                    
+
                     // Display yes, no, unanswered statistics
                     let yesCount = answerCounts["yes"] ?? 0
                     let noCount = answerCounts["no"] ?? 0
                     let unansweredCount = answerCounts["unanswered"] ?? 0
                     let totalCount = yesCount + noCount + unansweredCount
-                    
+
                     if totalCount > 0 {
                         summary += "  Total: \(totalCount) response(s)\n"
                         summary += "  Yes: \(yesCount) (\(totalCount > 0 ? Int(Double(yesCount) / Double(totalCount) * 100) : 0)%)\n"
                         summary += "  No: \(noCount) (\(totalCount > 0 ? Int(Double(noCount) / Double(totalCount) * 100) : 0)%)\n"
                         summary += "  Unanswered: \(unansweredCount) (\(totalCount > 0 ? Int(Double(unansweredCount) / Double(totalCount) * 100) : 0)%)\n"
                     }
-                    
+
                     // Display other answer types (if any)
                     let otherAnswers = answerCounts.filter { $0.key != "yes" && $0.key != "no" && $0.key != "unanswered" }
                     for (answerKey, count) in otherAnswers.sorted(by: { $0.value > $1.value }) {
                         let displayText = answerDisplayNames[questionId]?[answerKey] ?? answerKey
                         summary += "  - \(displayText): \(count)\n"
                     }
-                    
+
                     summary += "\n"
                 }
-                
+
                 let result = AggregationResult(
                     summary: summary,
                     statistics: statistics,
@@ -758,18 +835,18 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     questionTexts: questionTexts,
                     processedFiles: processedFiles
                 )
-                
+
                 DispatchQueue.main.async {
                     self.statusLabel.text = "Aggregation complete. Processed \(processedFiles) record(s)"
                     self.statusLabel.textColor = .systemGreen
-                    
+
                     switch action {
                     case .view:
                         self.showScrollableContent(title: "Aggregation Results", content: result.summary)
                     case .export:
                         self.exportAggregationJSON(result: result)
                     }
-                    
+
                     self.aggregateButton.isEnabled = true
                     self.aggregateButton.alpha = 1.0
                 }
@@ -784,13 +861,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
         }
     }
-    
+
     // Export aggregation results as JSON
     private func exportAggregationJSON(result: AggregationResult) {
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         let timestampString = dateFormatter.string(from: Date())
-        
+
         // Build JSON data structure
         var jsonData: [String: Any] = [
             "export_info": [
@@ -801,11 +878,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             "aggregation_summary": result.summary,
             "statistics": [:]
         ]
-        
+
         // Add statistics
         let sortedQuestionIds = result.statistics.keys.sorted()
         var statisticsDict: [String: Any] = [:]
-        
+
         for questionId in sortedQuestionIds {
             let questionTitle = result.questionTexts[questionId] ?? "Question \(questionId)"
             var questionData: [String: Any] = [
@@ -813,7 +890,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 "question_text": questionTitle,
                 "answers": []
             ]
-            
+
             let answerCounts = result.statistics[questionId] ?? [:]
             let sortedAnswers = answerCounts.sorted { lhs, rhs in
                 if lhs.value == rhs.value {
@@ -821,7 +898,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 }
                 return lhs.value > rhs.value
             }
-            
+
             var answersArray: [[String: Any]] = []
             for (answerKey, count) in sortedAnswers {
                 let displayText = result.answerDisplayNames[questionId]?[answerKey] ?? answerKey
@@ -830,53 +907,53 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     "count": count
                 ])
             }
-            
+
             questionData["answers"] = answersArray
             statisticsDict["question_\(questionId)"] = questionData
         }
-        
+
         jsonData["statistics"] = statisticsDict
-        
+
         // Convert to JSON data
         guard let jsonDataEncoded = try? JSONSerialization.data(withJSONObject: jsonData, options: .prettyPrinted) else {
             showMessage("JSON conversion failed")
             return
         }
-        
+
         // Save to temporary file
         let fileName = "aggregation_results_\(Date().timeIntervalSince1970).json"
         let tempDirectory = FileManager.default.temporaryDirectory
         let fileURL = tempDirectory.appendingPathComponent(fileName)
-        
+
         do {
             try jsonDataEncoded.write(to: fileURL)
-            
+
             // Use share functionality
             let activityViewController = UIActivityViewController(
                 activityItems: [fileURL],
                 applicationActivities: nil
             )
-            
+
             // iPad support
             if let popover = activityViewController.popoverPresentationController {
                 popover.sourceView = aggregateButton
                 popover.sourceRect = aggregateButton.bounds
             }
-            
+
             present(activityViewController, animated: true)
-            
+
         } catch {
             showMessage("Failed to save file: \(error.localizedDescription)")
         }
     }
-    
+
     // MARK: - Questionnaire Loading
     private func loadQuestionnaire() {
         guard let url = Bundle.main.url(forResource: "questionnaire", withExtension: "json") else {
             print("Error: questionnaire.json not found in bundle")
             return
         }
-        
+
         do {
             let data = try Data(contentsOf: url)
             let decoder = JSONDecoder()
@@ -887,7 +964,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             showMessage("Failed to load questionnaire: \(error.localizedDescription)")
         }
     }
-    
+
     // MARK: - Permission Requests
     private func requestMicrophonePermission() {
         if #available(iOS 17.0, *) {
@@ -909,7 +986,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
         }
     }
-    
+
     private func requestSpeechPermission() {
         SFSpeechRecognizer.requestAuthorization { status in
             DispatchQueue.main.async {
@@ -924,11 +1001,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
         }
     }
-    
+
     private func startRecording() {
         resetInactivityTimer()
         let audioSession = AVAudioSession.sharedInstance()
-        
+
         do {
             try audioSession.setCategory(.playAndRecord, mode: .default)
             try audioSession.setActive(true)
@@ -936,50 +1013,55 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             showMessage("Audio session setup failed: \(error.localizedDescription)")
             return
         }
-        
+
         let url: URL
         do {
             // Create/ensure per-participant session folder and store recording inside it
             let session = try SessionManager.shared.ensureCurrentSession()
             sessionId = session.id
             sessionDirectoryURL = session.directoryURL
-            
+
             url = try SessionManager.shared.makeRecordingURL()
             recordingURL = url
+            writeRecordingMetadata(for: url)
         } catch {
             showMessage("Failed to create session/recording path: \(error.localizedDescription)")
             return
         }
-        
+
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
             AVSampleRateKey: 44100,
             AVNumberOfChannelsKey: 2,
             AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
         ]
-        
+
         do {
             audioRecorder = try AVAudioRecorder(url: url, settings: settings)
             audioRecorder?.record()
-            
+
             recordButton.setTitle("Stop Recording", for: .normal)
             recordButton.backgroundColor = .systemOrange
             statusLabel.text = "Recording...\nSpeak into microphone"
             statusLabel.textColor = .systemRed
+            audioFilesButton?.isEnabled = false
+            audioFilesButton?.alpha = 0.5
         } catch {
             showMessage("Recording failed to start: \(error.localizedDescription)")
+            audioFilesButton?.isEnabled = true
+            audioFilesButton?.alpha = 1.0
         }
     }
-    
+
     private func stopRecording() {
         resetInactivityTimer()
         audioRecorder?.stop()
-        
+
         recordButton.setTitle("Start Recording", for: .normal)
         recordButton.backgroundColor = .systemRed
         statusLabel.text = "Recording stopped\nYou can play, recognize, or export"
         statusLabel.textColor = .systemGray
-        
+
         // Enable buttons
         playButton.isEnabled = true
         llmButton.isEnabled = true
@@ -987,10 +1069,39 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         playButton.alpha = 1.0
         llmButton.alpha = 1.0
         exportButton.alpha = 1.0
-        
+        audioFilesButton?.isEnabled = true
+        audioFilesButton?.alpha = 1.0
+
         recordedData = "Recording data - Timestamp: \(Date().timeIntervalSince1970)"
     }
-    
+
+    private func writeRecordingMetadata(for recordingURL: URL) {
+        let metadataURL = recordingURL.deletingPathExtension().appendingPathExtension("json")
+        var metadata: [String: Any] = [
+            "recording_file": recordingURL.lastPathComponent,
+            "recorded_at_epoch": Date().timeIntervalSince1970,
+            "session_id": sessionId ?? "",
+            "location": respondentInfo?.location ?? ""
+        ]
+
+        if let info = respondentInfo {
+            metadata["respondent_info"] = [
+                "name": info.name,
+                "age": info.age,
+                "gender": info.gender,
+                "phone": info.phone,
+                "location": info.location
+            ]
+        }
+
+        do {
+            let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: metadataURL, options: [.atomic])
+        } catch {
+            print("Failed to write recording metadata: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Speech Recognition
     private func transcribeAudio(url: URL, completion: @escaping (String?) -> Void) {
         resetInactivityTimer()
@@ -998,33 +1109,33 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             completion(nil)
             return
         }
-        
+
         if !recognizer.isAvailable {
             completion(nil)
             return
         }
-        
+
         let request = SFSpeechURLRecognitionRequest(url: url)
         request.shouldReportPartialResults = false
-        
+
         recognizer.recognitionTask(with: request) { result, error in
             if let error = error {
                 print("Speech recognition error: \(error)")
                 completion(nil)
                 return
             }
-            
+
             if let result = result, result.isFinal {
                 completion(result.bestTranscription.formattedString)
             }
         }
     }
-    
+
     // MARK: - Results Display
     private func displayResults(transcription: String, matchedQuestions: [MatchedQuestion]) {
         var resultText = "Transcription:\n\(transcription)\n\n"
         resultText += "Matched Questions:\n"
-        
+
         for matched in matchedQuestions {
             resultText += "\nQuestion \(matched.matchedQuestionId): \(matched.matchedQuestion)\n"
             resultText += "Answer: \(matched.extractedAnswer)\n"
@@ -1033,13 +1144,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 resultText += "⚠️ Clarification needed\n"
             }
         }
-        
+
         // Show results in alert
         let alert = UIAlertController(title: "Analysis Results", message: resultText, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
     }
-    
+
     // MARK: - AVAudioPlayerDelegate
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         DispatchQueue.main.async {
@@ -1049,7 +1160,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             self.statusLabel.textColor = .systemGray
         }
     }
-    
+
     // MARK: - Helper Methods
     private func animateButton(_ button: UIButton) {
         UIView.animate(withDuration: 0.1, animations: {
@@ -1060,13 +1171,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
         }
     }
-    
+
     // MARK: - Multi-user session helpers
-    
+
     private func initializeSessionAndPurge() {
         // Best-effort purge of old sessions (local-only retention)
         SessionManager.shared.purgeOldSessions(keepLast: 50, maxAgeDays: 7)
-        
+
         do {
             let session = try SessionManager.shared.startNewSession()
             sessionId = session.id
@@ -1076,24 +1187,20 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             sessionDirectoryURL = nil
         }
     }
-    
-    private func startNextParticipant(discardCurrentRecording: Bool = true) {
-        // Stop any active recording/playback and optionally remove the current recording file
+
+    private func startNextParticipant() {
+        // Stop any active recording/playback while keeping the saved recording in its session folder.
         if isRecording {
             isRecording = false
             audioRecorder?.stop()
         }
-        
+
         if let player = audioPlayer, player.isPlaying {
             player.stop()
         }
         audioPlayer = nil
         audioRecorder = nil
-        
-        if discardCurrentRecording, let url = recordingURL {
-            try? FileManager.default.removeItem(at: url)
-        }
-        
+
         // Clear participant-specific state
         respondentInfo = nil
         transcription = nil
@@ -1103,7 +1210,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         TrajectoryTracker.shared.setCurrentIdentity(respondentId: nil, sessionId: nil)
         recordedData = nil
         recordingURL = nil
-        
+
         // Reset UI state
         recordButton.setTitle("Start Recording", for: .normal)
         recordButton.backgroundColor = .systemRed
@@ -1113,10 +1220,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         exportButton.alpha = 0.5
         llmButton.isEnabled = false
         llmButton.alpha = 0.5
-        
+        audioFilesButton?.isEnabled = true
+        audioFilesButton?.alpha = 1.0
+
         statusLabel.text = "Ready for next participant"
         statusLabel.textColor = .systemGray
-        
+
         // Start a fresh session
         do {
             let session = try SessionManager.shared.startNewSession()
@@ -1126,60 +1235,60 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             sessionId = nil
             sessionDirectoryURL = nil
         }
-        
+
         resetInactivityTimer()
     }
-    
+
     // MARK: - Inactivity auto-reset
-    
+
     private func resetInactivityTimer() {
         invalidateInactivityTimer()
         inactivityTimer = Timer.scheduledTimer(withTimeInterval: inactivityTimeoutSeconds, repeats: false) { [weak self] _ in
             self?.handleInactivityTimeout()
         }
     }
-    
+
     private func invalidateInactivityTimer() {
         inactivityTimer?.invalidate()
         inactivityTimer = nil
     }
-    
+
     private func handleInactivityTimeout() {
         DispatchQueue.main.async {
-            self.startNextParticipant(discardCurrentRecording: true)
+            self.startNextParticipant()
         }
     }
-    
+
     private func showMessage(_ message: String) {
         let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
         present(alert, animated: true)
-        
+
         // Auto dismiss after 1.5 seconds
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             alert.dismiss(animated: true)
         }
     }
-    
+
     private func showJSONContent(_ jsonString: String) {
         showScrollableContent(title: "Exported JSON", content: jsonString)
     }
-    
+
     private func shareFile(url: URL) {
         let activityViewController = UIActivityViewController(
             activityItems: [url],
             applicationActivities: nil
         )
-        
+
         // For iPad
         if let popover = activityViewController.popoverPresentationController {
             popover.sourceView = view
             popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
             popover.permittedArrowDirections = []
         }
-        
+
         present(activityViewController, animated: true)
     }
-    
+
     private func jsonToPrettyString(_ json: [String: Any]) -> String? {
         guard let data = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted),
               let string = String(data: data, encoding: .utf8) else {
@@ -1187,31 +1296,31 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
         return string
     }
-    
+
     private func ensureExportsDirectory() throws -> URL {
         let fileManager = FileManager.default
         let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let exportsURL = documentsURL.appendingPathComponent("SurveyExports", isDirectory: true)
-        
+
         if !fileManager.fileExists(atPath: exportsURL.path) {
             try fileManager.createDirectory(at: exportsURL, withIntermediateDirectories: true, attributes: nil)
         }
-        
+
         return exportsURL
     }
-    
+
     private func showScrollableContent(title: String, content: String) {
         let alert = UIAlertController(title: title, message: nil, preferredStyle: .alert)
-        
+
         let textView = UITextView()
         textView.text = content
         textView.font = UIFont.systemFont(ofSize: 12)
         textView.isEditable = false
         textView.backgroundColor = .systemBackground
         textView.translatesAutoresizingMaskIntoConstraints = false
-        
+
         alert.view.addSubview(textView)
-        
+
         NSLayoutConstraint.activate([
             textView.topAnchor.constraint(equalTo: alert.view.topAnchor, constant: 60),
             textView.leadingAnchor.constraint(equalTo: alert.view.leadingAnchor, constant: 15),
@@ -1219,24 +1328,24 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             textView.bottomAnchor.constraint(equalTo: alert.view.bottomAnchor, constant: -60),
             textView.heightAnchor.constraint(equalToConstant: 300)
         ])
-        
+
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
     }
-    
+
     // MARK: - Settings & API Key Management
     @objc private func settingsButtonTapped() {
         showAPIKeySettings()
     }
-    
+
     @objc private func questionnaireButtonTapped() {
         let questionnaireVC = QuestionnaireViewController(transitionStyle: .scroll, navigationOrientation: .horizontal)
         questionnaireVC.modalPresentationStyle = .fullScreen
-        
+
         let navController = UINavigationController(rootViewController: questionnaireVC)
         present(navController, animated: true)
     }
-    
+
     private func checkAPIKeyStatus() {
         let currentProvider = LLMService.shared.currentProvider
         if !LLMService.shared.hasAPIKey() {
@@ -1245,34 +1354,34 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             statusLabel.textColor = .systemOrange
         }
     }
-    
+
     private func showAPIKeySettings() {
         let alert = UIAlertController(
             title: "LLM API Settings",
             message: "Select API provider and configure API Key\n\nCurrent selection: \(LLMService.shared.currentProvider.displayName)",
             preferredStyle: .alert
         )
-        
+
         // Add API provider selection
         alert.addAction(UIAlertAction(title: "Select API Provider", style: .default) { [weak self] _ in
             self?.showAPIProviderSelection()
         })
-        
+
         // Add OpenAI API key configuration
         alert.addAction(UIAlertAction(title: "Configure OpenAI API Key", style: .default) { [weak self] _ in
             self?.showAPIKeyInput(for: .openai)
         })
-        
+
         // Add Gemini API key configuration
         alert.addAction(UIAlertAction(title: "Configure Gemini API Key", style: .default) { [weak self] _ in
             self?.showAPIKeyInput(for: .gemini)
         })
-        
+
         // Add custom LLM base URL configuration
         alert.addAction(UIAlertAction(title: "Configure Custom LLM Base URL", style: .default) { [weak self] _ in
             self?.showCustomLLMBaseURLInput()
         })
-        
+
         // Survey API configuration (Cloud SQL persistence)
         alert.addAction(UIAlertAction(title: "Configure Survey API Base URL", style: .default) { [weak self] _ in
             self?.showSurveyAPIBaseURLInput()
@@ -1280,21 +1389,21 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         alert.addAction(UIAlertAction(title: "Configure Survey API Key", style: .default) { [weak self] _ in
             self?.showSurveyAPIKeyInput()
         })
-        
+
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
+
         present(alert, animated: true)
     }
-    
+
     private func showAPIProviderSelection() {
         let alert = UIAlertController(
             title: "Select API Provider",
             message: "Choose the LLM API provider to use",
             preferredStyle: .actionSheet
         )
-        
+
         let currentProvider = LLMService.shared.currentProvider
-        
+
         for provider in APIProvider.allCases {
             let title = provider == currentProvider ? "\(provider.displayName) ✓" : provider.displayName
             alert.addAction(UIAlertAction(title: title, style: .default) { [weak self] _ in
@@ -1303,33 +1412,33 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 self?.showMessage("Switched to \(provider.rawValue)")
             })
         }
-        
+
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
+
         // iPad support
         if let popover = alert.popoverPresentationController {
             popover.sourceView = view
             popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
             popover.permittedArrowDirections = []
         }
-        
+
         present(alert, animated: true)
     }
-    
+
     private func showAPIKeyInput(for provider: APIProvider) {
         let providerName = provider == .openai ? "OpenAI" : "Gemini"
         let apiKeyURL = provider == .openai ? "https://platform.openai.com/api-keys" : "https://makersuite.google.com/app/apikey"
-        
+
         let alert = UIAlertController(
             title: "\(providerName) API Key Settings",
             message: "Enter your \(providerName) API Key\n\nGet your API key from: \(apiKeyURL)",
             preferredStyle: .alert
         )
-        
+
         // Get current API key status
         let hasExistingKey = LLMService.shared.hasAPIKey(for: provider)
         let currentKey = LLMService.shared.getAPIKey(for: provider)
-        
+
         alert.addTextField { textField in
             if hasExistingKey {
                 textField.placeholder = "API key is configured (enter new key to update)"
@@ -1345,7 +1454,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             textField.autocapitalizationType = .none
             textField.autocorrectionType = .no
         }
-        
+
         alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
             guard let textField = alert.textFields?.first,
                   let apiKey = textField.text?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1353,7 +1462,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 self?.showMessage("API key cannot be empty")
                 return
             }
-            
+
             // If the input is the masked key, don't update
             if hasExistingKey && !currentKey.isEmpty {
                 let maskedKey = String(currentKey.prefix(8)) + "..." + String(currentKey.suffix(4))
@@ -1362,12 +1471,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     return
                 }
             }
-            
+
             LLMService.shared.setAPIKey(apiKey, for: provider)
             self?.checkAPIKeyStatus()
             self?.showMessage("\(providerName) API key saved successfully")
         })
-        
+
         if hasExistingKey {
             alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { [weak self] _ in
                 LLMService.shared.setAPIKey("", for: provider)
@@ -1375,21 +1484,21 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 self?.showMessage("\(providerName) API key cleared")
             })
         }
-        
+
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
+
         present(alert, animated: true)
     }
-    
+
     private func showCustomLLMBaseURLInput() {
         let currentURL = LLMService.shared.getCustomLLMBaseURL()
-        
+
         let alert = UIAlertController(
             title: "Custom LLM Base URL",
             message: "Optional: point the app to a self-hosted OpenAI-compatible endpoint.\n\nExample:\nhttp://YOUR_VM_IP:8000/v1",
             preferredStyle: .alert
         )
-        
+
         alert.addTextField { textField in
             textField.placeholder = "http://YOUR_VM_IP:8000/v1"
             textField.text = currentURL.isEmpty ? nil : currentURL
@@ -1397,26 +1506,26 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             textField.autocorrectionType = .no
             textField.keyboardType = .URL
         }
-        
+
         alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
             guard let text = alert.textFields?.first?.text else { return }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             LLMService.shared.setCustomLLMBaseURL(trimmed.isEmpty ? nil : trimmed)
             self?.showMessage("Custom LLM base URL \(trimmed.isEmpty ? "cleared" : "saved")")
         })
-        
+
         alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { [weak self] _ in
             LLMService.shared.setCustomLLMBaseURL(nil)
             self?.showMessage("Custom LLM base URL cleared")
         })
-        
+
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
+
         present(alert, animated: true)
     }
-    
+
     // MARK: - Survey API (Cloud SQL) Settings
-    
+
     private func showSurveyAPIBaseURLInput() {
         let current = SurveyAPIClient.shared.baseURLString
         let alert = UIAlertController(
@@ -1424,7 +1533,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             message: "Set the base URL for your FastAPI server.\n\nExample:\nhttps://YOUR_DOMAIN\nor\nhttp://YOUR_VM_IP:8000",
             preferredStyle: .alert
         )
-        
+
         alert.addTextField { textField in
             textField.placeholder = "https://YOUR_DOMAIN"
             textField.text = current.isEmpty ? nil : current
@@ -1432,22 +1541,22 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             textField.autocorrectionType = .no
             textField.keyboardType = .URL
         }
-        
+
         alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
             let text = alert.textFields?.first?.text ?? ""
             SurveyAPIClient.shared.baseURLString = text
             self?.showMessage("Survey API base URL \(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "cleared" : "saved")")
         })
-        
+
         alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { [weak self] _ in
             SurveyAPIClient.shared.baseURLString = ""
             self?.showMessage("Survey API base URL cleared")
         })
-        
+
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         present(alert, animated: true)
     }
-    
+
     private func showSurveyAPIKeyInput() {
         let current = SurveyAPIClient.shared.apiKey
         let hasExisting = !current.isEmpty
@@ -1456,7 +1565,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             message: "Optional: set X-API-Key for your Survey API server.",
             preferredStyle: .alert
         )
-        
+
         alert.addTextField { textField in
             if hasExisting {
                 textField.placeholder = "API key is configured (enter new key to update)"
@@ -1469,7 +1578,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             textField.autocapitalizationType = .none
             textField.autocorrectionType = .no
         }
-        
+
         alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
             let text = (alert.textFields?.first?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             if hasExisting {
@@ -1482,20 +1591,20 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             SurveyAPIClient.shared.apiKey = text
             self?.showMessage(text.isEmpty ? "Survey API key cleared" : "Survey API key saved")
         })
-        
+
         if hasExisting {
             alert.addAction(UIAlertAction(title: "Clear", style: .destructive) { [weak self] _ in
                 SurveyAPIClient.shared.apiKey = ""
                 self?.showMessage("Survey API key cleared")
             })
         }
-        
+
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         present(alert, animated: true)
     }
-    
+
     // MARK: - Survey API (Cloud SQL) Upload Flow
-    
+
     private func appVersionString() -> String? {
         let dict = Bundle.main.infoDictionary
         let short = dict?["CFBundleShortVersionString"] as? String
@@ -1503,11 +1612,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         if let short, let build { return "\(short) (\(build))" }
         return short ?? build
     }
-    
+
     private func ensureCloudSessionCreated() async {
         guard SurveyAPIClient.shared.isConfigured() else { return }
         if cloudSessionId != nil { return }
-        
+
         do {
             let resp = try await SurveyAPIClient.shared.createSession(
                 questionnaireVersion: "1",
@@ -1522,16 +1631,16 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             print("Survey API createSession failed: \(error.localizedDescription)")
         }
     }
-    
-    private func uploadAnswersToCloud(transcription: String, matchedQuestions: [MatchedQuestion]) async {
+
+    private func uploadAnswersToCloud(transcription: String, matchedQuestions: [MatchedQuestion], recordingURL: URL?) async {
         guard !matchedQuestions.isEmpty else { return }
         guard SurveyAPIClient.shared.isConfigured() else { return }
-        
+
         if cloudSessionId == nil {
             await ensureCloudSessionCreated()
         }
         guard let sid = cloudSessionId else { return }
-        
+
         let info = respondentInfo
         let answers: [[String: Any]] = matchedQuestions.map { mq in
             let value: [String: Any] = [
@@ -1547,20 +1656,93 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 "value": value
             ]
         }
-        
+
         do {
             try await SurveyAPIClient.shared.postAnswers(sessionId: sid, answers: answers)
+            await uploadAudioToCloudIfNeeded(sessionId: sid, recordingURL: recordingURL)
+            await TrajectoryTracker.shared.captureLLMRecognitionPointNow()
         } catch {
             PendingSurveyUploadStore.shared.enqueue(sessionId: sid, answers: answers)
             print("Survey API postAnswers failed; enqueued pending batch: \(error.localizedDescription)")
         }
     }
-    
+
+    private func uploadAudioToCloudIfNeeded(sessionId: String, recordingURL: URL?) async {
+        guard let recordingURL else { return }
+        guard FileManager.default.fileExists(atPath: recordingURL.path) else { return }
+        if isAudioUploadMarked(for: recordingURL) { return }
+
+        do {
+            let response = try await SurveyAPIClient.shared.uploadAudio(
+                sessionId: sessionId,
+                fileURL: recordingURL,
+                recordedAtMs: recordedAtMs(for: recordingURL),
+                localSessionId: sessionIdForRecording(recordingURL)
+            )
+            markAudioUploaded(for: recordingURL, response: response)
+            print("Survey API audio upload succeeded: \(response.storagePath)")
+        } catch {
+            print("Survey API audio upload failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func recordingMetadataURL(for recordingURL: URL) -> URL {
+        return recordingURL.deletingPathExtension().appendingPathExtension("json")
+    }
+
+    private func recordingMetadata(for recordingURL: URL) -> [String: Any]? {
+        let metadataURL = recordingMetadataURL(for: recordingURL)
+        guard let data = try? Data(contentsOf: metadataURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return json
+    }
+
+    private func recordedAtMs(for recordingURL: URL) -> Int? {
+        if let epoch = recordingMetadata(for: recordingURL)?["recorded_at_epoch"] as? Double {
+            return Int(epoch * 1000)
+        }
+        if let date = try? recordingURL.resourceValues(forKeys: [.creationDateKey]).creationDate {
+            return Int(date.timeIntervalSince1970 * 1000)
+        }
+        return nil
+    }
+
+    private func sessionIdForRecording(_ recordingURL: URL) -> String? {
+        if let metadataSessionId = recordingMetadata(for: recordingURL)?["session_id"] as? String,
+           !metadataSessionId.isEmpty {
+            return metadataSessionId
+        }
+        return recordingURL.deletingLastPathComponent().lastPathComponent
+    }
+
+    private func isAudioUploadMarked(for recordingURL: URL) -> Bool {
+        return recordingMetadata(for: recordingURL)?["audio_uploaded_at_epoch"] != nil
+    }
+
+    private func markAudioUploaded(for recordingURL: URL, response: SurveyAPIClient.AudioUploadResponse) {
+        let metadataURL = recordingMetadataURL(for: recordingURL)
+        var metadata = recordingMetadata(for: recordingURL) ?? [:]
+        metadata["audio_uploaded_at_epoch"] = Date().timeIntervalSince1970
+        metadata["audio_upload_id"] = response.id
+        metadata["audio_server_storage_path"] = response.storagePath
+        metadata["audio_server_sha256"] = response.sha256
+        metadata["audio_server_file_size_bytes"] = response.fileSizeBytes
+
+        do {
+            let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: metadataURL, options: [.atomic])
+        } catch {
+            print("Failed to mark audio as uploaded: \(error.localizedDescription)")
+        }
+    }
+
     private func flushPendingSurveyUploads() async {
         guard SurveyAPIClient.shared.isConfigured() else { return }
         let batches = PendingSurveyUploadStore.shared.drain()
         guard !batches.isEmpty else { return }
-        
+
         for batch in batches {
             let answers: [[String: Any]] = batch.answers.map { item in
                 let value: [String: Any] = item.value.mapValues { $0.value }
@@ -1577,7 +1759,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
         }
     }
-    
+
     // MARK: - Respondent Info Form
     private func showRespondentInfoForm(completion: @escaping (RespondentInfo) -> Void) {
         let infoVC = RespondentInfoViewController()
@@ -1589,27 +1771,27 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         infoVC.onCancel = { [weak self] in
             self?.dismiss(animated: true)
         }
-        
+
         let navController = UINavigationController(rootViewController: infoVC)
         navController.modalPresentationStyle = .fullScreen
         present(navController, animated: true)
     }
-    
+
     // MARK: - Location-based Aggregation
     private func performLocationAggregation() {
         statusLabel.text = "Aggregating by location..."
         statusLabel.textColor = .systemBlue
         aggregateButton.isEnabled = false
         aggregateButton.alpha = 0.5
-        
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-            
+
             do {
                 let exportsDirectory = try self.ensureExportsDirectory()
                 let fileManager = FileManager.default
                 let fileURLs = try fileManager.contentsOfDirectory(at: exportsDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).filter { $0.pathExtension.lowercased() == "json" }
-                
+
                 if fileURLs.isEmpty {
                     DispatchQueue.main.async {
                         self.statusLabel.text = "No historical data available"
@@ -1620,11 +1802,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     }
                     return
                 }
-                
+
                 // Group files by location
                 let decoder = JSONDecoder()
                 var locationData: [String: [ExportedSurvey]] = [:]
-                
+
                 for fileURL in fileURLs {
                     do {
                         let data = try Data(contentsOf: fileURL)
@@ -1635,7 +1817,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         print("Failed to process file \(fileURL.lastPathComponent): \(error)")
                     }
                 }
-                
+
                 if locationData.isEmpty {
                     DispatchQueue.main.async {
                         self.statusLabel.text = "No location data found"
@@ -1646,19 +1828,19 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     }
                     return
                 }
-                
+
                 DispatchQueue.main.async {
                     self.statusLabel.text = "Aggregation complete"
                     self.statusLabel.textColor = .systemGreen
                     self.aggregateButton.isEnabled = true
                     self.aggregateButton.alpha = 1.0
-                    
+
                     // Show location aggregation view
                     let locationVC = LocationAggregationViewController()
                     locationVC.locationData = locationData
                     locationVC.questionnaireData = self.questionnaireData
                     locationVC.exportsDirectory = try? self.ensureExportsDirectory()
-                    
+
                     let navController = UINavigationController(rootViewController: locationVC)
                     self.present(navController, animated: true)
                 }
@@ -1674,5 +1856,3 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 }
-
-

@@ -4,13 +4,14 @@ import json
 import logging
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional
 from uuid import UUID, uuid4
 
 import pymysql
 from pymysql.err import IntegrityError, OperationalError
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -22,6 +23,8 @@ MYSQL_USER = os.environ["MYSQL_USER"]
 MYSQL_PASSWORD = os.environ["MYSQL_PASSWORD"]
 MYSQL_DATABASE = os.environ["MYSQL_DATABASE"]
 API_KEY = os.environ.get("API_KEY", "").strip()
+AUDIO_STORAGE_DIR = Path(os.environ.get("AUDIO_STORAGE_DIR", "uploaded_audio")).expanduser()
+AUDIO_MAX_BYTES = int(os.environ.get("AUDIO_MAX_BYTES", str(200 * 1024 * 1024)))
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,17 @@ def uuid_to_bytes(u: UUID) -> bytes:
 
 def bytes_to_uuid_hex(b: bytes) -> str:
     return str(UUID(bytes=b))
+
+
+def sanitize_filename(name: str) -> str:
+    allowed = []
+    for ch in name:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            allowed.append(ch)
+        else:
+            allowed.append("_")
+    sanitized = "".join(allowed).strip("._")
+    return sanitized or "recording.m4a"
 
 
 @contextmanager
@@ -205,6 +219,119 @@ def post_answers(
                     raise
 
     return {"inserted": len(body.answers)}
+
+
+@app.post("/sessions/{session_id}/audio")
+def upload_session_audio(
+    session_id: str,
+    file: UploadFile = File(...),
+    recorded_at_ms: int | None = Form(default=None),
+    local_session_id: str | None = Form(default=None),
+    _: None = Depends(verify_api_key),
+):
+    try:
+        sid = UUID(hex=session_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
+    session_bytes = uuid_to_bytes(sid)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, respondent_id FROM survey_sessions WHERE id = %s",
+                (session_bytes,),
+            )
+            session_row = cur.fetchone()
+            if not session_row:
+                raise HTTPException(status_code=404, detail="session not found")
+
+            respondent_bytes = session_row["respondent_id"]
+
+    original_filename = sanitize_filename(file.filename or "recording.m4a")
+    extension = Path(original_filename).suffix.lower() or ".m4a"
+    storage_name = f"{session_id}_{uuid4().hex}{extension}"
+    session_dir = AUDIO_STORAGE_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    storage_path = session_dir / storage_name
+    relative_path = str(Path(session_id) / storage_name)
+
+    bytes_written = 0
+    try:
+        with storage_path.open("wb") as out:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > AUDIO_MAX_BYTES:
+                    out.close()
+                    storage_path.unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail="audio file is too large")
+                out.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        storage_path.unlink(missing_ok=True)
+        logger.exception("audio file save failed")
+        raise HTTPException(status_code=500, detail="failed to save audio file") from e
+    finally:
+        file.file.close()
+
+    if bytes_written <= 0:
+        storage_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="audio file is empty")
+
+    try:
+        import hashlib
+
+        sha256 = hashlib.sha256()
+        with storage_path.open("rb") as saved:
+            for chunk in iter(lambda: saved.read(1024 * 1024), b""):
+                sha256.update(chunk)
+        sha256_hex = sha256.hexdigest()
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO audio_recordings (
+                        session_id, respondent_id, original_filename, storage_path,
+                        content_type, file_size_bytes, sha256, recorded_at_ms, local_session_id
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        session_bytes,
+                        respondent_bytes,
+                        original_filename,
+                        relative_path,
+                        file.content_type,
+                        bytes_written,
+                        sha256_hex,
+                        recorded_at_ms,
+                        local_session_id,
+                    ),
+                )
+                audio_id = cur.lastrowid
+    except Exception as e:
+        storage_path.unlink(missing_ok=True)
+        if isinstance(e, (IntegrityError, OperationalError)):
+            logger.exception("audio metadata insert failed")
+            raise HTTPException(
+                status_code=500,
+                detail="audio metadata insert failed; did you apply server/schema.sql?",
+            ) from e
+        logger.exception("audio metadata processing failed")
+        raise HTTPException(status_code=500, detail="audio metadata processing failed") from e
+
+    return {
+        "id": audio_id,
+        "session_id": session_id,
+        "filename": original_filename,
+        "storage_path": relative_path,
+        "file_size_bytes": bytes_written,
+        "sha256": sha256_hex,
+    }
 
 
 class LLMEventCreate(BaseModel):

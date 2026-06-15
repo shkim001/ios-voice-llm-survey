@@ -108,6 +108,24 @@ final class SurveyAPIClient {
     struct TrajectoryBatch: Encodable {
         let points: [PendingTrajectoryStore.Point]
     }
+
+    struct AudioUploadResponse: Decodable {
+        let id: Int
+        let sessionId: String
+        let filename: String
+        let storagePath: String
+        let fileSizeBytes: Int
+        let sha256: String
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case sessionId = "session_id"
+            case filename
+            case storagePath = "storage_path"
+            case fileSizeBytes = "file_size_bytes"
+            case sha256
+        }
+    }
     
     func postTrajectory(respondentId: String, points: [PendingTrajectoryStore.Point]) async throws {
         let body = TrajectoryBatch(points: points)
@@ -116,6 +134,55 @@ final class SurveyAPIClient {
             path: "/respondents/\(respondentId)/trajectory",
             body: body
         )
+    }
+
+    func uploadAudio(
+        sessionId: String,
+        fileURL: URL,
+        recordedAtMs: Int?,
+        localSessionId: String?
+    ) async throws -> AudioUploadResponse {
+        let url = try makeURL(path: "/sessions/\(sessionId)/audio")
+        let boundary = "Boundary-\(UUID().uuidString)"
+        let filename = fileURL.lastPathComponent
+        let fileData = try Data(contentsOf: fileURL)
+
+        var body = Data()
+        appendFormField(name: "recorded_at_ms", value: recordedAtMs.map(String.init), to: &body, boundary: boundary)
+        appendFormField(name: "local_session_id", value: localSessionId, to: &body, boundary: boundary)
+        appendFileField(
+            name: "file",
+            filename: filename,
+            contentType: "audio/mp4",
+            data: fileData,
+            to: &body,
+            boundary: boundary
+        )
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        if !apiKey.isEmpty {
+            req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        }
+        req.timeoutInterval = 120.0
+
+        let (data, response) = try await URLSession.shared.upload(for: req, from: body)
+        guard let http = response as? HTTPURLResponse else {
+            throw SurveyAPIError.invalidHTTPResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.httpError(statusCode: http.statusCode, bodyPreview: String(raw.prefix(500)))
+        }
+
+        do {
+            return try JSONDecoder().decode(AudioUploadResponse.self, from: data)
+        } catch {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.decodingFailed(rawPreview: String(raw.prefix(300)))
+        }
     }
     
     // MARK: - Networking internals
@@ -180,6 +247,28 @@ final class SurveyAPIClient {
         }
         return data
     }
+
+    private func appendFormField(name: String, value: String?, to body: inout Data, boundary: String) {
+        guard let value, !value.isEmpty else { return }
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".data(using: .utf8)!)
+        body.append("\(value)\r\n".data(using: .utf8)!)
+    }
+
+    private func appendFileField(
+        name: String,
+        filename: String,
+        contentType: String,
+        data: Data,
+        to body: inout Data,
+        boundary: String
+    ) {
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename)\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: \(contentType)\r\n\r\n".data(using: .utf8)!)
+        body.append(data)
+        body.append("\r\n".data(using: .utf8)!)
+    }
 }
 
 // MARK: - Errors
@@ -242,4 +331,3 @@ struct AnyJSON: Encodable {
         }
     }
 }
-

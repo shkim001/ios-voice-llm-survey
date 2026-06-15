@@ -134,6 +134,11 @@ MYSQL_DATABASE=survey
 
 # Optional: require X-API-Key header on all mutating routes (leave empty to disable)
 API_KEY=your-shared-secret
+
+# Optional: where uploaded audio files are stored on the VM.
+# Use an absolute path for production, e.g. /var/lib/ios-voice-llm-survey/audio
+AUDIO_STORAGE_DIR=./uploaded_audio
+AUDIO_MAX_BYTES=209715200
 ```
 
 ### 2. Install and run
@@ -156,7 +161,7 @@ Use HTTPS in production, or configure firewall rules so only trusted clients rea
 
 ### 3. Database schema
 
-Ensure MySQL has tables for respondents, sessions, questions, and answers (your existing study schema). Then apply trajectory support:
+Ensure MySQL has tables for respondents, sessions, questions, and answers (your existing study schema). Then apply trajectory/audio support:
 
 ```bash
 mysql -h "$MYSQL_HOST" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" < schema.sql
@@ -178,6 +183,7 @@ python3 scripts/seed_questions.py ../CounterApp/questionnaire.json
 | `GET` | `/health` | Health check |
 | `POST` | `/sessions` | Create respondent + session |
 | `POST` | `/sessions/{session_id}/answers` | Batch upload LLM-matched answers |
+| `POST` | `/sessions/{session_id}/audio` | Upload the session recording to VM-local storage |
 | `POST` | `/respondents/{respondent_id}/trajectory` | Upload GPS points |
 | `GET` | `/respondents/{respondent_id}/trajectory` | Read back trajectory |
 | `POST` | `/llm-events` | Optional LLM telemetry |

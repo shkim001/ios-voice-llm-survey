@@ -39,3 +39,30 @@ CREATE TABLE IF NOT EXISTS trajectory_points (
     ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS audio_recordings (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  session_id BINARY(16) NOT NULL,
+  respondent_id BINARY(16) NOT NULL,
+
+  original_filename VARCHAR(255) NOT NULL,
+  storage_path VARCHAR(1024) NOT NULL,
+  content_type VARCHAR(128) NULL,
+  file_size_bytes BIGINT UNSIGNED NOT NULL,
+  sha256 CHAR(64) NOT NULL,
+
+  recorded_at_ms BIGINT NULL,
+  local_session_id VARCHAR(64) NULL,
+  uploaded_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+
+  PRIMARY KEY (id),
+  INDEX idx_audio_session_uploaded (session_id, uploaded_at),
+  INDEX idx_audio_respondent_uploaded (respondent_id, uploaded_at),
+
+  CONSTRAINT fk_audio_session
+    FOREIGN KEY (session_id) REFERENCES survey_sessions(id)
+    ON DELETE CASCADE,
+
+  CONSTRAINT fk_audio_respondent
+    FOREIGN KEY (respondent_id) REFERENCES respondents(id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

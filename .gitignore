@@ -12,3 +12,8 @@ __pycache__/
 venv/
 .env
 
+# Server-local uploaded recordings
+server/uploaded_audio/
+
+# Local Codex project memory
+AGENTS.md
