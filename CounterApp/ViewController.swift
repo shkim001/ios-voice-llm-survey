@@ -20,6 +20,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private var audioRecorder: AVAudioRecorder?
     private var audioPlayer: AVAudioPlayer?
     private var recordingURL: URL?
+    private var recordingStartTrajectoryPoint: PendingTrajectoryStore.Point?
 
     // Per-participant session (local-only separation)
     private var sessionId: String?
@@ -193,9 +194,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     await self?.ensureCloudSessionCreated()
                 }
 
-                // Start recording after info is submitted
-                self.isRecording = true
-                self.startRecording()
+                // Start recording only after a fresh GPS point is captured.
+                self.prepareAndStartRecording()
                 self.resetInactivityTimer()
             }
             animateButton(sender)
@@ -1002,7 +1002,41 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 
-    private func startRecording() {
+    private func prepareAndStartRecording() {
+        guard !isRecording else { return }
+
+        recordButton.isEnabled = false
+        recordButton.alpha = 0.5
+        statusLabel.text = "Checking GPS location...\nPlease wait"
+        statusLabel.textColor = .systemBlue
+
+        Task { [weak self] in
+            do {
+                let point = try await TrajectoryTracker.shared.captureRequiredRecordingStartPoint()
+                await MainActor.run {
+                    guard let self = self else { return }
+                    self.recordingStartTrajectoryPoint = point
+                    self.recordButton.isEnabled = true
+                    self.recordButton.alpha = 1.0
+                    self.isRecording = true
+                    self.startRecording(with: point)
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self = self else { return }
+                    self.recordingStartTrajectoryPoint = nil
+                    self.isRecording = false
+                    self.recordButton.isEnabled = true
+                    self.recordButton.alpha = 1.0
+                    self.statusLabel.text = "GPS location unavailable"
+                    self.statusLabel.textColor = .systemRed
+                    self.showMessage("Could not get a current GPS location, so recording was not started. Please make sure Location Services are enabled and try again.")
+                }
+            }
+        }
+    }
+
+    private func startRecording(with recordingStartPoint: PendingTrajectoryStore.Point) {
         resetInactivityTimer()
         let audioSession = AVAudioSession.sharedInstance()
 
@@ -1011,6 +1045,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             try audioSession.setActive(true)
         } catch {
             showMessage("Audio session setup failed: \(error.localizedDescription)")
+            isRecording = false
+            recordButton.setTitle("Start Recording", for: .normal)
+            recordButton.backgroundColor = .systemRed
             return
         }
 
@@ -1023,9 +1060,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
             url = try SessionManager.shared.makeRecordingURL()
             recordingURL = url
-            writeRecordingMetadata(for: url)
+            writeRecordingMetadata(for: url, recordingStartPoint: recordingStartPoint)
         } catch {
             showMessage("Failed to create session/recording path: \(error.localizedDescription)")
+            isRecording = false
+            recordButton.setTitle("Start Recording", for: .normal)
+            recordButton.backgroundColor = .systemRed
             return
         }
 
@@ -1048,6 +1088,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             audioFilesButton?.alpha = 0.5
         } catch {
             showMessage("Recording failed to start: \(error.localizedDescription)")
+            isRecording = false
+            recordButton.setTitle("Start Recording", for: .normal)
+            recordButton.backgroundColor = .systemRed
             audioFilesButton?.isEnabled = true
             audioFilesButton?.alpha = 1.0
         }
@@ -1075,13 +1118,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         recordedData = "Recording data - Timestamp: \(Date().timeIntervalSince1970)"
     }
 
-    private func writeRecordingMetadata(for recordingURL: URL) {
+    private func writeRecordingMetadata(for recordingURL: URL, recordingStartPoint: PendingTrajectoryStore.Point) {
         let metadataURL = recordingURL.deletingPathExtension().appendingPathExtension("json")
         var metadata: [String: Any] = [
             "recording_file": recordingURL.lastPathComponent,
             "recorded_at_epoch": Date().timeIntervalSince1970,
             "session_id": sessionId ?? "",
-            "location": respondentInfo?.location ?? ""
+            "location": respondentInfo?.location ?? "",
+            "recording_start_trajectory_point": trajectoryPointDictionary(recordingStartPoint)
         ]
 
         if let info = respondentInfo {
@@ -1100,6 +1144,21 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         } catch {
             print("Failed to write recording metadata: \(error.localizedDescription)")
         }
+    }
+
+    private func trajectoryPointDictionary(_ point: PendingTrajectoryStore.Point) -> [String: Any] {
+        var dict: [String: Any] = [
+            "ts_ms": point.tsMs,
+            "lat": point.lat,
+            "lon": point.lon
+        ]
+        if let accuracyM = point.accuracyM { dict["accuracy_m"] = accuracyM }
+        if let speedMps = point.speedMps { dict["speed_mps"] = speedMps }
+        if let courseDeg = point.courseDeg { dict["course_deg"] = courseDeg }
+        if let provider = point.provider { dict["provider"] = provider }
+        if let isBackground = point.isBackground { dict["is_background"] = isBackground }
+        if let sessionId = point.sessionId, !sessionId.isEmpty { dict["session_id"] = sessionId }
+        return dict
     }
 
     // MARK: - Speech Recognition
@@ -1210,6 +1269,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         TrajectoryTracker.shared.setCurrentIdentity(respondentId: nil, sessionId: nil)
         recordedData = nil
         recordingURL = nil
+        recordingStartTrajectoryPoint = nil
 
         // Reset UI state
         recordButton.setTitle("Start Recording", for: .normal)
@@ -1633,13 +1693,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func uploadAnswersToCloud(transcription: String, matchedQuestions: [MatchedQuestion], recordingURL: URL?) async {
-        guard !matchedQuestions.isEmpty else { return }
         guard SurveyAPIClient.shared.isConfigured() else { return }
 
         if cloudSessionId == nil {
             await ensureCloudSessionCreated()
         }
         guard let sid = cloudSessionId else { return }
+        await uploadRecordingStartTrajectoryIfNeeded(sessionId: sid, recordingURL: recordingURL)
+        guard !matchedQuestions.isEmpty else { return }
 
         let info = respondentInfo
         let answers: [[String: Any]] = matchedQuestions.map { mq in
@@ -1660,10 +1721,22 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         do {
             try await SurveyAPIClient.shared.postAnswers(sessionId: sid, answers: answers)
             await uploadAudioToCloudIfNeeded(sessionId: sid, recordingURL: recordingURL)
-            await TrajectoryTracker.shared.captureLLMRecognitionPointNow()
         } catch {
             PendingSurveyUploadStore.shared.enqueue(sessionId: sid, answers: answers)
             print("Survey API postAnswers failed; enqueued pending batch: \(error.localizedDescription)")
+        }
+    }
+
+    private func uploadRecordingStartTrajectoryIfNeeded(sessionId: String, recordingURL: URL?) async {
+        guard let recordingURL else { return }
+        guard !isRecordingStartTrajectoryUploadMarked(for: recordingURL) else { return }
+        guard let point = recordingStartTrajectoryPoint(for: recordingURL, cloudSessionId: sessionId) else { return }
+
+        do {
+            try await TrajectoryTracker.shared.uploadRecordingStartPoint(point)
+            markRecordingStartTrajectoryUploaded(for: recordingURL)
+        } catch {
+            print("Recording-start trajectory upload failed; point remains in recording metadata for retry: \(error.localizedDescription)")
         }
     }
 
@@ -1717,8 +1790,80 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         return recordingURL.deletingLastPathComponent().lastPathComponent
     }
 
+    private func recordingStartTrajectoryPoint(
+        for recordingURL: URL,
+        cloudSessionId: String
+    ) -> PendingTrajectoryStore.Point? {
+        if let point = recordingStartTrajectoryPoint {
+            return pointWithCloudSessionId(point, cloudSessionId)
+        }
+
+        guard let raw = recordingMetadata(for: recordingURL)?["recording_start_trajectory_point"] as? [String: Any] else {
+            return nil
+        }
+        guard let tsMs = int64Value(raw["ts_ms"]),
+              let lat = doubleValue(raw["lat"]),
+              let lon = doubleValue(raw["lon"]) else {
+            return nil
+        }
+
+        let point = PendingTrajectoryStore.Point(
+            tsMs: tsMs,
+            lat: lat,
+            lon: lon,
+            accuracyM: doubleValue(raw["accuracy_m"]),
+            speedMps: doubleValue(raw["speed_mps"]),
+            courseDeg: doubleValue(raw["course_deg"]),
+            provider: raw["provider"] as? String ?? "recording-start",
+            isBackground: raw["is_background"] as? Bool,
+            sessionId: cloudSessionId
+        )
+        recordingStartTrajectoryPoint = point
+        return point
+    }
+
+    private func pointWithCloudSessionId(
+        _ point: PendingTrajectoryStore.Point,
+        _ cloudSessionId: String
+    ) -> PendingTrajectoryStore.Point {
+        return PendingTrajectoryStore.Point(
+            tsMs: point.tsMs,
+            lat: point.lat,
+            lon: point.lon,
+            accuracyM: point.accuracyM,
+            speedMps: point.speedMps,
+            courseDeg: point.courseDeg,
+            provider: point.provider,
+            isBackground: point.isBackground,
+            sessionId: cloudSessionId
+        )
+    }
+
+    private func int64Value(_ value: Any?) -> Int64? {
+        if let value = value as? Int64 { return value }
+        if let value = value as? Int { return Int64(value) }
+        if let value = value as? Double { return Int64(value) }
+        if let value = value as? NSNumber { return value.int64Value }
+        if let value = value as? String { return Int64(value) }
+        return nil
+    }
+
+    private func doubleValue(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? Float { return Double(value) }
+        if let value = value as? Int { return Double(value) }
+        if let value = value as? Int64 { return Double(value) }
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String { return Double(value) }
+        return nil
+    }
+
     private func isAudioUploadMarked(for recordingURL: URL) -> Bool {
         return recordingMetadata(for: recordingURL)?["audio_uploaded_at_epoch"] != nil
+    }
+
+    private func isRecordingStartTrajectoryUploadMarked(for recordingURL: URL) -> Bool {
+        return recordingMetadata(for: recordingURL)?["recording_start_trajectory_uploaded_at_epoch"] != nil
     }
 
     private func markAudioUploaded(for recordingURL: URL, response: SurveyAPIClient.AudioUploadResponse) {
@@ -1735,6 +1880,19 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             try data.write(to: metadataURL, options: [.atomic])
         } catch {
             print("Failed to mark audio as uploaded: \(error.localizedDescription)")
+        }
+    }
+
+    private func markRecordingStartTrajectoryUploaded(for recordingURL: URL) {
+        let metadataURL = recordingMetadataURL(for: recordingURL)
+        var metadata = recordingMetadata(for: recordingURL) ?? [:]
+        metadata["recording_start_trajectory_uploaded_at_epoch"] = Date().timeIntervalSince1970
+
+        do {
+            let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: metadataURL, options: [.atomic])
+        } catch {
+            print("Failed to mark recording-start trajectory as uploaded: \(error.localizedDescription)")
         }
     }
 

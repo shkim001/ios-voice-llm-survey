@@ -3,16 +3,12 @@ import CoreLocation
 import UIKit
 
 /// Minimal trajectory tracking:
-/// - uses Significant Location Change (battery friendly)
-/// - captures a one-time GPS point when LLM answers are uploaded
-/// - persists points locally
-/// - uploads opportunistically when app is active (and also after each new point)
+/// - captures a required one-time GPS point before recording starts
+/// - uploads that saved point when a cloud respondent/session identity exists
 final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
     static let shared = TrajectoryTracker()
 
     private let manager = CLLocationManager()
-    private var isTracking = false
-    private var isFlushing = false
     private var lastKnownLocation: CLLocation?
 
     private override init() {
@@ -25,45 +21,37 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
     // MARK: - Public
 
     func startIfPossible() {
-        guard SurveyAPIClient.shared.isConfigured() else { return }
-        guard currentRespondentId() != nil else { return }
-
-        ensureAuthorization()
-
-        // Significant-change tracking can continue in the background with "Always" permission.
-        if !isTracking {
-            isTracking = true
-            manager.startMonitoringSignificantLocationChanges()
-        }
+        stop()
     }
 
     func stop() {
-        isTracking = false
         manager.stopMonitoringSignificantLocationChanges()
     }
 
     func flushPendingNow() {
-        Task { [weak self] in
-            await self?.flushLoop()
-        }
+        stop()
     }
 
-    func captureLLMRecognitionPointNow() async {
-        guard SurveyAPIClient.shared.isConfigured() else { return }
-        guard currentRespondentId() != nil else { return }
-
-        do {
-            let loc = try await OneShotLocationRequester.currentLocation()
-            lastKnownLocation = loc
-            await appendAndFlushLLMRecognitionPoint(from: loc, timestamp: loc.timestamp)
-        } catch {
-            if let fallback = bestCachedLocation(maxAgeSeconds: 10 * 60) {
-                await appendAndFlushLLMRecognitionPoint(from: fallback, timestamp: Date())
-                print("LLM recognition location capture used cached location after failure: \(error.localizedDescription)")
-            } else {
-                print("LLM recognition location capture failed: \(error.localizedDescription)")
-            }
+    func captureRequiredRecordingStartPoint() async throws -> PendingTrajectoryStore.Point {
+        let loc = try await OneShotLocationRequester.currentLocation()
+        guard isUsable(loc, maxAgeSeconds: 60) else {
+            throw OneShotLocationError.unavailable
         }
+
+        lastKnownLocation = loc
+        return makePoint(
+            from: loc,
+            timestamp: Date(),
+            provider: "recording-start",
+            isBackground: await MainActor.run { UIApplication.shared.applicationState != .active },
+            sessionId: currentSessionId()
+        )
+    }
+
+    func uploadRecordingStartPoint(_ point: PendingTrajectoryStore.Point) async throws {
+        guard SurveyAPIClient.shared.isConfigured() else { return }
+        guard let respondentId = currentRespondentId() else { return }
+        try await SurveyAPIClient.shared.postTrajectory(respondentId: respondentId, points: [point])
     }
 
     func setCurrentIdentity(respondentId: String?, sessionId: String?) {
@@ -78,54 +66,20 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.sessionId)
         }
 
-        // Re-evaluate tracking state
         if respondentId == nil {
             stop()
-        } else {
-            startIfPossible()
         }
     }
 
     // MARK: - CLLocationManagerDelegate
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        switch manager.authorizationStatus {
-        case .authorizedAlways:
-            startIfPossible()
-        case .authorizedWhenInUse:
-            // Encourage upgrade to Always for background tracking
-            manager.requestAlwaysAuthorization()
-        default:
-            break
-        }
+        stop()
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
-        guard let respondentId = currentRespondentId() else { return }
-        guard SurveyAPIClient.shared.isConfigured() else { return }
         lastKnownLocation = loc
-
-        let point = PendingTrajectoryStore.Point(
-            tsMs: Int64(loc.timestamp.timeIntervalSince1970 * 1000.0),
-            lat: loc.coordinate.latitude,
-            lon: loc.coordinate.longitude,
-            accuracyM: loc.horizontalAccuracy >= 0 ? Double(loc.horizontalAccuracy) : nil,
-            speedMps: loc.speed >= 0 ? Double(loc.speed) : nil,
-            courseDeg: loc.course >= 0 ? Double(loc.course) : nil,
-            provider: "significant-change",
-            isBackground: UIApplication.shared.applicationState != .active,
-            sessionId: currentSessionId()
-        )
-
-        PendingTrajectoryStore.shared.append(point)
-
-        // Best-effort: attempt upload soon after capturing a point.
-        Task { [weak self] in
-            await self?.flushLoop()
-        }
-
-        _ = respondentId // keep for clarity; respondentId is used in flush
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
@@ -150,77 +104,30 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
         return (id?.isEmpty == false) ? id : nil
     }
 
-    private func ensureAuthorization() {
-        switch manager.authorizationStatus {
-        case .notDetermined:
-            manager.requestWhenInUseAuthorization()
-        case .authorizedWhenInUse:
-            manager.requestAlwaysAuthorization()
-        default:
-            break
-        }
-    }
-
-    private func bestCachedLocation(maxAgeSeconds: TimeInterval) -> CLLocation? {
-        let candidates = [lastKnownLocation, manager.location].compactMap { $0 }
-        return candidates
-            .filter { isUsable($0, maxAgeSeconds: maxAgeSeconds) }
-            .sorted { $0.timestamp > $1.timestamp }
-            .first
-    }
-
     private func isUsable(_ location: CLLocation, maxAgeSeconds: TimeInterval) -> Bool {
         guard CLLocationCoordinate2DIsValid(location.coordinate) else { return false }
         guard location.horizontalAccuracy >= 0 else { return false }
         return abs(location.timestamp.timeIntervalSinceNow) <= maxAgeSeconds
     }
 
-    private func appendAndFlushLLMRecognitionPoint(from loc: CLLocation, timestamp: Date) async {
-        let wasFlushing = isFlushing
-        let point = PendingTrajectoryStore.Point(
+    private func makePoint(
+        from loc: CLLocation,
+        timestamp: Date,
+        provider: String,
+        isBackground: Bool,
+        sessionId: String?
+    ) -> PendingTrajectoryStore.Point {
+        return PendingTrajectoryStore.Point(
             tsMs: Int64(timestamp.timeIntervalSince1970 * 1000.0),
             lat: loc.coordinate.latitude,
             lon: loc.coordinate.longitude,
             accuracyM: loc.horizontalAccuracy >= 0 ? Double(loc.horizontalAccuracy) : nil,
             speedMps: loc.speed >= 0 ? Double(loc.speed) : nil,
             courseDeg: loc.course >= 0 ? Double(loc.course) : nil,
-            provider: "llm-recognition",
-            isBackground: await MainActor.run { UIApplication.shared.applicationState != .active },
-            sessionId: currentSessionId()
+            provider: provider,
+            isBackground: isBackground,
+            sessionId: sessionId
         )
-
-        PendingTrajectoryStore.shared.append(point)
-
-        if wasFlushing {
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                await self?.flushLoop()
-            }
-        } else {
-            await flushLoop()
-        }
-    }
-
-    private func flushLoop() async {
-        guard !isFlushing else { return }
-        isFlushing = true
-        defer { isFlushing = false }
-
-        guard SurveyAPIClient.shared.isConfigured() else { return }
-        guard let respondentId = currentRespondentId() else { return }
-
-        // Upload up to N points per flush; keep looping briefly to reduce backlog.
-        for _ in 0..<5 {
-            let batch = PendingTrajectoryStore.shared.drain(max: 250)
-            if batch.isEmpty { return }
-
-            do {
-                try await SurveyAPIClient.shared.postTrajectory(respondentId: respondentId, points: batch)
-            } catch {
-                PendingTrajectoryStore.shared.requeueFront(batch)
-                return
-            }
-        }
     }
 }
 
