@@ -126,6 +126,30 @@ final class SurveyAPIClient {
             case sha256
         }
     }
+
+    struct SessionPackageUploadResponse: Decodable {
+        let sessionId: String
+        let respondentId: String
+        let packageDir: String
+        let jsonPath: String
+        let audioPath: String?
+        let jsonFileSizeBytes: Int
+        let audioFileSizeBytes: Int?
+        let jsonSha256: String
+        let audioSha256: String?
+
+        enum CodingKeys: String, CodingKey {
+            case sessionId = "session_id"
+            case respondentId = "respondent_id"
+            case packageDir = "package_dir"
+            case jsonPath = "json_path"
+            case audioPath = "audio_path"
+            case jsonFileSizeBytes = "json_file_size_bytes"
+            case audioFileSizeBytes = "audio_file_size_bytes"
+            case jsonSha256 = "json_sha256"
+            case audioSha256 = "audio_sha256"
+        }
+    }
     
     func postTrajectory(respondentId: String, points: [PendingTrajectoryStore.Point]) async throws {
         let body = TrajectoryBatch(points: points)
@@ -179,6 +203,66 @@ final class SurveyAPIClient {
 
         do {
             return try JSONDecoder().decode(AudioUploadResponse.self, from: data)
+        } catch {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.decodingFailed(rawPreview: String(raw.prefix(300)))
+        }
+    }
+
+    func uploadSessionPackage(
+        sessionId: String,
+        sessionJSONURL: URL,
+        audioURL: URL?,
+        localSessionId: String?
+    ) async throws -> SessionPackageUploadResponse {
+        let url = try makeURL(path: "/sessions/\(sessionId)/package")
+        let boundary = "Boundary-\(UUID().uuidString)"
+        let sessionJSONData = try Data(contentsOf: sessionJSONURL)
+
+        var body = Data()
+        appendFormField(name: "local_session_id", value: localSessionId, to: &body, boundary: boundary)
+        appendFileField(
+            name: "session_json",
+            filename: sessionJSONURL.lastPathComponent,
+            contentType: "application/json",
+            data: sessionJSONData,
+            to: &body,
+            boundary: boundary
+        )
+
+        if let audioURL {
+            let audioData = try Data(contentsOf: audioURL)
+            appendFileField(
+                name: "audio",
+                filename: audioURL.lastPathComponent,
+                contentType: "audio/mp4",
+                data: audioData,
+                to: &body,
+                boundary: boundary
+            )
+        }
+
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        if !apiKey.isEmpty {
+            req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
+        }
+        req.timeoutInterval = 120.0
+
+        let (data, response) = try await URLSession.shared.upload(for: req, from: body)
+        guard let http = response as? HTTPURLResponse else {
+            throw SurveyAPIError.invalidHTTPResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.httpError(statusCode: http.statusCode, bodyPreview: String(raw.prefix(500)))
+        }
+
+        do {
+            return try JSONDecoder().decode(SessionPackageUploadResponse.self, from: data)
         } catch {
             let raw = String(data: data, encoding: .utf8) ?? ""
             throw SurveyAPIError.decodingFailed(rawPreview: String(raw.prefix(300)))

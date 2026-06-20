@@ -14,6 +14,7 @@ venv/
 
 # Server-local uploaded recordings
 server/uploaded_audio/
+server/survey_session_packages/
 
 # Local Codex project memory
 AGENTS.md

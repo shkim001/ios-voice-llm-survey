@@ -1,4 +1,4 @@
--- Minimal schema additions for trajectory storage.
+-- Schema additions for VM-local interview packages and legacy upload tables.
 -- Assumes existing tables:
 --   respondents(id BINARY(16) PRIMARY KEY, ...)
 --   survey_sessions(id BINARY(16) PRIMARY KEY, respondent_id BINARY(16) NOT NULL, ...)
@@ -63,6 +63,44 @@ CREATE TABLE IF NOT EXISTS audio_recordings (
     ON DELETE CASCADE,
 
   CONSTRAINT fk_audio_respondent
+    FOREIGN KEY (respondent_id) REFERENCES respondents(id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS session_packages (
+  session_id BINARY(16) NOT NULL,
+  respondent_id BINARY(16) NOT NULL,
+
+  local_session_id VARCHAR(64) NULL,
+  package_dir VARCHAR(1024) NOT NULL,
+
+  json_path VARCHAR(1024) NOT NULL,
+  json_file_size_bytes BIGINT UNSIGNED NOT NULL,
+  json_sha256 CHAR(64) NOT NULL,
+
+  audio_path VARCHAR(1024) NULL,
+  audio_original_filename VARCHAR(255) NULL,
+  audio_file_size_bytes BIGINT UNSIGNED NULL,
+  audio_sha256 CHAR(64) NULL,
+
+  recorded_at_ms BIGINT NULL,
+  location_label VARCHAR(255) NULL,
+  gps_lat DOUBLE NULL,
+  gps_lon DOUBLE NULL,
+  answer_count INT UNSIGNED NULL,
+  transcript_chars INT UNSIGNED NULL,
+
+  uploaded_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+
+  PRIMARY KEY (session_id),
+  INDEX idx_session_packages_respondent_uploaded (respondent_id, uploaded_at),
+  INDEX idx_session_packages_location_uploaded (location_label, uploaded_at),
+
+  CONSTRAINT fk_session_packages_session
+    FOREIGN KEY (session_id) REFERENCES survey_sessions(id)
+    ON DELETE CASCADE,
+
+  CONSTRAINT fk_session_packages_respondent
     FOREIGN KEY (respondent_id) REFERENCES respondents(id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

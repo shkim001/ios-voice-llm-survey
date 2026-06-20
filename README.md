@@ -1,6 +1,6 @@
 # Questionnaire LLM iOS App
 
-A Swift iOS app for field researchers to collect location-based street assessments. Participants record spoken responses; the app captures a required GPS point at recording start, transcribes audio, matches answers to survey questions with an LLM, and optionally uploads results, recording audio, and interview coordinates to a backend (FastAPI + MySQL / Cloud SQL).
+A Swift iOS app for field researchers to collect location-based street assessments. Participants record spoken responses; the app captures a required GPS point at recording start, transcribes audio, matches answers to survey questions with an LLM, and optionally uploads one complete interview package to a backend (FastAPI + MySQL / Cloud SQL).
 
 ## Architecture
 
@@ -12,16 +12,17 @@ flowchart LR
   DB[(MySQL / Cloud SQL)]
 
   iOS -->|transcription + chat/completions| LLM
-  iOS -->|sessions, answers, audio, recording-start GPS| API
-  API --> DB
+  iOS -->|session.json + audio.m4a| API
+  API -->|session package files| Files[(VM filesystem)]
+  API -->|package index| DB
 ```
 
 | Component | Role |
 |-----------|------|
 | **iOS app** | Required recording-start GPS capture, audio recording, speech-to-text, LLM matching, local JSON export, optional cloud upload |
 | **LLM** | OpenAI, Gemini, or a **self-hosted OpenAI-compatible** endpoint on a VM |
-| **Survey API** (`server/`) | Persists respondents, sessions, answers, recording-start GPS points, and uploaded audio metadata/files |
-| **MySQL** | Cloud SQL or any MySQL 8+ instance the Survey API connects to |
+| **Survey API** (`server/`) | Creates respondent/session IDs, stores each interview folder on the VM, and writes a lightweight MySQL index |
+| **MySQL** | Cloud SQL or any MySQL 8+ instance used as an index for session package paths and searchable metadata |
 
 You can run in **local-only** mode (export JSON on device, no server) or **full study** mode (Survey API + database + optional VM LLM).
 
@@ -44,7 +45,7 @@ You can run in **local-only** mode (export JSON on device, no server) or **full 
 ### Survey API (optional, for cloud storage)
 
 - Python 3.10+
-- MySQL database (e.g. Google Cloud SQL) with schema for `respondents`, `survey_sessions`, `questions`, `answers`
+- MySQL database (e.g. Google Cloud SQL) with schema for `respondents` and `survey_sessions`; `schema.sql` adds the session package index table
 - A host to run `uvicorn` (GCP VM, Cloud Run, etc.)
 
 ---
@@ -108,10 +109,9 @@ Open **Settings** (gear) from the main screen.
 
 When the Survey API is configured:
 
-- After **LLM Recognition**, matched answers are posted to `POST /sessions/{id}/answers`.
-- The current recording is uploaded to `POST /sessions/{id}/audio` and stored under `AUDIO_STORAGE_DIR` on the server.
-- The GPS point captured at **recording start** is uploaded to `POST /respondents/{id}/trajectory` with provider `recording-start`.
-- Failed answer uploads are **queued locally** and retried on the next launch.
+- After **LLM Recognition**, the app writes `session.json` into the local `SurveySessions/<local-session-id>/` folder.
+- If the Survey API is configured, the app uploads `session.json` and the `.m4a` recording together to `POST /sessions/{id}/package`.
+- The server stores both files under one VM folder and writes only an index row to MySQL.
 - Recording is blocked if the app cannot retrieve a current GPS coordinate.
 
 ---
@@ -137,8 +137,12 @@ MYSQL_DATABASE=survey
 # Optional: require X-API-Key header on all mutating routes (leave empty to disable)
 API_KEY=your-shared-secret
 
-# Optional: where uploaded audio files are stored on the VM.
-# Use an absolute path for production, e.g. /var/lib/ios-voice-llm-survey/audio
+# Optional: where complete session packages are stored on the VM.
+# Use an absolute path for production, e.g. /var/lib/ios-voice-llm-survey/session-packages
+SURVEY_PACKAGE_STORAGE_DIR=./survey_session_packages
+SESSION_JSON_MAX_BYTES=26214400
+
+# Legacy audio-only endpoint storage. New app uploads use SURVEY_PACKAGE_STORAGE_DIR.
 AUDIO_STORAGE_DIR=./uploaded_audio
 AUDIO_MAX_BYTES=209715200
 ```
@@ -163,15 +167,15 @@ Use HTTPS in production, or configure firewall rules so only trusted clients rea
 
 ### 3. Database schema
 
-Ensure MySQL has tables for respondents, sessions, questions, and answers (your existing study schema). Then apply recording-start GPS and audio upload support:
+Ensure MySQL has the existing `respondents` and `survey_sessions` tables. Then apply the package index schema:
 
 ```bash
 mysql -h "$MYSQL_HOST" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" < schema.sql
 ```
 
-### 4. Seed questionnaire rows
+### 4. Questionnaire rows
 
-Answer inserts reference `questions.id`. Load rows from the app’s questionnaire file:
+New package uploads do not insert per-answer rows into MySQL, so questionnaire seeding is not required for the package flow. If you use the legacy `/answers` endpoint, load rows from the app’s questionnaire file first:
 
 ```bash
 export $(grep -v '^#' .env | xargs)
@@ -184,10 +188,11 @@ python3 scripts/seed_questions.py ../CounterApp/questionnaire.json
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
 | `POST` | `/sessions` | Create respondent + session |
-| `POST` | `/sessions/{session_id}/answers` | Batch upload LLM-matched answers |
-| `POST` | `/sessions/{session_id}/audio` | Upload the session recording to VM-local storage |
-| `POST` | `/respondents/{respondent_id}/trajectory` | Upload the recording-start GPS point |
-| `GET` | `/respondents/{respondent_id}/trajectory` | Read back stored GPS points |
+| `POST` | `/sessions/{session_id}/package` | Upload `session.json` plus the audio file into one server folder; MySQL stores only the index |
+| `POST` | `/sessions/{session_id}/answers` | Legacy: batch upload LLM-matched answers as MySQL rows |
+| `POST` | `/sessions/{session_id}/audio` | Legacy: upload recording audio separately |
+| `POST` | `/respondents/{respondent_id}/trajectory` | Legacy: upload GPS points separately |
+| `GET` | `/respondents/{respondent_id}/trajectory` | Legacy: read back stored GPS points |
 | `POST` | `/llm-events` | Optional LLM telemetry |
 
 Authenticated requests send header `X-API-Key: <API_KEY>` when `API_KEY` is set in `.env`.
@@ -223,10 +228,10 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 3. **Transcribe** — runs automatically after recording (English locale).
 4. **LLM Recognition** — sends the transcript to the configured LLM; shows matched questions and extracted answers.
 5. **Respondent info** — prompted when exporting or as part of your study flow.
-6. **Export JSON** — saves session data under the app Documents directory (`SurveySessions/`).
+6. **Export JSON** — saves or updates `session.json` under the app Documents directory (`SurveySessions/<local-session-id>/`).
 7. **Aggregate** — summarizes previously exported JSON files on device.
 
-If Survey API is configured, step 4 also uploads the saved recording-start GPS point, matched answers, and the audio recording to the server where possible.
+If Survey API is configured, step 4 also uploads the complete session package. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row.
 
 ---
 
@@ -239,9 +244,9 @@ ios-voice-llm-survey/
 │   ├── ViewController.swift           # Main voice survey UI
 │   ├── LLMService.swift               # OpenAI / Gemini / custom base URL
 │   ├── SurveyAPIClient.swift          # FastAPI client
-│   ├── TrajectoryTracker.swift        # Required recording-start GPS capture/upload
+│   ├── TrajectoryTracker.swift        # Required recording-start GPS capture helpers
 │   ├── SessionManager.swift           # Local session folders
-│   ├── PendingSurveyUploadStore.swift # Offline answer queue
+│   ├── PendingSurveyUploadStore.swift # Legacy offline answer queue
 │   ├── MapViewController.swift        # Map-first entry (optional)
 │   ├── questionnaire.json
 │   └── ...
@@ -249,7 +254,7 @@ ios-voice-llm-survey/
 ├── CounterAppUITests/
 ├── server/
 │   ├── app/main.py                    # FastAPI Survey API
-│   ├── schema.sql                     # trajectory_points table
+│   ├── schema.sql                     # package index + legacy trajectory/audio tables
 │   ├── scripts/seed_questions.py
 │   ├── requirements.txt
 │   └── .env.example
@@ -264,10 +269,10 @@ ios-voice-llm-survey/
 |-------|----------------|
 | LLM timeout / failure | VM proxy running; model name mapping for `gpt-4o-mini`; timeout ≥ 180s on proxy chain |
 | Survey API 401 | `X-API-Key` in app matches `API_KEY` in `.env` |
-| Answers 400 / FK error | Run `seed_questions.py` so `questions` rows exist for each `question_id` |
+| Package upload fails with schema error | Apply `server/schema.sql` so `session_packages` exists |
+| Cannot find answers/transcript on server | Open `SURVEY_PACKAGE_STORAGE_DIR/<session-id>/session.json`; new uploads no longer store full answers/transcripts as MySQL rows |
 | iOS cannot reach HTTP server | ATS / use HTTPS; VM firewall allows device IP |
-| GPS point not uploading | Survey API configured; cloud session created; Location permission allowed; recording sidecar JSON has `recording_start_trajectory_point` |
-| Audio not uploading | `AUDIO_STORAGE_DIR` writable on server; `audio_recordings` table exists; recording sidecar JSON is not already marked uploaded |
+| Package/audio not uploading | `SURVEY_PACKAGE_STORAGE_DIR` writable on server; Survey API configured; cloud session created |
 | Cleartext blocked | Add VM host to `NSAppTransportSecurity` in `Info.plist` or use TLS |
 
 ---

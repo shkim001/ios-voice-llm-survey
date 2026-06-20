@@ -51,7 +51,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         initializeSessionAndPurge()
         resetInactivityTimer()
 
-        // Best-effort: resend any pending uploads from prior runs
+        // Legacy answer-row retries are intentionally disabled under package-based storage.
         Task { [weak self] in
             await self?.flushPendingSurveyUploads()
         }
@@ -311,9 +311,19 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         self.llmButton.alpha = 1.0
                     }
 
-                    // Best-effort: upload answers/audio to Survey API or enqueue answers if offline/unconfigured
+                    // Best-effort: upload one complete session package to the Survey API.
                     Task { [weak self] in
-                        await self?.uploadAnswersToCloud(
+                        guard let self else { return }
+                        do {
+                            _ = try self.writeSessionPackageJSON(
+                                transcription: transcription,
+                                matchedQuestions: matchedQuestions,
+                                recordingURL: recordingURL
+                            )
+                        } catch {
+                            print("Failed to write local session package: \(error.localizedDescription)")
+                        }
+                        await self.uploadSessionPackageToCloud(
                             transcription: transcription,
                             matchedQuestions: matchedQuestions,
                             recordingURL: recordingURL
@@ -358,46 +368,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             return
         }
 
-        // Create comprehensive JSON data
-        let timestamp = Date().timeIntervalSince1970
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        let timestampString = dateFormatter.string(from: Date())
-
-        var exportData: [String: Any] = [
-            "export_info": [
-                "export_time": timestampString,
-                "total_responses": 1,
-                "questionnaire_title": questionnaireData?.questionnaire.title ?? "Unknown"
-            ],
-            "timestamp": timestamp,
-            "session_id": sessionId ?? "",
-            "respondent_info": [
-                "name": respondentInfo.name,
-                "age": respondentInfo.age,
-                "gender": respondentInfo.gender,
-                "phone": respondentInfo.phone,
-                "location": respondentInfo.location
-            ],
-            "transcription": transcription,
-            "matched_questions": matchedQuestions.map { matched in
-                [
-                    "matched_question_id": matched.matchedQuestionId,
-                    "matched_question": matched.matchedQuestion,
-                    "extracted_answer": matched.extractedAnswer,
-                    "confidence": matched.confidence,
-                    "clarification_needed": matched.clarificationNeeded
-                ]
-            }
-        ]
-
-        // Add questionnaire if available
-        if let questionnaire = questionnaireData {
-            exportData["questionnaire"] = [
-                "title": questionnaire.questionnaire.title,
-                "description": questionnaire.questionnaire.description
-            ]
-        }
+        let exportData = makeSessionPackageJSON(
+            transcription: transcription,
+            matchedQuestions: matchedQuestions,
+            recordingURL: recordingURL
+        )
 
         // Convert to JSON data
         guard let jsonData = try? JSONSerialization.data(withJSONObject: exportData, options: .prettyPrinted) else {
@@ -406,7 +381,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
 
         // Save into the current per-participant session folder
-        let fileName = "survey_results_\(sessionId ?? "unknown")_\(Date().timeIntervalSince1970).json"
+        let fileName = "session.json"
 
         let sessionFileURL: URL
         do {
@@ -427,7 +402,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
             // Mirror into SurveyExports as well (keeps aggregation/clear flows working)
             if let exportsDirectory = try? ensureExportsDirectory() {
-                let mirrorURL = exportsDirectory.appendingPathComponent(fileName)
+                let mirrorName = "survey_results_\(sessionId ?? "unknown")_\(Date().timeIntervalSince1970).json"
+                let mirrorURL = exportsDirectory.appendingPathComponent(mirrorName)
                 try? jsonData.write(to: mirrorURL)
             }
 
@@ -1161,6 +1137,114 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         return dict
     }
 
+    private func makeSessionPackageJSON(
+        transcription: String,
+        matchedQuestions: [MatchedQuestion],
+        recordingURL: URL?
+    ) -> [String: Any] {
+        let timestamp = Date().timeIntervalSince1970
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let timestampString = dateFormatter.string(from: Date())
+
+        var exportData: [String: Any] = [
+            "schema_version": 2,
+            "export_info": [
+                "export_time": timestampString,
+                "total_responses": 1,
+                "questionnaire_title": questionnaireData?.questionnaire.title ?? "Unknown"
+            ],
+            "timestamp": timestamp,
+            "session_id": sessionId ?? "",
+            "local_session_id": sessionId ?? "",
+            "transcription": transcription,
+            "matched_questions": matchedQuestions.map { matched in
+                [
+                    "matched_question_id": matched.matchedQuestionId,
+                    "matched_question": matched.matchedQuestion,
+                    "extracted_answer": matched.extractedAnswer,
+                    "confidence": matched.confidence,
+                    "clarification_needed": matched.clarificationNeeded
+                ]
+            }
+        ]
+
+        if let respondentInfo {
+            exportData["respondent_info"] = [
+                "name": respondentInfo.name,
+                "age": respondentInfo.age,
+                "gender": respondentInfo.gender,
+                "phone": respondentInfo.phone,
+                "location": respondentInfo.location
+            ]
+            exportData["location_label"] = respondentInfo.location
+        }
+
+        if let questionnaire = questionnaireData {
+            exportData["questionnaire"] = [
+                "title": questionnaire.questionnaire.title,
+                "description": questionnaire.questionnaire.description
+            ]
+        }
+
+        if let cloudSessionId, let cloudRespondentId {
+            exportData["cloud"] = [
+                "session_id": cloudSessionId,
+                "respondent_id": cloudRespondentId
+            ]
+        }
+
+        if let recordingURL {
+            var audio: [String: Any] = [
+                "file_name": recordingURL.lastPathComponent
+            ]
+            if let localSessionId = sessionIdForRecording(recordingURL) {
+                audio["local_session_id"] = localSessionId
+            }
+            if let recordedAtMs = recordedAtMs(for: recordingURL) {
+                audio["recorded_at_ms"] = recordedAtMs
+            }
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: recordingURL.path),
+               let size = attributes[.size] as? NSNumber {
+                audio["file_size_bytes"] = size.intValue
+            }
+            exportData["audio"] = audio
+
+            if let point = recordingStartTrajectoryPoint(
+                for: recordingURL,
+                cloudSessionId: cloudSessionId ?? ""
+            ) {
+                exportData["recording_start_trajectory_point"] = trajectoryPointDictionary(point)
+            }
+
+            if let sidecar = recordingMetadata(for: recordingURL) {
+                exportData["recording_metadata"] = sidecar
+            }
+        }
+
+        return exportData
+    }
+
+    private func writeSessionPackageJSON(
+        transcription: String,
+        matchedQuestions: [MatchedQuestion],
+        recordingURL: URL?
+    ) throws -> URL {
+        let session = try SessionManager.shared.ensureCurrentSession()
+        sessionId = session.id
+        sessionDirectoryURL = session.directoryURL
+
+        let package = makeSessionPackageJSON(
+            transcription: transcription,
+            matchedQuestions: matchedQuestions,
+            recordingURL: recordingURL
+        )
+        let jsonData = try JSONSerialization.data(withJSONObject: package, options: [.prettyPrinted, .sortedKeys])
+        let url = session.directoryURL.appendingPathComponent("session.json")
+        try jsonData.write(to: url, options: [.atomic])
+        return url
+    }
+
     // MARK: - Speech Recognition
     private func transcribeAudio(url: URL, completion: @escaping (String?) -> Void) {
         resetInactivityTimer()
@@ -1687,43 +1771,37 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             cloudSessionId = resp.sessionId
             TrajectoryTracker.shared.setCurrentIdentity(respondentId: resp.respondentId, sessionId: resp.sessionId)
         } catch {
-            // Best-effort: don't block the survey; answers will be enqueued on upload attempt.
+            // Best-effort: don't block the survey; the local session package remains available on device.
             print("Survey API createSession failed: \(error.localizedDescription)")
         }
     }
 
-    private func uploadAnswersToCloud(transcription: String, matchedQuestions: [MatchedQuestion], recordingURL: URL?) async {
+    private func uploadSessionPackageToCloud(transcription: String, matchedQuestions: [MatchedQuestion], recordingURL: URL?) async {
         guard SurveyAPIClient.shared.isConfigured() else { return }
 
         if cloudSessionId == nil {
             await ensureCloudSessionCreated()
         }
         guard let sid = cloudSessionId else { return }
-        await uploadRecordingStartTrajectoryIfNeeded(sessionId: sid, recordingURL: recordingURL)
-        guard !matchedQuestions.isEmpty else { return }
-
-        let info = respondentInfo
-        let answers: [[String: Any]] = matchedQuestions.map { mq in
-            let value: [String: Any] = [
-                "extracted_answer": mq.extractedAnswer,
-                "confidence": mq.confidence,
-                "clarification_needed": mq.clarificationNeeded,
-                "matched_question": mq.matchedQuestion,
-                "transcription": transcription,
-                "location": info?.location ?? ""
-            ]
-            return [
-                "question_id": String(mq.matchedQuestionId),
-                "value": value
-            ]
-        }
 
         do {
-            try await SurveyAPIClient.shared.postAnswers(sessionId: sid, answers: answers)
-            await uploadAudioToCloudIfNeeded(sessionId: sid, recordingURL: recordingURL)
+            let packageURL = try writeSessionPackageJSON(
+                transcription: transcription,
+                matchedQuestions: matchedQuestions,
+                recordingURL: recordingURL
+            )
+            let response = try await SurveyAPIClient.shared.uploadSessionPackage(
+                sessionId: sid,
+                sessionJSONURL: packageURL,
+                audioURL: recordingURL,
+                localSessionId: sessionId
+            )
+            if let recordingURL {
+                markSessionPackageUploaded(for: recordingURL, response: response)
+            }
+            print("Survey API session package upload succeeded: \(response.packageDir)")
         } catch {
-            PendingSurveyUploadStore.shared.enqueue(sessionId: sid, answers: answers)
-            print("Survey API postAnswers failed; enqueued pending batch: \(error.localizedDescription)")
+            print("Survey API session package upload failed: \(error.localizedDescription)")
         }
     }
 
@@ -1883,6 +1961,34 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 
+    private func markSessionPackageUploaded(
+        for recordingURL: URL,
+        response: SurveyAPIClient.SessionPackageUploadResponse
+    ) {
+        let metadataURL = recordingMetadataURL(for: recordingURL)
+        var metadata = recordingMetadata(for: recordingURL) ?? [:]
+        metadata["session_package_uploaded_at_epoch"] = Date().timeIntervalSince1970
+        metadata["server_package_dir"] = response.packageDir
+        metadata["server_session_json_path"] = response.jsonPath
+        metadata["server_session_json_sha256"] = response.jsonSha256
+        if let audioPath = response.audioPath {
+            metadata["server_audio_path"] = audioPath
+        }
+        if let audioSha256 = response.audioSha256 {
+            metadata["server_audio_sha256"] = audioSha256
+        }
+        if let audioFileSizeBytes = response.audioFileSizeBytes {
+            metadata["server_audio_file_size_bytes"] = audioFileSizeBytes
+        }
+
+        do {
+            let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: metadataURL, options: [.atomic])
+        } catch {
+            print("Failed to mark session package as uploaded: \(error.localizedDescription)")
+        }
+    }
+
     private func markRecordingStartTrajectoryUploaded(for recordingURL: URL) {
         let metadataURL = recordingMetadataURL(for: recordingURL)
         var metadata = recordingMetadata(for: recordingURL) ?? [:]
@@ -1897,25 +2003,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func flushPendingSurveyUploads() async {
-        guard SurveyAPIClient.shared.isConfigured() else { return }
-        let batches = PendingSurveyUploadStore.shared.drain()
-        guard !batches.isEmpty else { return }
-
-        for batch in batches {
-            let answers: [[String: Any]] = batch.answers.map { item in
-                let value: [String: Any] = item.value.mapValues { $0.value }
-                return [
-                    "question_id": item.questionId,
-                    "value": value
-                ]
-            }
-            do {
-                try await SurveyAPIClient.shared.postAnswers(sessionId: batch.sessionId, answers: answers)
-            } catch {
-                PendingSurveyUploadStore.shared.requeue(batch)
-                break
-            }
-        }
+        // Legacy answer-row retries are disabled for new package-based storage.
+        // New interviews upload `session.json` plus audio through /sessions/{id}/package.
     }
 
     // MARK: - Respondent Info Form

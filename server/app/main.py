@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import hashlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -24,7 +25,11 @@ MYSQL_PASSWORD = os.environ["MYSQL_PASSWORD"]
 MYSQL_DATABASE = os.environ["MYSQL_DATABASE"]
 API_KEY = os.environ.get("API_KEY", "").strip()
 AUDIO_STORAGE_DIR = Path(os.environ.get("AUDIO_STORAGE_DIR", "uploaded_audio")).expanduser()
+SURVEY_PACKAGE_STORAGE_DIR = Path(
+    os.environ.get("SURVEY_PACKAGE_STORAGE_DIR", "survey_session_packages")
+).expanduser()
 AUDIO_MAX_BYTES = int(os.environ.get("AUDIO_MAX_BYTES", str(200 * 1024 * 1024)))
+SESSION_JSON_MAX_BYTES = int(os.environ.get("SESSION_JSON_MAX_BYTES", str(25 * 1024 * 1024)))
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +58,61 @@ def sanitize_filename(name: str) -> str:
             allowed.append("_")
     sanitized = "".join(allowed).strip("._")
     return sanitized or "recording.m4a"
+
+
+def safe_json_summary(data: dict) -> dict:
+    respondent_info = data.get("respondent_info") if isinstance(data.get("respondent_info"), dict) else {}
+    audio = data.get("audio") if isinstance(data.get("audio"), dict) else {}
+    gps = data.get("recording_start_trajectory_point")
+    if not isinstance(gps, dict):
+        location = data.get("location")
+        gps = location if isinstance(location, dict) else {}
+
+    matched_questions = data.get("matched_questions")
+    answers = matched_questions if isinstance(matched_questions, list) else []
+    transcript = data.get("transcription")
+
+    return {
+        "local_session_id": data.get("local_session_id") or data.get("session_id"),
+        "location_label": respondent_info.get("location") or data.get("location_label"),
+        "gps_lat": gps.get("lat"),
+        "gps_lon": gps.get("lon"),
+        "recorded_at_ms": audio.get("recorded_at_ms"),
+        "answer_count": len(answers),
+        "transcript_chars": len(transcript) if isinstance(transcript, str) else None,
+    }
+
+
+def write_upload_file(upload: UploadFile, destination: Path, max_bytes: int) -> tuple[int, str]:
+    bytes_written = 0
+    sha256 = hashlib.sha256()
+    try:
+        with destination.open("wb") as out:
+            while True:
+                chunk = upload.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > max_bytes:
+                    out.close()
+                    destination.unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail=f"{upload.filename or 'file'} is too large")
+                sha256.update(chunk)
+                out.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        destination.unlink(missing_ok=True)
+        logger.exception("uploaded file save failed")
+        raise HTTPException(status_code=500, detail="failed to save uploaded file") from e
+    finally:
+        upload.file.close()
+
+    if bytes_written <= 0:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"{upload.filename or 'file'} is empty")
+
+    return bytes_written, sha256.hexdigest()
 
 
 @contextmanager
@@ -331,6 +391,145 @@ def upload_session_audio(
         "storage_path": relative_path,
         "file_size_bytes": bytes_written,
         "sha256": sha256_hex,
+    }
+
+
+@app.post("/sessions/{session_id}/package")
+def upload_session_package(
+    session_id: str,
+    session_json: UploadFile = File(...),
+    audio: UploadFile | None = File(default=None),
+    local_session_id: str | None = Form(default=None),
+    _: None = Depends(verify_api_key),
+):
+    try:
+        sid = UUID(hex=session_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
+    session_bytes = uuid_to_bytes(sid)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, respondent_id FROM survey_sessions WHERE id = %s",
+                (session_bytes,),
+            )
+            session_row = cur.fetchone()
+            if not session_row:
+                raise HTTPException(status_code=404, detail="session not found")
+            respondent_bytes = session_row["respondent_id"]
+
+    session_dir = SURVEY_PACKAGE_STORAGE_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = session_dir / "session.json"
+    json_bytes, json_sha256 = write_upload_file(session_json, json_path, SESSION_JSON_MAX_BYTES)
+
+    try:
+        package_data = json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        json_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="session_json must be valid JSON") from e
+
+    if not isinstance(package_data, dict):
+        json_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="session_json must be a JSON object")
+
+    summary = safe_json_summary(package_data)
+    if not local_session_id:
+        local_session_id = summary.get("local_session_id")
+
+    audio_relative_path = None
+    audio_original_filename = None
+    audio_bytes = None
+    audio_sha256 = None
+    if audio is not None:
+        audio_original_filename = sanitize_filename(audio.filename or "recording.m4a")
+        audio_path = session_dir / audio_original_filename
+        try:
+            audio_bytes, audio_sha256 = write_upload_file(audio, audio_path, AUDIO_MAX_BYTES)
+        except Exception:
+            json_path.unlink(missing_ok=True)
+            raise
+        audio_relative_path = str(Path(session_id) / audio_path.name)
+
+    json_relative_path = str(Path(session_id) / "session.json")
+    package_dir_relative_path = session_id
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO session_packages (
+                        session_id, respondent_id, local_session_id, package_dir,
+                        json_path, json_file_size_bytes, json_sha256,
+                        audio_path, audio_original_filename, audio_file_size_bytes, audio_sha256,
+                        recorded_at_ms, location_label, gps_lat, gps_lon,
+                        answer_count, transcript_chars
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        local_session_id = VALUES(local_session_id),
+                        package_dir = VALUES(package_dir),
+                        json_path = VALUES(json_path),
+                        json_file_size_bytes = VALUES(json_file_size_bytes),
+                        json_sha256 = VALUES(json_sha256),
+                        audio_path = VALUES(audio_path),
+                        audio_original_filename = VALUES(audio_original_filename),
+                        audio_file_size_bytes = VALUES(audio_file_size_bytes),
+                        audio_sha256 = VALUES(audio_sha256),
+                        recorded_at_ms = VALUES(recorded_at_ms),
+                        location_label = VALUES(location_label),
+                        gps_lat = VALUES(gps_lat),
+                        gps_lon = VALUES(gps_lon),
+                        answer_count = VALUES(answer_count),
+                        transcript_chars = VALUES(transcript_chars),
+                        uploaded_at = CURRENT_TIMESTAMP(6)
+                    """,
+                    (
+                        session_bytes,
+                        respondent_bytes,
+                        local_session_id,
+                        package_dir_relative_path,
+                        json_relative_path,
+                        json_bytes,
+                        json_sha256,
+                        audio_relative_path,
+                        audio_original_filename,
+                        audio_bytes,
+                        audio_sha256,
+                        summary.get("recorded_at_ms"),
+                        summary.get("location_label"),
+                        summary.get("gps_lat"),
+                        summary.get("gps_lon"),
+                        summary.get("answer_count"),
+                        summary.get("transcript_chars"),
+                    ),
+                )
+    except Exception as e:
+        if audio_relative_path:
+            (session_dir / Path(audio_relative_path).name).unlink(missing_ok=True)
+        json_path.unlink(missing_ok=True)
+        if isinstance(e, (IntegrityError, OperationalError)):
+            logger.exception("session package index upsert failed")
+            raise HTTPException(
+                status_code=500,
+                detail="session package index failed; did you apply server/schema.sql?",
+            ) from e
+        logger.exception("session package processing failed")
+        raise HTTPException(status_code=500, detail="session package processing failed") from e
+
+    return {
+        "session_id": session_id,
+        "respondent_id": bytes_to_uuid_hex(respondent_bytes),
+        "package_dir": package_dir_relative_path,
+        "json_path": json_relative_path,
+        "audio_path": audio_relative_path,
+        "json_file_size_bytes": json_bytes,
+        "audio_file_size_bytes": audio_bytes,
+        "json_sha256": json_sha256,
+        "audio_sha256": audio_sha256,
     }
 
 
