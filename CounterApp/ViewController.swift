@@ -1470,7 +1470,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let currentIndent = String(repeating: "  ", count: indent)
         let childIndent = String(repeating: "  ", count: indent + 1)
         let lines = kept.map { key, value in
-            "\(childIndent)\(jsonString(key)): \(value)"
+            "\(childIndent)\(jsonFragment(key)): \(value)"
         }
         return "{\n\(lines.joined(separator: ",\n"))\n\(currentIndent)}"
     }
