@@ -1124,9 +1124,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     private func trajectoryPointDictionary(_ point: PendingTrajectoryStore.Point) -> [String: Any] {
         var dict: [String: Any] = [
-            "ts_ms": point.tsMs,
             "lat": point.lat,
-            "lon": point.lon
+            "lon": point.lon,
+            "ts_ms": point.tsMs
         ]
         if let accuracyM = point.accuracyM { dict["accuracy_m"] = accuracyM }
         if let speedMps = point.speedMps { dict["speed_mps"] = speedMps }
@@ -1266,9 +1266,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let sessionId: String?
 
         enum CodingKeys: String, CodingKey {
-            case tsMs = "ts_ms"
             case lat
             case lon
+            case tsMs = "ts_ms"
             case accuracyM = "accuracy_m"
             case speedMps = "speed_mps"
             case courseDeg = "course_deg"
@@ -1291,9 +1291,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(tsMs, forKey: .tsMs)
             try container.encode(lat, forKey: .lat)
             try container.encode(lon, forKey: .lon)
+            try container.encode(tsMs, forKey: .tsMs)
             try container.encodeIfPresent(accuracyM, forKey: .accuracyM)
             try container.encodeIfPresent(speedMps, forKey: .speedMps)
             try container.encodeIfPresent(courseDeg, forKey: .courseDeg)
