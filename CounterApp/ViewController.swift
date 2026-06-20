@@ -1147,26 +1147,36 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         let timestampString = dateFormatter.string(from: Date())
 
-        var exportData: [String: Any] = [
+        var metadata: [String: Any] = [
             "schema_version": 2,
-            "export_info": [
-                "export_time": timestampString,
-                "total_responses": 1,
-                "questionnaire_title": questionnaireData?.questionnaire.title ?? "Unknown"
-            ],
+            "export_time": timestampString,
+            "timestamp": timestamp,
+            "local_session_id": sessionId ?? "",
+            "questionnaire_title": questionnaireData?.questionnaire.title ?? "Unknown",
+            "total_responses": 1
+        ]
+
+        if let questionnaire = questionnaireData {
+            metadata["questionnaire"] = [
+                "title": questionnaire.questionnaire.title,
+                "description": questionnaire.questionnaire.description
+            ]
+        }
+
+        if let cloudSessionId, let cloudRespondentId {
+            metadata["cloud"] = [
+                "session_id": cloudSessionId,
+                "respondent_id": cloudRespondentId
+            ]
+        }
+
+        var exportData: [String: Any] = [
+            "metadata": metadata,
+            // Kept at top level for existing aggregation/server indexing code.
+            "schema_version": 2,
             "timestamp": timestamp,
             "session_id": sessionId ?? "",
-            "local_session_id": sessionId ?? "",
-            "transcription": transcription,
-            "matched_questions": matchedQuestions.map { matched in
-                [
-                    "matched_question_id": matched.matchedQuestionId,
-                    "matched_question": matched.matchedQuestion,
-                    "extracted_answer": matched.extractedAnswer,
-                    "confidence": matched.confidence,
-                    "clarification_needed": matched.clarificationNeeded
-                ]
-            }
+            "local_session_id": sessionId ?? ""
         ]
 
         if let respondentInfo {
@@ -1178,20 +1188,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 "location": respondentInfo.location
             ]
             exportData["location_label"] = respondentInfo.location
-        }
-
-        if let questionnaire = questionnaireData {
-            exportData["questionnaire"] = [
-                "title": questionnaire.questionnaire.title,
-                "description": questionnaire.questionnaire.description
-            ]
-        }
-
-        if let cloudSessionId, let cloudRespondentId {
-            exportData["cloud"] = [
-                "session_id": cloudSessionId,
-                "respondent_id": cloudRespondentId
-            ]
         }
 
         if let recordingURL {
@@ -1222,6 +1218,17 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
         }
 
+        exportData["transcription"] = transcription
+        exportData["matched_questions"] = matchedQuestions.map { matched in
+            [
+                "matched_question_id": matched.matchedQuestionId,
+                "matched_question": matched.matchedQuestion,
+                "extracted_answer": matched.extractedAnswer,
+                "confidence": matched.confidence,
+                "clarification_needed": matched.clarificationNeeded
+            ]
+        }
+
         return exportData
     }
 
@@ -1239,7 +1246,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             matchedQuestions: matchedQuestions,
             recordingURL: recordingURL
         )
-        let jsonData = try JSONSerialization.data(withJSONObject: package, options: [.prettyPrinted, .sortedKeys])
+        let jsonData = try JSONSerialization.data(withJSONObject: package, options: [.prettyPrinted])
         let url = session.directoryURL.appendingPathComponent("session.json")
         try jsonData.write(to: url, options: [.atomic])
         return url
