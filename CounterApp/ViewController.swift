@@ -1371,9 +1371,153 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func encodeSessionPackage(_ package: SessionPackage) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted]
-        return try encoder.encode(package)
+        let json = orderedObject([
+            ("metadata", sessionPackageMetadataJSON(package.metadata, indent: 1)),
+            ("schema_version", jsonNumber(package.schemaVersion)),
+            ("timestamp", jsonNumber(package.timestamp)),
+            ("session_id", jsonString(package.sessionId)),
+            ("local_session_id", jsonString(package.localSessionId)),
+            ("respondent_info", package.respondentInfo.map { respondentInfoJSON($0, indent: 1) }),
+            ("location_label", jsonString(package.locationLabel)),
+            ("audio", package.audio.map { sessionPackageAudioJSON($0, indent: 1) }),
+            ("recording_start_trajectory_point", package.recordingStartTrajectoryPoint.map { trajectoryPointJSON($0, indent: 1) }),
+            ("transcription", jsonString(package.transcription)),
+            ("matched_questions", matchedQuestionsJSON(package.matchedQuestions, indent: 1))
+        ], indent: 0)
+        return Data(json.utf8)
+    }
+
+    private func sessionPackageMetadataJSON(_ metadata: SessionPackageMetadata, indent: Int) -> String {
+        return orderedObject([
+            ("schema_version", jsonNumber(metadata.schemaVersion)),
+            ("export_time", jsonString(metadata.exportTime)),
+            ("timestamp", jsonNumber(metadata.timestamp)),
+            ("local_session_id", jsonString(metadata.localSessionId)),
+            ("questionnaire_title", jsonString(metadata.questionnaireTitle)),
+            ("total_responses", jsonNumber(metadata.totalResponses)),
+            ("questionnaire", metadata.questionnaire.map { questionnaireJSON($0, indent: indent + 1) }),
+            ("cloud", metadata.cloud.map { cloudJSON($0, indent: indent + 1) })
+        ], indent: indent)
+    }
+
+    private func questionnaireJSON(_ questionnaire: SessionPackageQuestionnaire, indent: Int) -> String {
+        return orderedObject([
+            ("title", jsonString(questionnaire.title)),
+            ("description", jsonString(questionnaire.description))
+        ], indent: indent)
+    }
+
+    private func cloudJSON(_ cloud: SessionPackageCloud, indent: Int) -> String {
+        return orderedObject([
+            ("session_id", jsonString(cloud.sessionId)),
+            ("respondent_id", jsonString(cloud.respondentId))
+        ], indent: indent)
+    }
+
+    private func respondentInfoJSON(_ info: RespondentInfo, indent: Int) -> String {
+        return orderedObject([
+            ("name", jsonString(info.name)),
+            ("age", jsonNumber(info.age)),
+            ("gender", jsonString(info.gender)),
+            ("phone", jsonString(info.phone)),
+            ("location", jsonString(info.location))
+        ], indent: indent)
+    }
+
+    private func sessionPackageAudioJSON(_ audio: SessionPackageAudio, indent: Int) -> String {
+        return orderedObject([
+            ("file_name", jsonString(audio.fileName)),
+            ("local_session_id", jsonString(audio.localSessionId)),
+            ("recorded_at_ms", jsonNumber(audio.recordedAtMs)),
+            ("file_size_bytes", jsonNumber(audio.fileSizeBytes))
+        ], indent: indent)
+    }
+
+    private func trajectoryPointJSON(_ point: SessionPackageTrajectoryPoint, indent: Int) -> String {
+        return orderedObject([
+            ("lat", jsonNumber(point.lat)),
+            ("lon", jsonNumber(point.lon)),
+            ("ts_ms", jsonNumber(point.tsMs)),
+            ("accuracy_m", jsonNumber(point.accuracyM)),
+            ("speed_mps", jsonNumber(point.speedMps)),
+            ("course_deg", jsonNumber(point.courseDeg)),
+            ("provider", jsonString(point.provider)),
+            ("is_background", jsonBool(point.isBackground)),
+            ("session_id", jsonString(point.sessionId))
+        ], indent: indent)
+    }
+
+    private func matchedQuestionsJSON(_ matchedQuestions: [MatchedQuestion], indent: Int) -> String {
+        let values = matchedQuestions.map { matched in
+            orderedObject([
+                ("matched_question_id", jsonNumber(matched.matchedQuestionId)),
+                ("matched_question", jsonString(matched.matchedQuestion)),
+                ("extracted_answer", jsonString(matched.extractedAnswer)),
+                ("confidence", jsonString(matched.confidence)),
+                ("clarification_needed", jsonBool(matched.clarificationNeeded))
+            ], indent: indent + 1)
+        }
+        return orderedArray(values, indent: indent)
+    }
+
+    private func orderedObject(_ pairs: [(String, String?)], indent: Int) -> String {
+        let kept = pairs.compactMap { key, value -> (String, String)? in
+            guard let value else { return nil }
+            return (key, value)
+        }
+        guard !kept.isEmpty else { return "{}" }
+
+        let currentIndent = String(repeating: "  ", count: indent)
+        let childIndent = String(repeating: "  ", count: indent + 1)
+        let lines = kept.map { key, value in
+            "\(childIndent)\(jsonString(key)): \(value)"
+        }
+        return "{\n\(lines.joined(separator: ",\n"))\n\(currentIndent)}"
+    }
+
+    private func orderedArray(_ values: [String], indent: Int) -> String {
+        guard !values.isEmpty else { return "[]" }
+
+        let currentIndent = String(repeating: "  ", count: indent)
+        let childIndent = String(repeating: "  ", count: indent + 1)
+        let lines = values.map { value in
+            "\(childIndent)\(value)"
+        }
+        return "[\n\(lines.joined(separator: ",\n"))\n\(currentIndent)]"
+    }
+
+    private func jsonString(_ value: String?) -> String? {
+        guard let value else { return nil }
+        return jsonFragment(value)
+    }
+
+    private func jsonNumber(_ value: Int?) -> String? {
+        guard let value else { return nil }
+        return jsonFragment(value)
+    }
+
+    private func jsonNumber(_ value: Int64?) -> String? {
+        guard let value else { return nil }
+        return jsonFragment(value)
+    }
+
+    private func jsonNumber(_ value: Double?) -> String? {
+        guard let value, value.isFinite else { return nil }
+        return jsonFragment(value)
+    }
+
+    private func jsonBool(_ value: Bool?) -> String? {
+        guard let value else { return nil }
+        return value ? "true" : "false"
+    }
+
+    private func jsonFragment(_ value: Any) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: [value], options: []),
+              let arrayString = String(data: data, encoding: .utf8),
+              arrayString.count >= 2 else {
+            return "null"
+        }
+        return String(arrayString.dropFirst().dropLast())
     }
 
     private func writeSessionPackageJSON(
