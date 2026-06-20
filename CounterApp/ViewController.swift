@@ -368,14 +368,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             return
         }
 
-        let exportData = makeSessionPackageJSON(
+        let package = makeSessionPackage(
             transcription: transcription,
             matchedQuestions: matchedQuestions,
             recordingURL: recordingURL
         )
 
         // Convert to JSON data
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: exportData, options: .prettyPrinted) else {
+        guard let jsonData = try? encodeSessionPackage(package) else {
             showMessage("JSON conversion failed")
             return
         }
@@ -1137,99 +1137,378 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         return dict
     }
 
-    private func makeSessionPackageJSON(
+    private struct SessionPackage: Encodable {
+        let metadata: SessionPackageMetadata
+        let schemaVersion: Int
+        let timestamp: Double
+        let sessionId: String
+        let localSessionId: String
+        let respondentInfo: RespondentInfo?
+        let locationLabel: String?
+        let audio: SessionPackageAudio?
+        let recordingStartTrajectoryPoint: SessionPackageTrajectoryPoint?
+        let recordingMetadata: SessionPackageRecordingMetadata?
+        let transcription: String
+        let matchedQuestions: [MatchedQuestion]
+
+        enum CodingKeys: String, CodingKey {
+            case metadata
+            case schemaVersion = "schema_version"
+            case timestamp
+            case sessionId = "session_id"
+            case localSessionId = "local_session_id"
+            case respondentInfo = "respondent_info"
+            case locationLabel = "location_label"
+            case audio
+            case recordingStartTrajectoryPoint = "recording_start_trajectory_point"
+            case recordingMetadata = "recording_metadata"
+            case transcription
+            case matchedQuestions = "matched_questions"
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(metadata, forKey: .metadata)
+            try container.encode(schemaVersion, forKey: .schemaVersion)
+            try container.encode(timestamp, forKey: .timestamp)
+            try container.encode(sessionId, forKey: .sessionId)
+            try container.encode(localSessionId, forKey: .localSessionId)
+            try container.encodeIfPresent(respondentInfo, forKey: .respondentInfo)
+            try container.encodeIfPresent(locationLabel, forKey: .locationLabel)
+            try container.encodeIfPresent(audio, forKey: .audio)
+            try container.encodeIfPresent(recordingStartTrajectoryPoint, forKey: .recordingStartTrajectoryPoint)
+            try container.encodeIfPresent(recordingMetadata, forKey: .recordingMetadata)
+            try container.encode(transcription, forKey: .transcription)
+            try container.encode(matchedQuestions, forKey: .matchedQuestions)
+        }
+    }
+
+    private struct SessionPackageMetadata: Encodable {
+        let schemaVersion: Int
+        let exportTime: String
+        let timestamp: Double
+        let localSessionId: String
+        let questionnaireTitle: String
+        let totalResponses: Int
+        let questionnaire: SessionPackageQuestionnaire?
+        let cloud: SessionPackageCloud?
+
+        enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
+            case exportTime = "export_time"
+            case timestamp
+            case localSessionId = "local_session_id"
+            case questionnaireTitle = "questionnaire_title"
+            case totalResponses = "total_responses"
+            case questionnaire
+            case cloud
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(schemaVersion, forKey: .schemaVersion)
+            try container.encode(exportTime, forKey: .exportTime)
+            try container.encode(timestamp, forKey: .timestamp)
+            try container.encode(localSessionId, forKey: .localSessionId)
+            try container.encode(questionnaireTitle, forKey: .questionnaireTitle)
+            try container.encode(totalResponses, forKey: .totalResponses)
+            try container.encodeIfPresent(questionnaire, forKey: .questionnaire)
+            try container.encodeIfPresent(cloud, forKey: .cloud)
+        }
+    }
+
+    private struct SessionPackageQuestionnaire: Encodable {
+        let title: String
+        let description: String
+    }
+
+    private struct SessionPackageCloud: Encodable {
+        let sessionId: String
+        let respondentId: String
+
+        enum CodingKeys: String, CodingKey {
+            case sessionId = "session_id"
+            case respondentId = "respondent_id"
+        }
+    }
+
+    private struct SessionPackageAudio: Encodable {
+        let fileName: String
+        let localSessionId: String?
+        let recordedAtMs: Int?
+        let fileSizeBytes: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case fileName = "file_name"
+            case localSessionId = "local_session_id"
+            case recordedAtMs = "recorded_at_ms"
+            case fileSizeBytes = "file_size_bytes"
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(fileName, forKey: .fileName)
+            try container.encodeIfPresent(localSessionId, forKey: .localSessionId)
+            try container.encodeIfPresent(recordedAtMs, forKey: .recordedAtMs)
+            try container.encodeIfPresent(fileSizeBytes, forKey: .fileSizeBytes)
+        }
+    }
+
+    private struct SessionPackageTrajectoryPoint: Encodable {
+        let tsMs: Int64
+        let lat: Double
+        let lon: Double
+        let accuracyM: Double?
+        let speedMps: Double?
+        let courseDeg: Double?
+        let provider: String?
+        let isBackground: Bool?
+        let sessionId: String?
+
+        enum CodingKeys: String, CodingKey {
+            case tsMs = "ts_ms"
+            case lat
+            case lon
+            case accuracyM = "accuracy_m"
+            case speedMps = "speed_mps"
+            case courseDeg = "course_deg"
+            case provider
+            case isBackground = "is_background"
+            case sessionId = "session_id"
+        }
+
+        init(_ point: PendingTrajectoryStore.Point) {
+            tsMs = point.tsMs
+            lat = point.lat
+            lon = point.lon
+            accuracyM = point.accuracyM
+            speedMps = point.speedMps
+            courseDeg = point.courseDeg
+            provider = point.provider
+            isBackground = point.isBackground
+            sessionId = point.sessionId
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(tsMs, forKey: .tsMs)
+            try container.encode(lat, forKey: .lat)
+            try container.encode(lon, forKey: .lon)
+            try container.encodeIfPresent(accuracyM, forKey: .accuracyM)
+            try container.encodeIfPresent(speedMps, forKey: .speedMps)
+            try container.encodeIfPresent(courseDeg, forKey: .courseDeg)
+            try container.encodeIfPresent(provider, forKey: .provider)
+            try container.encodeIfPresent(isBackground, forKey: .isBackground)
+            try container.encodeIfPresent(sessionId, forKey: .sessionId)
+        }
+    }
+
+    private struct SessionPackageRecordingMetadata: Encodable {
+        let recordingFile: String?
+        let recordedAtEpoch: Double?
+        let sessionId: String?
+        let location: String?
+        let recordingStartTrajectoryPoint: SessionPackageTrajectoryPoint?
+        let respondentInfo: RespondentInfo?
+        let sessionPackageUploadedAtEpoch: Double?
+        let serverPackageDir: String?
+        let serverSessionJsonPath: String?
+        let serverSessionJsonSha256: String?
+        let serverAudioPath: String?
+        let serverAudioSha256: String?
+        let serverAudioFileSizeBytes: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case recordingFile = "recording_file"
+            case recordedAtEpoch = "recorded_at_epoch"
+            case sessionId = "session_id"
+            case location
+            case recordingStartTrajectoryPoint = "recording_start_trajectory_point"
+            case respondentInfo = "respondent_info"
+            case sessionPackageUploadedAtEpoch = "session_package_uploaded_at_epoch"
+            case serverPackageDir = "server_package_dir"
+            case serverSessionJsonPath = "server_session_json_path"
+            case serverSessionJsonSha256 = "server_session_json_sha256"
+            case serverAudioPath = "server_audio_path"
+            case serverAudioSha256 = "server_audio_sha256"
+            case serverAudioFileSizeBytes = "server_audio_file_size_bytes"
+        }
+
+        init?(_ raw: [String: Any]?) {
+            guard let raw else { return nil }
+            recordingFile = raw["recording_file"] as? String
+            recordedAtEpoch = ViewController.packageDoubleValue(raw["recorded_at_epoch"])
+            sessionId = raw["session_id"] as? String
+            location = raw["location"] as? String
+            if let point = ViewController.packageTrajectoryPoint(from: raw["recording_start_trajectory_point"]) {
+                recordingStartTrajectoryPoint = SessionPackageTrajectoryPoint(point)
+            } else {
+                recordingStartTrajectoryPoint = nil
+            }
+            if let info = raw["respondent_info"] as? [String: Any] {
+                respondentInfo = RespondentInfo(
+                    name: info["name"] as? String ?? "",
+                    age: ViewController.packageIntValue(info["age"]) ?? 0,
+                    gender: info["gender"] as? String ?? "",
+                    phone: info["phone"] as? String ?? "",
+                    location: info["location"] as? String ?? ""
+                )
+            } else {
+                respondentInfo = nil
+            }
+            sessionPackageUploadedAtEpoch = ViewController.packageDoubleValue(raw["session_package_uploaded_at_epoch"])
+            serverPackageDir = raw["server_package_dir"] as? String
+            serverSessionJsonPath = raw["server_session_json_path"] as? String
+            serverSessionJsonSha256 = raw["server_session_json_sha256"] as? String
+            serverAudioPath = raw["server_audio_path"] as? String
+            serverAudioSha256 = raw["server_audio_sha256"] as? String
+            serverAudioFileSizeBytes = ViewController.packageIntValue(raw["server_audio_file_size_bytes"])
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(recordingFile, forKey: .recordingFile)
+            try container.encodeIfPresent(recordedAtEpoch, forKey: .recordedAtEpoch)
+            try container.encodeIfPresent(sessionId, forKey: .sessionId)
+            try container.encodeIfPresent(location, forKey: .location)
+            try container.encodeIfPresent(recordingStartTrajectoryPoint, forKey: .recordingStartTrajectoryPoint)
+            try container.encodeIfPresent(respondentInfo, forKey: .respondentInfo)
+            try container.encodeIfPresent(sessionPackageUploadedAtEpoch, forKey: .sessionPackageUploadedAtEpoch)
+            try container.encodeIfPresent(serverPackageDir, forKey: .serverPackageDir)
+            try container.encodeIfPresent(serverSessionJsonPath, forKey: .serverSessionJsonPath)
+            try container.encodeIfPresent(serverSessionJsonSha256, forKey: .serverSessionJsonSha256)
+            try container.encodeIfPresent(serverAudioPath, forKey: .serverAudioPath)
+            try container.encodeIfPresent(serverAudioSha256, forKey: .serverAudioSha256)
+            try container.encodeIfPresent(serverAudioFileSizeBytes, forKey: .serverAudioFileSizeBytes)
+        }
+    }
+
+    private func makeSessionPackage(
         transcription: String,
         matchedQuestions: [MatchedQuestion],
         recordingURL: URL?
-    ) -> [String: Any] {
+    ) -> SessionPackage {
         let timestamp = Date().timeIntervalSince1970
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         let timestampString = dateFormatter.string(from: Date())
 
-        var metadata: [String: Any] = [
-            "schema_version": 2,
-            "export_time": timestampString,
-            "timestamp": timestamp,
-            "local_session_id": sessionId ?? "",
-            "questionnaire_title": questionnaireData?.questionnaire.title ?? "Unknown",
-            "total_responses": 1
-        ]
-
-        if let questionnaire = questionnaireData {
-            metadata["questionnaire"] = [
-                "title": questionnaire.questionnaire.title,
-                "description": questionnaire.questionnaire.description
-            ]
+        let questionnaire = questionnaireData.map {
+            SessionPackageQuestionnaire(
+                title: $0.questionnaire.title,
+                description: $0.questionnaire.description
+            )
         }
-
-        if let cloudSessionId, let cloudRespondentId {
-            metadata["cloud"] = [
-                "session_id": cloudSessionId,
-                "respondent_id": cloudRespondentId
-            ]
+        let cloud = cloudSessionId.flatMap { cloudSessionId in
+            cloudRespondentId.map {
+                SessionPackageCloud(sessionId: cloudSessionId, respondentId: $0)
+            }
         }
+        let metadata = SessionPackageMetadata(
+            schemaVersion: 2,
+            exportTime: timestampString,
+            timestamp: timestamp,
+            localSessionId: sessionId ?? "",
+            questionnaireTitle: questionnaireData?.questionnaire.title ?? "Unknown",
+            totalResponses: 1,
+            questionnaire: questionnaire,
+            cloud: cloud
+        )
 
-        var exportData: [String: Any] = [
-            "metadata": metadata,
-            // Kept at top level for existing aggregation/server indexing code.
-            "schema_version": 2,
-            "timestamp": timestamp,
-            "session_id": sessionId ?? "",
-            "local_session_id": sessionId ?? ""
-        ]
-
-        if let respondentInfo {
-            exportData["respondent_info"] = [
-                "name": respondentInfo.name,
-                "age": respondentInfo.age,
-                "gender": respondentInfo.gender,
-                "phone": respondentInfo.phone,
-                "location": respondentInfo.location
-            ]
-            exportData["location_label"] = respondentInfo.location
-        }
-
+        var audio: SessionPackageAudio?
+        var recordingStartPoint: SessionPackageTrajectoryPoint?
+        var recordingMetadata: SessionPackageRecordingMetadata?
         if let recordingURL {
-            var audio: [String: Any] = [
-                "file_name": recordingURL.lastPathComponent
-            ]
-            if let localSessionId = sessionIdForRecording(recordingURL) {
-                audio["local_session_id"] = localSessionId
-            }
-            if let recordedAtMs = recordedAtMs(for: recordingURL) {
-                audio["recorded_at_ms"] = recordedAtMs
-            }
+            var fileSizeBytes: Int?
             if let attributes = try? FileManager.default.attributesOfItem(atPath: recordingURL.path),
                let size = attributes[.size] as? NSNumber {
-                audio["file_size_bytes"] = size.intValue
+                fileSizeBytes = size.intValue
             }
-            exportData["audio"] = audio
+            audio = SessionPackageAudio(
+                fileName: recordingURL.lastPathComponent,
+                localSessionId: sessionIdForRecording(recordingURL),
+                recordedAtMs: recordedAtMs(for: recordingURL),
+                fileSizeBytes: fileSizeBytes
+            )
 
             if let point = recordingStartTrajectoryPoint(
                 for: recordingURL,
                 cloudSessionId: cloudSessionId ?? ""
             ) {
-                exportData["recording_start_trajectory_point"] = trajectoryPointDictionary(point)
+                recordingStartPoint = SessionPackageTrajectoryPoint(point)
             }
-
-            if let sidecar = recordingMetadata(for: recordingURL) {
-                exportData["recording_metadata"] = sidecar
-            }
+            recordingMetadata = SessionPackageRecordingMetadata(self.recordingMetadata(for: recordingURL))
         }
 
-        exportData["transcription"] = transcription
-        exportData["matched_questions"] = matchedQuestions.map { matched in
-            [
-                "matched_question_id": matched.matchedQuestionId,
-                "matched_question": matched.matchedQuestion,
-                "extracted_answer": matched.extractedAnswer,
-                "confidence": matched.confidence,
-                "clarification_needed": matched.clarificationNeeded
-            ]
+        return SessionPackage(
+            metadata: metadata,
+            schemaVersion: 2,
+            timestamp: timestamp,
+            sessionId: sessionId ?? "",
+            localSessionId: sessionId ?? "",
+            respondentInfo: respondentInfo,
+            locationLabel: respondentInfo?.location,
+            audio: audio,
+            recordingStartTrajectoryPoint: recordingStartPoint,
+            recordingMetadata: recordingMetadata,
+            transcription: transcription,
+            matchedQuestions: matchedQuestions
+        )
+    }
+
+    private func encodeSessionPackage(_ package: SessionPackage) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted]
+        return try encoder.encode(package)
+    }
+
+    private static func packageTrajectoryPoint(from value: Any?) -> PendingTrajectoryStore.Point? {
+        guard let raw = value as? [String: Any],
+              let tsMs = packageInt64Value(raw["ts_ms"]),
+              let lat = packageDoubleValue(raw["lat"]),
+              let lon = packageDoubleValue(raw["lon"]) else {
+            return nil
         }
 
-        return exportData
+        return PendingTrajectoryStore.Point(
+            tsMs: tsMs,
+            lat: lat,
+            lon: lon,
+            accuracyM: packageDoubleValue(raw["accuracy_m"]),
+            speedMps: packageDoubleValue(raw["speed_mps"]),
+            courseDeg: packageDoubleValue(raw["course_deg"]),
+            provider: raw["provider"] as? String,
+            isBackground: raw["is_background"] as? Bool,
+            sessionId: raw["session_id"] as? String
+        )
+    }
+
+    private static func packageIntValue(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? Int64 { return Int(value) }
+        if let value = value as? Double { return Int(value) }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) }
+        return nil
+    }
+
+    private static func packageInt64Value(_ value: Any?) -> Int64? {
+        if let value = value as? Int64 { return value }
+        if let value = value as? Int { return Int64(value) }
+        if let value = value as? Double { return Int64(value) }
+        if let value = value as? NSNumber { return value.int64Value }
+        if let value = value as? String { return Int64(value) }
+        return nil
+    }
+
+    private static func packageDoubleValue(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? Float { return Double(value) }
+        if let value = value as? Int { return Double(value) }
+        if let value = value as? Int64 { return Double(value) }
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String { return Double(value) }
+        return nil
     }
 
     private func writeSessionPackageJSON(
@@ -1241,12 +1520,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         sessionId = session.id
         sessionDirectoryURL = session.directoryURL
 
-        let package = makeSessionPackageJSON(
+        let package = makeSessionPackage(
             transcription: transcription,
             matchedQuestions: matchedQuestions,
             recordingURL: recordingURL
         )
-        let jsonData = try JSONSerialization.data(withJSONObject: package, options: [.prettyPrinted])
+        let jsonData = try encodeSessionPackage(package)
         let url = session.directoryURL.appendingPathComponent("session.json")
         try jsonData.write(to: url, options: [.atomic])
         return url
