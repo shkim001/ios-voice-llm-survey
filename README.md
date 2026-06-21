@@ -282,7 +282,12 @@ ios-voice-llm-survey/
 │   ├── schema.sql                     # package index + legacy trajectory/audio tables
 │   ├── scripts/seed_questions.py
 │   ├── requirements.txt
-│   └── .env.example
+│   ├── .env.example
+│   ├── survey_session_packages/       # runtime only: uploaded session packages, ignored by Git
+│   │   └── <cloud-session-id>/
+│   │       ├── session.json
+│   │       └── recording_....m4a
+│   └── uploaded_audio/                # legacy runtime audio-only uploads, ignored by Git
 └── README.md
 ```
 
