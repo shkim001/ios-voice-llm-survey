@@ -147,6 +147,29 @@ AUDIO_STORAGE_DIR=./uploaded_audio
 AUDIO_MAX_BYTES=209715200
 ```
 
+When `SURVEY_PACKAGE_STORAGE_DIR=./survey_session_packages` and the server runs from the `server/` directory, packages are saved under:
+
+```text
+<repo>/server/survey_session_packages/
+```
+
+For the current VM layout, that resolves to:
+
+```text
+/home/sk5738/ios-voice-llm-survey/server/survey_session_packages/
+```
+
+Each uploaded interview gets one cloud-session folder:
+
+```text
+survey_session_packages/
+└── <cloud-session-id>/
+    ├── session.json
+    └── recording_....m4a
+```
+
+For new app uploads, the `.m4a` recording is stored beside `session.json` in this package folder. `server/uploaded_audio/` is only for the legacy `/sessions/{session_id}/audio` endpoint.
+
 ### 2. Install and run
 
 ```bash
@@ -232,6 +255,8 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 7. **Aggregate** — summarizes previously exported JSON files on device.
 
 If Survey API is configured, step 4 also uploads the complete session package. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row.
+
+The generated `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. Coordinate objects always place `lat` and `lon` next to each other.
 
 ---
 
