@@ -147,16 +147,16 @@ AUDIO_STORAGE_DIR=./uploaded_audio
 AUDIO_MAX_BYTES=209715200
 ```
 
-When `SURVEY_PACKAGE_STORAGE_DIR=./survey_session_packages` and the server runs from the `server/` directory, packages are saved under:
+`SURVEY_PACKAGE_STORAGE_DIR` is read by the server from `.env`; it is not hardcoded in the iOS app. When it is set to `./survey_session_packages` and the FastAPI service runs from the `server/` directory, packages are saved under:
 
 ```text
 <repo>/server/survey_session_packages/
 ```
 
-For the current VM layout, that resolves to:
+For a production VM, prefer an absolute path owned by the server user, for example:
 
 ```text
-/home/sk5738/ios-voice-llm-survey/server/survey_session_packages/
+/var/lib/ios-voice-llm-survey/session-packages/
 ```
 
 Each uploaded interview gets one cloud-session folder:
