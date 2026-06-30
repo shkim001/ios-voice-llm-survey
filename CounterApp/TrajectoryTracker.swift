@@ -2,14 +2,19 @@ import Foundation
 import CoreLocation
 import UIKit
 
-/// Minimal trajectory tracking:
-/// - captures a required one-time GPS point before recording starts
-/// - uploads that saved point when a cloud respondent/session identity exists
+/// Interview trajectory tracking:
+/// - captures a required GPS point before recording starts
+/// - samples the latest available GPS location while recording
+/// - uploads the saved recording-start point when a cloud identity exists
 final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
     static let shared = TrajectoryTracker()
 
     private let manager = CLLocationManager()
+    private let samplingInterval: TimeInterval = 3.0
     private var lastKnownLocation: CLLocation?
+    private var interviewPoints: [PendingTrajectoryStore.Point] = []
+    private var samplingTimer: Timer?
+    private var activeInterviewSessionId: String?
 
     private override init() {
         super.init()
@@ -26,6 +31,9 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
 
     func stop() {
         manager.stopMonitoringSignificantLocationChanges()
+        manager.stopUpdatingLocation()
+        samplingTimer?.invalidate()
+        samplingTimer = nil
     }
 
     func flushPendingNow() {
@@ -46,6 +54,50 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
             isBackground: await MainActor.run { UIApplication.shared.applicationState != .active },
             sessionId: currentSessionId()
         )
+    }
+
+    func startInterviewTracking(with startPoint: PendingTrajectoryStore.Point) {
+        stopInterviewTracking()
+
+        interviewPoints = [startPoint]
+        activeInterviewSessionId = startPoint.sessionId ?? currentSessionId()
+
+        manager.desiredAccuracy = kCLLocationAccuracyBest
+        manager.distanceFilter = kCLDistanceFilterNone
+        manager.pausesLocationUpdatesAutomatically = false
+
+        if CLLocationManager.locationServicesEnabled() {
+            switch manager.authorizationStatus {
+            case .authorizedAlways, .authorizedWhenInUse:
+                manager.startUpdatingLocation()
+            case .notDetermined:
+                manager.requestWhenInUseAuthorization()
+            case .denied, .restricted:
+                break
+            @unknown default:
+                break
+            }
+        }
+
+        let timer = Timer(timeInterval: samplingInterval, repeats: true) { [weak self] _ in
+            self?.sampleLatestInterviewLocation()
+        }
+        samplingTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    @discardableResult
+    func stopInterviewTracking() -> [PendingTrajectoryStore.Point] {
+        sampleLatestInterviewLocation()
+        samplingTimer?.invalidate()
+        samplingTimer = nil
+        manager.stopUpdatingLocation()
+        activeInterviewSessionId = nil
+        return interviewPoints
+    }
+
+    func currentInterviewPoints() -> [PendingTrajectoryStore.Point] {
+        return interviewPoints
     }
 
     func uploadRecordingStartPoint(_ point: PendingTrajectoryStore.Point) async throws {
@@ -74,7 +126,17 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
     // MARK: - CLLocationManagerDelegate
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        stop()
+        if samplingTimer == nil {
+            stop()
+            return
+        }
+
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse:
+            manager.startUpdatingLocation()
+        default:
+            break
+        }
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
@@ -102,6 +164,18 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
     private func currentSessionId() -> String? {
         let id = UserDefaults.standard.string(forKey: DefaultsKeys.sessionId)?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (id?.isEmpty == false) ? id : nil
+    }
+
+    private func sampleLatestInterviewLocation() {
+        guard let loc = lastKnownLocation, isUsable(loc, maxAgeSeconds: 60) else { return }
+        let point = makePoint(
+            from: loc,
+            timestamp: Date(),
+            provider: "interview",
+            isBackground: UIApplication.shared.applicationState != .active,
+            sessionId: activeInterviewSessionId ?? currentSessionId()
+        )
+        interviewPoints.append(point)
     }
 
     private func isUsable(_ location: CLLocation, maxAgeSeconds: TimeInterval) -> Bool {

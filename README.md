@@ -112,7 +112,7 @@ When the Survey API is configured:
 - After **LLM Recognition**, the app writes `session.json` into the local `SurveySessions/<local-session-id>/` folder.
 - If the Survey API is configured, the app uploads `session.json` and the `.m4a` recording together to `POST /sessions/{id}/package`.
 - The server stores both files under one VM folder and writes only an index row to MySQL.
-- Recording is blocked if the app cannot retrieve a current GPS coordinate.
+- Recording is blocked if the app cannot retrieve a current GPS coordinate, then the app samples the latest available location about every 3 seconds while recording.
 
 ---
 
@@ -256,7 +256,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 
 If Survey API is configured, step 4 also uploads the complete session package. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row.
 
-The generated `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. Coordinate objects always place `lat` and `lon` next to each other.
+The generated `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. Coordinate objects always place `lat` and `lon` next to each other. Interview paths are saved in `trajectory_points`; each point includes both `ts_ms` and readable UTC `captured_at`.
 
 ---
 
@@ -269,7 +269,7 @@ ios-voice-llm-survey/
 │   ├── ViewController.swift           # Main voice survey UI
 │   ├── LLMService.swift               # OpenAI / Gemini / custom base URL
 │   ├── SurveyAPIClient.swift          # FastAPI client
-│   ├── TrajectoryTracker.swift        # Required recording-start GPS capture helpers
+│   ├── TrajectoryTracker.swift        # Required GPS start point + interview trajectory sampling
 │   ├── SessionManager.swift           # Local session folders
 │   ├── PendingSurveyUploadStore.swift # Legacy offline answer queue
 │   ├── MapViewController.swift        # Map-first entry (optional)

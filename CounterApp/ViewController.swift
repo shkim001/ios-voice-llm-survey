@@ -21,6 +21,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private var audioPlayer: AVAudioPlayer?
     private var recordingURL: URL?
     private var recordingStartTrajectoryPoint: PendingTrajectoryStore.Point?
+    private var interviewTrajectoryPoints: [PendingTrajectoryStore.Point] = []
 
     // Per-participant session (local-only separation)
     private var sessionId: String?
@@ -32,7 +33,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     // Inactivity auto-reset
     private var inactivityTimer: Timer?
-    private let inactivityTimeoutSeconds: TimeInterval = 180
+    private let inactivityTimeoutSeconds: TimeInterval = 420
 
     // Questionnaire and analysis
     private var questionnaireData: QuestionnaireData?
@@ -129,11 +130,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         // Create and setup clear button programmatically
         let clearBtn = UIButton(type: .system)
         clearBtn.translatesAutoresizingMaskIntoConstraints = false
-        clearBtn.setTitle("Clear JSON Files", for: .normal)
-        clearBtn.backgroundColor = .systemOrange
-        clearBtn.setTitleColor(.white, for: .normal)
-        clearBtn.layer.cornerRadius = 12
-        clearBtn.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
+        setupButton(clearBtn, title: "Clear JSON Files", backgroundColor: .systemOrange)
         clearBtn.addTarget(self, action: #selector(clearButtonTapped(_:)), for: .touchUpInside)
         view.addSubview(clearBtn)
         self.clearButton = clearBtn
@@ -163,11 +160,28 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func setupButton(_ button: UIButton, title: String, backgroundColor: UIColor) {
-        button.setTitle(title, for: .normal)
-        button.backgroundColor = backgroundColor
-        button.setTitleColor(.white, for: .normal)
-        button.layer.cornerRadius = 12
-        button.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
+        var config = UIButton.Configuration.filled()
+        config.title = title
+        config.baseBackgroundColor = backgroundColor
+        config.baseForegroundColor = .systemBackground
+        config.cornerStyle = .medium
+        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+            var attributes = incoming
+            attributes.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
+            return attributes
+        }
+        button.configuration = config
+        button.layer.cornerRadius = 0
+    }
+
+    private func updateButton(_ button: UIButton, title: String, backgroundColor: UIColor) {
+        if button.configuration == nil {
+            setupButton(button, title: title, backgroundColor: backgroundColor)
+            return
+        }
+
+        button.configuration?.title = title
+        button.configuration?.baseBackgroundColor = backgroundColor
     }
 
     // MARK: - Button Actions
@@ -178,6 +192,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             // Clear previous state when starting a new recording (same participant/session unless "Start next participant" was used)
             transcription = nil
             matchedQuestions = []
+            interviewTrajectoryPoints = []
 
             // Disable LLM and export buttons until new analysis is done
             llmButton.isEnabled = true  // Can start LLM analysis after recording
@@ -221,8 +236,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             player.stop()
             audioPlayer = nil
 
-            playButton.setTitle("Play Recording", for: .normal)
-            playButton.backgroundColor = .systemPurple
+            updateButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
             statusLabel.text = "Playback stopped"
             statusLabel.textColor = .systemGray
         } else {
@@ -235,8 +249,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 statusLabel.text = "Playing recording..."
                 statusLabel.textColor = .systemPurple
 
-                playButton.setTitle("Stop Playback", for: .normal)
-                playButton.backgroundColor = .systemRed
+                updateButton(playButton, title: "Stop Playback", backgroundColor: .systemRed)
 
             } catch {
                 showMessage("Playback failed: \(error.localizedDescription)")
@@ -1022,8 +1035,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         } catch {
             showMessage("Audio session setup failed: \(error.localizedDescription)")
             isRecording = false
-            recordButton.setTitle("Start Recording", for: .normal)
-            recordButton.backgroundColor = .systemRed
+            updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
             return
         }
 
@@ -1040,8 +1052,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         } catch {
             showMessage("Failed to create session/recording path: \(error.localizedDescription)")
             isRecording = false
-            recordButton.setTitle("Start Recording", for: .normal)
-            recordButton.backgroundColor = .systemRed
+            updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
             return
         }
 
@@ -1055,9 +1066,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         do {
             audioRecorder = try AVAudioRecorder(url: url, settings: settings)
             audioRecorder?.record()
+            TrajectoryTracker.shared.startInterviewTracking(with: recordingStartPoint)
+            interviewTrajectoryPoints = [recordingStartPoint]
 
-            recordButton.setTitle("Stop Recording", for: .normal)
-            recordButton.backgroundColor = .systemOrange
+            updateButton(recordButton, title: "Stop Recording", backgroundColor: .systemOrange)
             statusLabel.text = "Recording...\nSpeak into microphone"
             statusLabel.textColor = .systemRed
             audioFilesButton?.isEnabled = false
@@ -1065,8 +1077,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         } catch {
             showMessage("Recording failed to start: \(error.localizedDescription)")
             isRecording = false
-            recordButton.setTitle("Start Recording", for: .normal)
-            recordButton.backgroundColor = .systemRed
+            updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
             audioFilesButton?.isEnabled = true
             audioFilesButton?.alpha = 1.0
         }
@@ -1075,9 +1086,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func stopRecording() {
         resetInactivityTimer()
         audioRecorder?.stop()
+        interviewTrajectoryPoints = TrajectoryTracker.shared.stopInterviewTracking()
+        if let recordingURL {
+            updateRecordingTrajectoryMetadata(for: recordingURL, points: interviewTrajectoryPoints)
+        }
 
-        recordButton.setTitle("Start Recording", for: .normal)
-        recordButton.backgroundColor = .systemRed
+        updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
         statusLabel.text = "Recording stopped\nYou can play, recognize, or export"
         statusLabel.textColor = .systemGray
 
@@ -1101,7 +1115,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             "recorded_at_epoch": Date().timeIntervalSince1970,
             "session_id": sessionId ?? "",
             "location": respondentInfo?.location ?? "",
-            "recording_start_trajectory_point": trajectoryPointDictionary(recordingStartPoint)
+            "recording_start_trajectory_point": trajectoryPointDictionary(recordingStartPoint),
+            "trajectory_points": [trajectoryPointDictionary(recordingStartPoint)]
         ]
 
         if let info = respondentInfo {
@@ -1122,11 +1137,29 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 
+    private func updateRecordingTrajectoryMetadata(for recordingURL: URL, points: [PendingTrajectoryStore.Point]) {
+        guard !points.isEmpty else { return }
+        let metadataURL = recordingURL.deletingPathExtension().appendingPathExtension("json")
+        var metadata = recordingMetadata(for: recordingURL) ?? [:]
+        metadata["trajectory_points"] = points.map { trajectoryPointDictionary($0) }
+        if metadata["recording_start_trajectory_point"] == nil, let first = points.first {
+            metadata["recording_start_trajectory_point"] = trajectoryPointDictionary(first)
+        }
+
+        do {
+            let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: metadataURL, options: [.atomic])
+        } catch {
+            print("Failed to update recording trajectory metadata: \(error.localizedDescription)")
+        }
+    }
+
     private func trajectoryPointDictionary(_ point: PendingTrajectoryStore.Point) -> [String: Any] {
         var dict: [String: Any] = [
             "lat": point.lat,
             "lon": point.lon,
-            "ts_ms": point.tsMs
+            "ts_ms": point.tsMs,
+            "captured_at": readableTimestamp(for: point.tsMs)
         ]
         if let accuracyM = point.accuracyM { dict["accuracy_m"] = accuracyM }
         if let speedMps = point.speedMps { dict["speed_mps"] = speedMps }
@@ -1135,6 +1168,18 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         if let isBackground = point.isBackground { dict["is_background"] = isBackground }
         if let sessionId = point.sessionId, !sessionId.isEmpty { dict["session_id"] = sessionId }
         return dict
+    }
+
+    private func readableTimestamp(for tsMs: Int64) -> String {
+        return Self.readableTimestampString(for: tsMs)
+    }
+
+    private static func readableTimestampString(for tsMs: Int64) -> String {
+        let date = Date(timeIntervalSince1970: Double(tsMs) / 1000.0)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter.string(from: date)
     }
 
     private struct SessionPackage: Encodable {
@@ -1147,6 +1192,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let locationLabel: String?
         let audio: SessionPackageAudio?
         let recordingStartTrajectoryPoint: SessionPackageTrajectoryPoint?
+        let trajectoryPoints: [SessionPackageTrajectoryPoint]
         let transcription: String
         let matchedQuestions: [MatchedQuestion]
 
@@ -1160,6 +1206,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             case locationLabel = "location_label"
             case audio
             case recordingStartTrajectoryPoint = "recording_start_trajectory_point"
+            case trajectoryPoints = "trajectory_points"
             case transcription
             case matchedQuestions = "matched_questions"
         }
@@ -1175,6 +1222,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             try container.encodeIfPresent(locationLabel, forKey: .locationLabel)
             try container.encodeIfPresent(audio, forKey: .audio)
             try container.encodeIfPresent(recordingStartTrajectoryPoint, forKey: .recordingStartTrajectoryPoint)
+            try container.encode(trajectoryPoints, forKey: .trajectoryPoints)
             try container.encode(transcription, forKey: .transcription)
             try container.encode(matchedQuestions, forKey: .matchedQuestions)
         }
@@ -1253,6 +1301,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     private struct SessionPackageTrajectoryPoint: Encodable {
         let tsMs: Int64
+        let capturedAt: String
         let lat: Double
         let lon: Double
         let accuracyM: Double?
@@ -1266,6 +1315,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             case lat
             case lon
             case tsMs = "ts_ms"
+            case capturedAt = "captured_at"
             case accuracyM = "accuracy_m"
             case speedMps = "speed_mps"
             case courseDeg = "course_deg"
@@ -1276,6 +1326,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         init(_ point: PendingTrajectoryStore.Point) {
             tsMs = point.tsMs
+            capturedAt = ViewController.readableTimestampString(for: point.tsMs)
             lat = point.lat
             lon = point.lon
             accuracyM = point.accuracyM
@@ -1291,6 +1342,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             try container.encode(lat, forKey: .lat)
             try container.encode(lon, forKey: .lon)
             try container.encode(tsMs, forKey: .tsMs)
+            try container.encode(capturedAt, forKey: .capturedAt)
             try container.encodeIfPresent(accuracyM, forKey: .accuracyM)
             try container.encodeIfPresent(speedMps, forKey: .speedMps)
             try container.encodeIfPresent(courseDeg, forKey: .courseDeg)
@@ -1334,6 +1386,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         var audio: SessionPackageAudio?
         var recordingStartPoint: SessionPackageTrajectoryPoint?
+        var trajectoryPoints: [SessionPackageTrajectoryPoint] = []
         if let recordingURL {
             var fileSizeBytes: Int?
             if let attributes = try? FileManager.default.attributesOfItem(atPath: recordingURL.path),
@@ -1353,6 +1406,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ) {
                 recordingStartPoint = SessionPackageTrajectoryPoint(point)
             }
+            trajectoryPoints = interviewTrajectoryPoints(
+                for: recordingURL,
+                cloudSessionId: cloudSessionId ?? ""
+            ).map { SessionPackageTrajectoryPoint($0) }
         }
 
         return SessionPackage(
@@ -1365,6 +1422,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             locationLabel: respondentInfo?.location,
             audio: audio,
             recordingStartTrajectoryPoint: recordingStartPoint,
+            trajectoryPoints: trajectoryPoints,
             transcription: transcription,
             matchedQuestions: matchedQuestions
         )
@@ -1381,6 +1439,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("location_label", jsonString(package.locationLabel)),
             ("audio", package.audio.map { sessionPackageAudioJSON($0, indent: 1) }),
             ("recording_start_trajectory_point", package.recordingStartTrajectoryPoint.map { trajectoryPointJSON($0, indent: 1) }),
+            ("trajectory_points", trajectoryPointsJSON(package.trajectoryPoints, indent: 1)),
             ("transcription", jsonString(package.transcription)),
             ("matched_questions", matchedQuestionsJSON(package.matchedQuestions, indent: 1))
         ], indent: 0)
@@ -1438,6 +1497,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("lat", jsonNumber(point.lat)),
             ("lon", jsonNumber(point.lon)),
             ("ts_ms", jsonNumber(point.tsMs)),
+            ("captured_at", jsonString(point.capturedAt)),
             ("accuracy_m", jsonNumber(point.accuracyM)),
             ("speed_mps", jsonNumber(point.speedMps)),
             ("course_deg", jsonNumber(point.courseDeg)),
@@ -1445,6 +1505,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("is_background", jsonBool(point.isBackground)),
             ("session_id", jsonString(point.sessionId))
         ], indent: indent)
+    }
+
+    private func trajectoryPointsJSON(_ points: [SessionPackageTrajectoryPoint], indent: Int) -> String {
+        let values = points.map { trajectoryPointJSON($0, indent: indent + 1) }
+        return orderedArray(values, indent: indent)
     }
 
     private func matchedQuestionsJSON(_ matchedQuestions: [MatchedQuestion], indent: Int) -> String {
@@ -1592,8 +1657,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     // MARK: - AVAudioPlayerDelegate
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         DispatchQueue.main.async {
-            self.playButton.setTitle("Play Recording", for: .normal)
-            self.playButton.backgroundColor = .systemPurple
+            self.updateButton(self.playButton, title: "Play Recording", backgroundColor: .systemPurple)
             self.statusLabel.text = "Playback complete"
             self.statusLabel.textColor = .systemGray
         }
@@ -1631,6 +1695,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         if isRecording {
             isRecording = false
             audioRecorder?.stop()
+            interviewTrajectoryPoints = TrajectoryTracker.shared.stopInterviewTracking()
+            if let recordingURL {
+                updateRecordingTrajectoryMetadata(for: recordingURL, points: interviewTrajectoryPoints)
+            }
         }
 
         if let player = audioPlayer, player.isPlaying {
@@ -1649,10 +1717,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         recordedData = nil
         recordingURL = nil
         recordingStartTrajectoryPoint = nil
+        interviewTrajectoryPoints = []
 
         // Reset UI state
-        recordButton.setTitle("Start Recording", for: .normal)
-        recordButton.backgroundColor = .systemRed
+        updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
         playButton.isEnabled = false
         exportButton.isEnabled = false
         playButton.alpha = 0.5
@@ -2193,6 +2261,59 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         )
         recordingStartTrajectoryPoint = point
         return point
+    }
+
+    private func interviewTrajectoryPoints(
+        for recordingURL: URL,
+        cloudSessionId: String
+    ) -> [PendingTrajectoryStore.Point] {
+        if isRecording {
+            let currentPoints = TrajectoryTracker.shared.currentInterviewPoints()
+            if !currentPoints.isEmpty {
+                interviewTrajectoryPoints = currentPoints
+            }
+        }
+
+        if !interviewTrajectoryPoints.isEmpty {
+            return interviewTrajectoryPoints.map { pointWithCloudSessionId($0, cloudSessionId) }
+        }
+
+        if let rawPoints = recordingMetadata(for: recordingURL)?["trajectory_points"] as? [[String: Any]] {
+            let points = rawPoints.compactMap { trajectoryPoint(from: $0, cloudSessionId: cloudSessionId) }
+            if !points.isEmpty {
+                interviewTrajectoryPoints = points
+                return points
+            }
+        }
+
+        if let startPoint = recordingStartTrajectoryPoint(for: recordingURL, cloudSessionId: cloudSessionId) {
+            return [startPoint]
+        }
+
+        return []
+    }
+
+    private func trajectoryPoint(
+        from raw: [String: Any],
+        cloudSessionId: String
+    ) -> PendingTrajectoryStore.Point? {
+        guard let tsMs = int64Value(raw["ts_ms"]),
+              let lat = doubleValue(raw["lat"]),
+              let lon = doubleValue(raw["lon"]) else {
+            return nil
+        }
+
+        return PendingTrajectoryStore.Point(
+            tsMs: tsMs,
+            lat: lat,
+            lon: lon,
+            accuracyM: doubleValue(raw["accuracy_m"]),
+            speedMps: doubleValue(raw["speed_mps"]),
+            courseDeg: doubleValue(raw["course_deg"]),
+            provider: raw["provider"] as? String ?? "interview",
+            isBackground: raw["is_background"] as? Bool,
+            sessionId: cloudSessionId
+        )
     }
 
     private func pointWithCloudSessionId(
