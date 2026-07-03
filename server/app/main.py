@@ -83,6 +83,135 @@ def safe_json_summary(data: dict) -> dict:
     }
 
 
+def normalize_answer_for_analysis(answer: object) -> str | None:
+    if not isinstance(answer, str):
+        return None
+
+    value = answer.strip().lower()
+    if not value:
+        return None
+
+    compact = value.strip(" .,!?:;\"'")
+    if compact in {"yes", "y", "true"} or compact.startswith("yes,") or compact.startswith("yes."):
+        return "yes"
+    if compact in {"no", "n", "false"} or compact.startswith("no,") or compact.startswith("no."):
+        return "no"
+    if compact in {"n/a", "na", "not applicable", "none"} or "not applicable" in compact:
+        return "not_applicable"
+    if any(term in compact for term in ("unknown", "unsure", "not sure", "can't tell", "cannot tell")):
+        return "unknown"
+
+    return None
+
+
+def analysis_answer_rows(
+    cur,
+    *,
+    session_bytes: bytes,
+    respondent_bytes: bytes,
+    package_data: dict,
+    source_json_path: str,
+) -> list[tuple]:
+    raw_matches = package_data.get("matched_questions")
+    if not isinstance(raw_matches, list):
+        return []
+
+    question_ids = []
+    for item in raw_matches:
+        if not isinstance(item, dict):
+            continue
+        qid = item.get("matched_question_id")
+        if qid is not None:
+            question_ids.append(str(qid))
+
+    question_lookup: dict[str, dict] = {}
+    if question_ids:
+        placeholders = ", ".join(["%s"] * len(set(question_ids)))
+        cur.execute(
+            f"""
+            SELECT id, prompt, answer_type
+            FROM questions
+            WHERE id IN ({placeholders})
+            """,
+            tuple(sorted(set(question_ids))),
+        )
+        question_lookup = {str(row["id"]): row for row in cur.fetchall()}
+
+    rows = []
+    for index, item in enumerate(raw_matches):
+        if not isinstance(item, dict):
+            continue
+
+        qid_raw = item.get("matched_question_id")
+        if qid_raw is None:
+            continue
+
+        question_id = str(qid_raw)
+        question = question_lookup.get(question_id, {})
+        extracted_answer = item.get("extracted_answer")
+        confidence = item.get("confidence")
+        clarification_needed = item.get("clarification_needed")
+        fallback_question_text = item.get("matched_question")
+        question_text = question.get("prompt")
+        if not isinstance(question_text, str):
+            question_text = fallback_question_text if isinstance(fallback_question_text, str) else None
+        answer_type = question.get("answer_type")
+        if not isinstance(answer_type, str):
+            answer_type = None
+
+        rows.append(
+            (
+                session_bytes,
+                respondent_bytes,
+                question_id,
+                index,
+                question_text,
+                answer_type,
+                extracted_answer if isinstance(extracted_answer, str) else None,
+                normalize_answer_for_analysis(extracted_answer),
+                confidence if isinstance(confidence, str) else None,
+                clarification_needed if isinstance(clarification_needed, bool) else None,
+                json.dumps(item, ensure_ascii=False),
+                source_json_path,
+            )
+        )
+
+    return rows
+
+
+def replace_analysis_answers(
+    cur,
+    *,
+    session_bytes: bytes,
+    respondent_bytes: bytes,
+    package_data: dict,
+    source_json_path: str,
+) -> int:
+    cur.execute("DELETE FROM analysis_answers WHERE session_id = %s", (session_bytes,))
+    rows = analysis_answer_rows(
+        cur,
+        session_bytes=session_bytes,
+        respondent_bytes=respondent_bytes,
+        package_data=package_data,
+        source_json_path=source_json_path,
+    )
+    if not rows:
+        return 0
+
+    cur.executemany(
+        """
+        INSERT INTO analysis_answers (
+            session_id, respondent_id, question_id, matched_index,
+            question_text, answer_type, extracted_answer, normalized_answer,
+            confidence, clarification_needed, raw_match_json, source_json_path
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
 def write_upload_file(upload: UploadFile, destination: Path, max_bytes: int) -> tuple[int, str]:
     bytes_written = 0
     sha256 = hashlib.sha256()
@@ -455,6 +584,7 @@ def upload_session_package(
 
     json_relative_path = str(Path(session_id) / "session.json")
     package_dir_relative_path = session_id
+    analysis_answer_count = 0
 
     try:
         with get_conn() as conn:
@@ -507,6 +637,13 @@ def upload_session_package(
                         summary.get("transcript_chars"),
                     ),
                 )
+                analysis_answer_count = replace_analysis_answers(
+                    cur,
+                    session_bytes=session_bytes,
+                    respondent_bytes=respondent_bytes,
+                    package_data=package_data,
+                    source_json_path=json_relative_path,
+                )
     except Exception as e:
         if audio_relative_path:
             (session_dir / Path(audio_relative_path).name).unlink(missing_ok=True)
@@ -530,6 +667,7 @@ def upload_session_package(
         "audio_file_size_bytes": audio_bytes,
         "json_sha256": json_sha256,
         "audio_sha256": audio_sha256,
+        "analysis_answer_count": analysis_answer_count,
     }
 
 

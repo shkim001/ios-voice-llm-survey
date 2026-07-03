@@ -111,7 +111,7 @@ When the Survey API is configured:
 
 - After **LLM Recognition**, the app writes `session.json` into the local `SurveySessions/<local-session-id>/` folder.
 - If the Survey API is configured, the app uploads `session.json` and the `.m4a` recording together to `POST /sessions/{id}/package`.
-- The server stores both files under one VM folder and writes only an index row to MySQL.
+- The server stores both files under one VM folder, writes a package index row to MySQL, and extracts matched answers into `analysis_answers` for easier counting/filtering.
 - Recording is blocked if the app cannot retrieve a current GPS coordinate, then the app samples the latest available location about every 3 seconds while recording.
 
 ---
@@ -190,7 +190,7 @@ Use HTTPS in production, or configure firewall rules so only trusted clients rea
 
 ### 3. Database schema
 
-Ensure MySQL has the existing `respondents` and `survey_sessions` tables. Then apply the package index schema:
+Ensure MySQL has the existing `respondents`, `survey_sessions`, and `questions` tables. Then apply the package index and analysis schema:
 
 ```bash
 mysql -h "$MYSQL_HOST" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" < schema.sql
@@ -198,11 +198,17 @@ mysql -h "$MYSQL_HOST" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" < schema.sql
 
 ### 4. Questionnaire rows
 
-New package uploads do not insert per-answer rows into MySQL, so questionnaire seeding is not required for the package flow. If you use the legacy `/answers` endpoint, load rows from the app’s questionnaire file first:
+Package uploads read `questions` to attach prompt text and answer type to `analysis_answers`. Load rows from the app’s questionnaire file before collecting/analyzing new sessions:
 
 ```bash
 export $(grep -v '^#' .env | xargs)
 python3 scripts/seed_questions.py ../CounterApp/questionnaire.json
+```
+
+To populate `analysis_answers` from packages that were uploaded before the analysis table existed:
+
+```bash
+python3 scripts/backfill_analysis_answers.py
 ```
 
 ### 5. API surface
@@ -211,7 +217,7 @@ python3 scripts/seed_questions.py ../CounterApp/questionnaire.json
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
 | `POST` | `/sessions` | Create respondent + session |
-| `POST` | `/sessions/{session_id}/package` | Upload `session.json` plus the audio file into one server folder; MySQL stores only the index |
+| `POST` | `/sessions/{session_id}/package` | Upload `session.json` plus the audio file into one server folder; MySQL stores the package index and extracted analysis rows |
 | `POST` | `/sessions/{session_id}/answers` | Legacy: batch upload LLM-matched answers as MySQL rows |
 | `POST` | `/sessions/{session_id}/audio` | Legacy: upload recording audio separately |
 | `POST` | `/respondents/{respondent_id}/trajectory` | Legacy: upload GPS points separately |
@@ -254,7 +260,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 6. **Export JSON** — saves or updates `session.json` under the app Documents directory (`SurveySessions/<local-session-id>/`).
 7. **Aggregate** — summarizes previously exported JSON files on device.
 
-If Survey API is configured, step 4 also uploads the complete session package. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row.
+If Survey API is configured, step 4 also uploads the complete session package. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, and `analysis_answers` stores one extracted row per matched question for SQL summaries.
 
 The generated `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. Coordinate objects always place `lat` and `lon` next to each other. Interview paths are saved in `trajectory_points`; each point includes both `ts_ms` and readable UTC `captured_at`.
 
@@ -299,7 +305,7 @@ ios-voice-llm-survey/
 |-------|----------------|
 | LLM timeout / failure | VM proxy running; model name mapping for `gpt-4o-mini`; timeout ≥ 180s on proxy chain |
 | Survey API 401 | `X-API-Key` in app matches `API_KEY` in `.env` |
-| Package upload fails with schema error | Apply `server/schema.sql` so `session_packages` exists |
+| Package upload fails with schema error | Apply `server/schema.sql` so `session_packages` and `analysis_answers` exist |
 | Cannot find answers/transcript on server | Open `SURVEY_PACKAGE_STORAGE_DIR/<session-id>/session.json`; new uploads no longer store full answers/transcripts as MySQL rows |
 | iOS cannot reach HTTP server | ATS / use HTTPS; VM firewall allows device IP |
 | Package/audio not uploading | `SURVEY_PACKAGE_STORAGE_DIR` writable on server; Survey API configured; cloud session created |

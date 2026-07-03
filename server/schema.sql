@@ -104,3 +104,39 @@ CREATE TABLE IF NOT EXISTS session_packages (
     FOREIGN KEY (respondent_id) REFERENCES respondents(id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS analysis_answers (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  session_id BINARY(16) NOT NULL,
+  respondent_id BINARY(16) NOT NULL,
+
+  question_id VARCHAR(64) NOT NULL,
+  matched_index INT UNSIGNED NOT NULL,
+  question_text TEXT NULL,
+  answer_type VARCHAR(64) NULL,
+
+  extracted_answer TEXT NULL,
+  normalized_answer VARCHAR(64) NULL,
+  confidence VARCHAR(32) NULL,
+  clarification_needed BOOLEAN NULL,
+
+  raw_match_json LONGTEXT NULL,
+  source_json_path VARCHAR(1024) NOT NULL,
+
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+
+  PRIMARY KEY (id),
+  UNIQUE KEY uniq_analysis_answers_session_match (session_id, matched_index),
+  INDEX idx_analysis_answers_question_normalized (question_id, normalized_answer),
+  INDEX idx_analysis_answers_session_question (session_id, question_id),
+  INDEX idx_analysis_answers_respondent_question (respondent_id, question_id),
+
+  CONSTRAINT fk_analysis_answers_session
+    FOREIGN KEY (session_id) REFERENCES survey_sessions(id)
+    ON DELETE CASCADE,
+
+  CONSTRAINT fk_analysis_answers_respondent
+    FOREIGN KEY (respondent_id) REFERENCES respondents(id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
