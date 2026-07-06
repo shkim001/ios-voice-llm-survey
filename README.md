@@ -216,6 +216,8 @@ python3 scripts/backfill_analysis_answers.py
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
+| `GET` | `/admin/sessions` | Admin only: list uploaded session packages |
+| `GET` | `/admin/sessions/{session_id}` | Admin only: return the stored `session.json` for one package |
 | `POST` | `/sessions` | Create respondent + session |
 | `POST` | `/sessions/{session_id}/package` | Upload `session.json` plus the audio file into one server folder; MySQL stores the package index and extracted analysis rows |
 | `POST` | `/sessions/{session_id}/answers` | Legacy: batch upload LLM-matched answers as MySQL rows |
@@ -225,6 +227,7 @@ python3 scripts/backfill_analysis_answers.py
 | `POST` | `/llm-events` | Optional LLM telemetry |
 
 Authenticated requests send header `X-API-Key: <API_KEY>` when `API_KEY` is set in `.env`.
+Read-only admin requests send header `X-Admin-API-Key: <ADMIN_API_KEY>`.
 
 ### 6. Point the iOS app at the server
 

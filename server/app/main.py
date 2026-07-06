@@ -6,7 +6,7 @@ import os
 import hashlib
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID, uuid4
 
 import pymysql
@@ -24,6 +24,7 @@ MYSQL_USER = os.environ["MYSQL_USER"]
 MYSQL_PASSWORD = os.environ["MYSQL_PASSWORD"]
 MYSQL_DATABASE = os.environ["MYSQL_DATABASE"]
 API_KEY = os.environ.get("API_KEY", "").strip()
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "").strip()
 AUDIO_STORAGE_DIR = Path(os.environ.get("AUDIO_STORAGE_DIR", "uploaded_audio")).expanduser()
 SURVEY_PACKAGE_STORAGE_DIR = Path(
     os.environ.get("SURVEY_PACKAGE_STORAGE_DIR", "survey_session_packages")
@@ -81,6 +82,80 @@ def safe_json_summary(data: dict) -> dict:
         "answer_count": len(answers),
         "transcript_chars": len(transcript) if isinstance(transcript, str) else None,
     }
+
+
+def _nested_dict(data: dict, key: str) -> dict:
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _list_value(data: dict, *keys: str) -> list:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _string_value(data: dict, *keys: str) -> str | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def admin_json_summary(data: dict) -> dict:
+    metadata = _nested_dict(data, "metadata")
+    cloud = _nested_dict(metadata, "cloud")
+    respondent_info = _nested_dict(data, "respondent_info")
+    audio = _nested_dict(data, "audio")
+    trajectory_points = _list_value(data, "trajectory_points", "trajectory", "gps", "coordinates")
+    matched_questions = _list_value(data, "matched_questions", "answers")
+
+    return {
+        "cloud_session_id": _string_value(cloud, "session_id"),
+        "local_session_id": _string_value(data, "local_session_id", "session_id")
+        or _string_value(metadata, "local_session_id"),
+        "export_time": _string_value(metadata, "export_time", "created_at", "uploaded_at"),
+        "respondent_name": _string_value(respondent_info, "name"),
+        "respondent_location": _string_value(respondent_info, "location"),
+        "location_label": _string_value(data, "location_label"),
+        "questionnaire_title": _string_value(metadata, "questionnaire_title"),
+        "answer_count": len(matched_questions),
+        "trajectory_point_count": len(trajectory_points),
+        "audio_filename": _string_value(audio, "file_name", "filename", "original_filename"),
+    }
+
+
+def read_package_json(relative_json_path: str) -> dict:
+    json_path = (SURVEY_PACKAGE_STORAGE_DIR / relative_json_path).resolve()
+    storage_root = SURVEY_PACKAGE_STORAGE_DIR.resolve()
+    try:
+        json_path.relative_to(storage_root)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail="stored package path is outside storage root") from e
+
+    if not json_path.exists():
+        raise HTTPException(status_code=404, detail="session.json not found on server")
+
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail="stored session.json is invalid JSON") from e
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="stored session.json must be a JSON object")
+    return data
 
 
 def normalize_answer_for_analysis(answer: object) -> str | None:
@@ -272,6 +347,13 @@ def verify_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def verify_admin_api_key(x_admin_api_key: str | None = Header(default=None, alias="X-Admin-API-Key")):
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="Admin API is not configured")
+    if x_admin_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing admin API key")
+
+
 app = FastAPI(title="Survey API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -285,6 +367,81 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/admin/sessions")
+def admin_list_sessions(_: None = Depends(verify_admin_api_key)):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    session_id, local_session_id, json_path, audio_original_filename,
+                    recorded_at_ms, location_label, answer_count, uploaded_at
+                FROM session_packages
+                ORDER BY uploaded_at DESC
+                LIMIT 500
+                """
+            )
+            rows = cur.fetchall()
+
+    sessions = []
+    for row in rows:
+        session_id = bytes_to_uuid_hex(row["session_id"])
+        json_summary: dict[str, Any] = {}
+        try:
+            json_summary = admin_json_summary(read_package_json(row["json_path"]))
+        except HTTPException as exc:
+            logger.warning("admin session summary read failed for %s: %s", session_id, exc.detail)
+
+        sessions.append(
+            {
+                "session_id": session_id,
+                "cloud_session_id": json_summary.get("cloud_session_id") or session_id,
+                "local_session_id": json_summary.get("local_session_id") or row.get("local_session_id"),
+                "created_at": json_summary.get("export_time")
+                or (row["uploaded_at"].isoformat() if row.get("uploaded_at") else None),
+                "export_time": json_summary.get("export_time"),
+                "uploaded_at": row["uploaded_at"].isoformat() if row.get("uploaded_at") else None,
+                "respondent_name": json_summary.get("respondent_name"),
+                "respondent_location": json_summary.get("respondent_location"),
+                "location_label": json_summary.get("location_label") or row.get("location_label"),
+                "questionnaire_title": json_summary.get("questionnaire_title"),
+                "answer_count": json_summary.get("answer_count")
+                if json_summary.get("answer_count") is not None
+                else row.get("answer_count"),
+                "trajectory_point_count": json_summary.get("trajectory_point_count"),
+                "audio_filename": json_summary.get("audio_filename") or row.get("audio_original_filename"),
+                "recorded_at_ms": _int_or_none(row.get("recorded_at_ms")),
+            }
+        )
+
+    return {"sessions": sessions, "count": len(sessions)}
+
+
+@app.get("/admin/sessions/{session_id}")
+def admin_get_session(session_id: str, _: None = Depends(verify_admin_api_key)):
+    try:
+        session_bytes = uuid_to_bytes(UUID(hex=session_id))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT json_path
+                FROM session_packages
+                WHERE session_id = %s
+                """,
+                (session_bytes,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="session package not found")
+
+    return read_package_json(row["json_path"])
 
 
 class SessionCreate(BaseModel):
