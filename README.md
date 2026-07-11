@@ -227,7 +227,7 @@ python3 scripts/backfill_analysis_answers.py
 | `POST` | `/llm-events` | Optional LLM telemetry |
 
 Authenticated requests send header `X-API-Key: <API_KEY>` when `API_KEY` is set in `.env`.
-Read-only admin requests send header `X-Admin-API-Key: <ADMIN_API_KEY>`.
+Read-only admin requests use the same `X-API-Key: <API_KEY>` header when `API_KEY` is set.
 
 ### 6. Point the iOS app at the server
 

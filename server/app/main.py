@@ -24,7 +24,6 @@ MYSQL_USER = os.environ["MYSQL_USER"]
 MYSQL_PASSWORD = os.environ["MYSQL_PASSWORD"]
 MYSQL_DATABASE = os.environ["MYSQL_DATABASE"]
 API_KEY = os.environ.get("API_KEY", "").strip()
-ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "").strip()
 AUDIO_STORAGE_DIR = Path(os.environ.get("AUDIO_STORAGE_DIR", "uploaded_audio")).expanduser()
 SURVEY_PACKAGE_STORAGE_DIR = Path(
     os.environ.get("SURVEY_PACKAGE_STORAGE_DIR", "survey_session_packages")
@@ -347,13 +346,6 @@ def verify_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-def verify_admin_api_key(x_admin_api_key: str | None = Header(default=None, alias="X-Admin-API-Key")):
-    if not ADMIN_API_KEY:
-        raise HTTPException(status_code=503, detail="Admin API is not configured")
-    if x_admin_api_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing admin API key")
-
-
 app = FastAPI(title="Survey API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -370,7 +362,7 @@ def health():
 
 
 @app.get("/admin/sessions")
-def admin_list_sessions(_: None = Depends(verify_admin_api_key)):
+def admin_list_sessions(_: None = Depends(verify_api_key)):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -420,7 +412,7 @@ def admin_list_sessions(_: None = Depends(verify_admin_api_key)):
 
 
 @app.get("/admin/sessions/{session_id}")
-def admin_get_session(session_id: str, _: None = Depends(verify_admin_api_key)):
+def admin_get_session(session_id: str, _: None = Depends(verify_api_key)):
     try:
         session_bytes = uuid_to_bytes(UUID(hex=session_id))
     except ValueError as e:

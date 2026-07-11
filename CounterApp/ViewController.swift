@@ -11,6 +11,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     @IBOutlet weak var llmButton: UIButton!
     @IBOutlet weak var exportButton: UIButton!
     @IBOutlet weak var aggregateButton: UIButton!
+    private var dashboardButton: UIButton?
     private var audioFilesButton: UIButton?
     private var clearButton: UIButton?  // Created programmatically
 
@@ -119,6 +120,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         // Setup aggregate button
         setupButton(aggregateButton, title: "Aggregate Results", backgroundColor: .systemTeal)
 
+        // Create and setup dashboard button programmatically
+        let dashboardBtn = UIButton(type: .system)
+        dashboardBtn.translatesAutoresizingMaskIntoConstraints = false
+        setupButton(dashboardBtn, title: "Dashboard", backgroundColor: .systemIndigo)
+        dashboardBtn.addTarget(self, action: #selector(dashboardButtonTapped(_:)), for: .touchUpInside)
+        view.addSubview(dashboardBtn)
+        self.dashboardButton = dashboardBtn
+
         // Create and setup audio files button programmatically
         let audioBtn = UIButton(type: .system)
         audioBtn.translatesAutoresizingMaskIntoConstraints = false
@@ -137,12 +146,17 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         // Add constraints for programmatic buttons positioned below aggregate button
         NSLayoutConstraint.activate([
-            audioBtn.topAnchor.constraint(equalTo: aggregateButton.bottomAnchor, constant: 16),
-            audioBtn.leadingAnchor.constraint(equalTo: aggregateButton.leadingAnchor),
+            dashboardBtn.topAnchor.constraint(equalTo: aggregateButton.bottomAnchor, constant: 16),
+            dashboardBtn.leadingAnchor.constraint(equalTo: aggregateButton.leadingAnchor),
+            dashboardBtn.trailingAnchor.constraint(equalTo: audioBtn.leadingAnchor, constant: -12),
+            dashboardBtn.heightAnchor.constraint(equalToConstant: 50),
+            dashboardBtn.widthAnchor.constraint(equalTo: audioBtn.widthAnchor),
+
+            audioBtn.topAnchor.constraint(equalTo: dashboardBtn.topAnchor),
             audioBtn.trailingAnchor.constraint(equalTo: aggregateButton.trailingAnchor),
             audioBtn.heightAnchor.constraint(equalToConstant: 50),
 
-            clearBtn.topAnchor.constraint(equalTo: audioBtn.bottomAnchor, constant: 16),
+            clearBtn.topAnchor.constraint(equalTo: dashboardBtn.bottomAnchor, constant: 16),
             clearBtn.leadingAnchor.constraint(equalTo: aggregateButton.leadingAnchor),
             clearBtn.trailingAnchor.constraint(equalTo: aggregateButton.trailingAnchor),
             clearBtn.heightAnchor.constraint(equalToConstant: 50)
@@ -152,10 +166,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         playButton.isEnabled = false
         llmButton.isEnabled = false
         exportButton.isEnabled = false
+        dashboardBtn.isEnabled = true
         audioBtn.isEnabled = true
         playButton.alpha = 0.5
         llmButton.alpha = 0.5
         exportButton.alpha = 0.5
+        dashboardBtn.alpha = 1.0
         audioBtn.alpha = 1.0
     }
 
@@ -547,6 +563,26 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
 
         let vc = AudioLocationsViewController(groupedRecordings: grouped)
+        let nav = UINavigationController(rootViewController: vc)
+        present(nav, animated: true)
+    }
+
+    @objc private func dashboardButtonTapped(_ sender: UIButton) {
+        resetInactivityTimer()
+        animateButton(sender)
+
+        guard !isRecording else {
+            showMessage("Dashboard is unavailable while recording")
+            return
+        }
+
+        let sessions = LocalSessionDashboardLibrary.loadSessions()
+        guard !sessions.isEmpty else {
+            showMessage("No local session packages found yet")
+            return
+        }
+
+        let vc = LocalSessionDashboardViewController(sessions: sessions)
         let nav = UINavigationController(rootViewController: vc)
         present(nav, animated: true)
     }
@@ -1072,13 +1108,17 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             updateButton(recordButton, title: "Stop Recording", backgroundColor: .systemOrange)
             statusLabel.text = "Recording...\nSpeak into microphone"
             statusLabel.textColor = .systemRed
+            dashboardButton?.isEnabled = false
             audioFilesButton?.isEnabled = false
+            dashboardButton?.alpha = 0.5
             audioFilesButton?.alpha = 0.5
         } catch {
             showMessage("Recording failed to start: \(error.localizedDescription)")
             isRecording = false
             updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
+            dashboardButton?.isEnabled = true
             audioFilesButton?.isEnabled = true
+            dashboardButton?.alpha = 1.0
             audioFilesButton?.alpha = 1.0
         }
     }
@@ -1102,7 +1142,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         playButton.alpha = 1.0
         llmButton.alpha = 1.0
         exportButton.alpha = 1.0
+        dashboardButton?.isEnabled = true
         audioFilesButton?.isEnabled = true
+        dashboardButton?.alpha = 1.0
         audioFilesButton?.alpha = 1.0
 
         recordedData = "Recording data - Timestamp: \(Date().timeIntervalSince1970)"
@@ -1727,7 +1769,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         exportButton.alpha = 0.5
         llmButton.isEnabled = false
         llmButton.alpha = 0.5
+        dashboardButton?.isEnabled = true
         audioFilesButton?.isEnabled = true
+        dashboardButton?.alpha = 1.0
         audioFilesButton?.alpha = 1.0
 
         statusLabel.text = "Ready for next participant"
