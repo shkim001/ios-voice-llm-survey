@@ -10,7 +10,7 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
     static let shared = TrajectoryTracker()
 
     private let manager = CLLocationManager()
-    private let samplingInterval: TimeInterval = 3.0
+    private let samplingInterval: TimeInterval = 15.0
     private var lastKnownLocation: CLLocation?
     private var interviewPoints: [PendingTrajectoryStore.Point] = []
     private var samplingTimer: Timer?

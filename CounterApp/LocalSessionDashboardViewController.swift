@@ -2,6 +2,11 @@ import MapKit
 import UIKit
 
 struct LocalSessionDashboardSession {
+    enum Source {
+        case local
+        case cachedServer
+    }
+
     struct TrajectoryPoint {
         let latitude: Double
         let longitude: Double
@@ -27,6 +32,8 @@ struct LocalSessionDashboardSession {
     let transcription: String
     let matchedAnswers: [MatchedAnswer]
     let trajectoryPoints: [TrajectoryPoint]
+    let source: Source
+    let serverSessionId: String?
 
     var titleText: String {
         if let respondentName, !respondentName.isEmpty {
@@ -34,10 +41,35 @@ struct LocalSessionDashboardSession {
         }
         return localSessionId
     }
+
+    var sourceLabel: String {
+        switch source {
+        case .local:
+            return isUploaded ? "Local + uploaded" : "Local"
+        case .cachedServer:
+            return "Cached"
+        }
+    }
 }
 
 enum LocalSessionDashboardLibrary {
+    struct ServerSessionSummary {
+        let sessionId: String
+        let localSessionId: String?
+        let createdAt: Date?
+        let createdAtLabel: String?
+        let respondentName: String?
+        let locationLabel: String
+        let answerCount: Int?
+        let trajectoryPointCount: Int?
+        let audioFilename: String?
+    }
+
     static func loadSessions() -> [LocalSessionDashboardSession] {
+        loadLocalSessions() + loadCachedServerSessions()
+    }
+
+    static func loadLocalSessions() -> [LocalSessionDashboardSession] {
         let fm = FileManager.default
         let documents = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let sessionsRoot = documents.appendingPathComponent("SurveySessions", isDirectory: true)
@@ -50,11 +82,70 @@ enum LocalSessionDashboardLibrary {
         }
 
         return sessionDirs
-            .compactMap { loadSession(in: $0) }
+            .compactMap { loadSession(in: $0, source: .local, serverSessionId: nil) }
             .sorted { $0.createdAt > $1.createdAt }
     }
 
-    private static func loadSession(in directoryURL: URL) -> LocalSessionDashboardSession? {
+    static func loadCachedServerSessions() -> [LocalSessionDashboardSession] {
+        let fm = FileManager.default
+        guard let cacheRoot = try? cacheRootDirectory(),
+              let sessionDirs = try? fm.contentsOfDirectory(
+                at: cacheRoot,
+                includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+              ) else {
+            return []
+        }
+
+        return sessionDirs
+            .compactMap { loadSession(in: $0, source: .cachedServer, serverSessionId: $0.lastPathComponent) }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    static func cachedSession(serverSessionId: String) -> LocalSessionDashboardSession? {
+        guard let url = try? cacheDirectory(for: serverSessionId) else { return nil }
+        return loadSession(in: url, source: .cachedServer, serverSessionId: serverSessionId)
+    }
+
+    static func saveServerPackage(data: Data, serverSessionId: String) throws -> LocalSessionDashboardSession {
+        _ = try JSONSerialization.jsonObject(with: data)
+        let directory = try cacheDirectory(for: serverSessionId)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
+        let packageURL = directory.appendingPathComponent("session.json")
+        try data.write(to: packageURL, options: [.atomic])
+        guard let session = loadSession(in: directory, source: .cachedServer, serverSessionId: serverSessionId) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return session
+    }
+
+    static func loadCachedServerSummaries() -> [ServerSessionSummary] {
+        guard let url = try? serverListCacheURL(),
+              let data = try? Data(contentsOf: url),
+              let response = try? JSONDecoder().decode(SurveyAPIClient.AdminSessionListResponse.self, from: data) else {
+            return []
+        }
+        return response.sessions.map(serverSummary)
+    }
+
+    static func saveServerSummaries(_ response: SurveyAPIClient.AdminSessionListResponse) {
+        guard let url = try? serverListCacheURL(),
+              let data = try? JSONEncoder().encode(AdminSessionListCache(response: response)) else {
+            return
+        }
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
+        try? data.write(to: url, options: [.atomic])
+    }
+
+    static func serverSummaries(from response: SurveyAPIClient.AdminSessionListResponse) -> [ServerSessionSummary] {
+        response.sessions.map(serverSummary)
+    }
+
+    private static func loadSession(
+        in directoryURL: URL,
+        source: LocalSessionDashboardSession.Source,
+        serverSessionId: String?
+    ) -> LocalSessionDashboardSession? {
         let packageURL = directoryURL.appendingPathComponent("session.json")
         guard let data = try? Data(contentsOf: packageURL),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -62,6 +153,7 @@ enum LocalSessionDashboardLibrary {
         }
 
         let metadata = json["metadata"] as? [String: Any]
+        let cloud = metadata?["cloud"] as? [String: Any]
         let respondent = json["respondent_info"] as? [String: Any]
         let audio = json["audio"] as? [String: Any]
         let rawAnswers = json["matched_questions"] as? [[String: Any]] ?? []
@@ -120,8 +212,58 @@ enum LocalSessionDashboardLibrary {
             isUploaded: isUploaded,
             transcription: transcription,
             matchedAnswers: answers,
-            trajectoryPoints: trajectoryPoints
+            trajectoryPoints: trajectoryPoints,
+            source: source,
+            serverSessionId: serverSessionId ?? nonEmptyString(cloud?["session_id"])
         )
+    }
+
+    private struct AdminSessionListCache: Encodable {
+        let sessions: [SurveyAPIClient.AdminSessionSummary]
+        let count: Int
+
+        init(response: SurveyAPIClient.AdminSessionListResponse) {
+            sessions = response.sessions
+            count = response.count
+        }
+    }
+
+    private static func serverSummary(_ summary: SurveyAPIClient.AdminSessionSummary) -> ServerSessionSummary {
+        let createdLabel = summary.createdAt ?? summary.exportTime ?? summary.uploadedAt
+        return ServerSessionSummary(
+            sessionId: summary.sessionId,
+            localSessionId: summary.localSessionId,
+            createdAt: dateValue(createdLabel),
+            createdAtLabel: createdLabel,
+            respondentName: summary.respondentName,
+            locationLabel: nonEmptyString(summary.locationLabel)
+                ?? nonEmptyString(summary.respondentLocation)
+                ?? "Unknown Location",
+            answerCount: summary.answerCount,
+            trajectoryPointCount: summary.trajectoryPointCount,
+            audioFilename: summary.audioFilename
+        )
+    }
+
+    private static func cacheRootDirectory() throws -> URL {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let root = documents.appendingPathComponent("DashboardCache", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: nil)
+        return root
+    }
+
+    private static func cacheDirectory(for serverSessionId: String) throws -> URL {
+        try cacheRootDirectory().appendingPathComponent(safeCacheName(serverSessionId), isDirectory: true)
+    }
+
+    private static func serverListCacheURL() throws -> URL {
+        try cacheRootDirectory().appendingPathComponent("admin_session_list.json")
+    }
+
+    private static func safeCacheName(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let scalars = value.unicodeScalars.map { allowed.contains($0) ? String($0) : "_" }
+        return scalars.joined()
     }
 
     private static func recordingMetadata(in directoryURL: URL, audioFileName: String?) -> [String: Any]? {
@@ -171,10 +313,42 @@ enum LocalSessionDashboardLibrary {
         if let value = value as? String { return Double(value) }
         return nil
     }
+
+    private static func dateValue(_ value: String?) -> Date? {
+        guard let value else { return nil }
+
+        let isoWithFractional = ISO8601DateFormatter()
+        isoWithFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = isoWithFractional.date(from: value) {
+            return date
+        }
+
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        if let date = iso.date(from: value) {
+            return date
+        }
+
+        let display = DateFormatter()
+        display.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return display.date(from: value)
+    }
 }
 
 final class LocalSessionDashboardViewController: UITableViewController {
+    private enum Section: Int, CaseIterable {
+        case device
+        case server
+    }
+
+    private enum Row {
+        case session(LocalSessionDashboardSession)
+        case server(LocalSessionDashboardLibrary.ServerSessionSummary)
+    }
+
     private var sessions: [LocalSessionDashboardSession]
+    private var serverSummaries: [LocalSessionDashboardLibrary.ServerSessionSummary]
+    private var loadingServerSessionIds: Set<String> = []
 
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -185,6 +359,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
 
     init(sessions: [LocalSessionDashboardSession]) {
         self.sessions = sessions
+        self.serverSummaries = LocalSessionDashboardLibrary.loadCachedServerSummaries()
         super.init(style: .insetGrouped)
     }
 
@@ -209,44 +384,75 @@ final class LocalSessionDashboardViewController: UITableViewController {
         updateHeader()
     }
 
-    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        sessions.count
+    override func numberOfSections(in tableView: UITableView) -> Int {
+        Section.allCases.count
     }
 
     override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
-        "Local Sessions"
+        switch Section(rawValue: section) {
+        case .device:
+            return "Ready on this device"
+        case .server:
+            return "Available on server"
+        case .none:
+            return nil
+        }
+    }
+
+    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        rows(for: section).count
     }
 
     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "DashboardCell", for: indexPath)
-        let session = sessions[indexPath.row]
 
         var content = UIListContentConfiguration.subtitleCell()
-        content.text = session.titleText
-        content.secondaryText = [
-            Self.dateFormatter.string(from: session.createdAt),
-            session.locationLabel,
-            "\(session.matchedAnswers.count) answer(s)",
-            "\(session.trajectoryPoints.count) GPS point(s)",
-            session.isUploaded ? "uploaded" : "local"
-        ].joined(separator: "  |  ")
         content.secondaryTextProperties.numberOfLines = 2
+
+        switch rows(for: indexPath.section)[indexPath.row] {
+        case .session(let session):
+            content.text = session.titleText
+            content.secondaryText = [
+                Self.dateFormatter.string(from: session.createdAt),
+                session.locationLabel,
+                "\(session.matchedAnswers.count) answer(s)",
+                "\(session.trajectoryPoints.count) GPS point(s)",
+                session.sourceLabel
+            ].joined(separator: "  |  ")
+            cell.accessoryType = .disclosureIndicator
+        case .server(let summary):
+            content.text = summary.respondentName ?? summary.localSessionId ?? summary.sessionId
+            content.secondaryText = [
+                serverDateText(summary),
+                summary.locationLabel,
+                "\(summary.answerCount ?? 0) answer(s)",
+                "\(summary.trajectoryPointCount ?? 0) GPS point(s)",
+                loadingServerSessionIds.contains(summary.sessionId) ? "downloading" : "server"
+            ].joined(separator: "  |  ")
+            cell.accessoryType = .disclosureIndicator
+        }
+
         cell.contentConfiguration = content
-        cell.accessoryType = .disclosureIndicator
         return cell
     }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        navigationController?.pushViewController(
-            LocalSessionDetailViewController(session: sessions[indexPath.row]),
-            animated: true
-        )
+        switch rows(for: indexPath.section)[indexPath.row] {
+        case .session(let session):
+            navigationController?.pushViewController(
+                LocalSessionDetailViewController(session: session),
+                animated: true
+            )
+        case .server(let summary):
+            openServerSession(summary, indexPath: indexPath)
+        }
     }
 
     private func updateHeader() {
-        let uploaded = sessions.filter(\.isUploaded).count
-        let localOnly = sessions.count - uploaded
+        let localCount = sessions.filter { $0.source == .local }.count
+        let cachedCount = sessions.filter { $0.source == .cachedServer }.count
+        let serverOnly = serverOnlySummaries().count
         let points = sessions.reduce(0) { $0 + $1.trajectoryPoints.count }
         let latest = sessions.first.map { Self.dateFormatter.string(from: $0.createdAt) } ?? "None"
 
@@ -254,20 +460,130 @@ final class LocalSessionDashboardViewController: UITableViewController {
         label.numberOfLines = 0
         label.font = .preferredFont(forTextStyle: .subheadline)
         label.textColor = .secondaryLabel
-        label.text = "Total: \(sessions.count)    Uploaded: \(uploaded)    Local: \(localOnly)\nGPS points: \(points)\nLatest: \(latest)"
+        label.text = "Local: \(localCount)    Cached: \(cachedCount)    Server: \(serverOnly)\nCached GPS points: \(points)\nLatest cached/local: \(latest)"
         label.frame = CGRect(x: 0, y: 0, width: tableView.bounds.width, height: 72)
         label.textAlignment = .center
         tableView.tableHeaderView = label
     }
 
     @objc private func refreshTapped() {
-        sessions = LocalSessionDashboardLibrary.loadSessions()
-        updateHeader()
-        tableView.reloadData()
+        guard SurveyAPIClient.shared.isConfigured() else {
+            showAlert(message: "Survey API is not configured. Set Survey API Base URL in Settings.")
+            return
+        }
+
+        navigationItem.rightBarButtonItem?.isEnabled = false
+        Task { [weak self] in
+            do {
+                let response = try await SurveyAPIClient.shared.listAdminSessions()
+                LocalSessionDashboardLibrary.saveServerSummaries(response)
+                await MainActor.run {
+                    guard let self else { return }
+                    self.serverSummaries = LocalSessionDashboardLibrary.serverSummaries(from: response)
+                    self.sessions = LocalSessionDashboardLibrary.loadSessions()
+                    self.navigationItem.rightBarButtonItem?.isEnabled = true
+                    self.updateHeader()
+                    self.tableView.reloadData()
+                }
+            } catch {
+                await MainActor.run {
+                    self?.navigationItem.rightBarButtonItem?.isEnabled = true
+                    self?.showAlert(message: error.localizedDescription)
+                }
+            }
+        }
     }
 
     @objc private func closeTapped() {
         dismiss(animated: true)
+    }
+
+    private func rows(for section: Int) -> [Row] {
+        switch Section(rawValue: section) {
+        case .device:
+            return sessions
+                .sorted { $0.createdAt > $1.createdAt }
+                .map(Row.session)
+        case .server:
+            return serverOnlySummaries().map(Row.server)
+        case .none:
+            return []
+        }
+    }
+
+    private func serverOnlySummaries() -> [LocalSessionDashboardLibrary.ServerSessionSummary] {
+        let loadedServerIds = Set(sessions.compactMap(\.serverSessionId))
+        let localCloudIds = Set(sessions.compactMap { session -> String? in
+            guard session.source == .local else { return nil }
+            return session.serverSessionId
+        })
+
+        return serverSummaries
+            .filter { !loadedServerIds.contains($0.sessionId) && !localCloudIds.contains($0.sessionId) }
+            .sorted {
+                switch ($0.createdAt, $1.createdAt) {
+                case let (lhs?, rhs?):
+                    return lhs > rhs
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                case (nil, nil):
+                    return $0.sessionId < $1.sessionId
+                }
+            }
+    }
+
+    private func openServerSession(_ summary: LocalSessionDashboardLibrary.ServerSessionSummary, indexPath: IndexPath) {
+        if let cached = LocalSessionDashboardLibrary.cachedSession(serverSessionId: summary.sessionId) {
+            sessions = LocalSessionDashboardLibrary.loadSessions()
+            tableView.reloadData()
+            navigationController?.pushViewController(LocalSessionDetailViewController(session: cached), animated: true)
+            return
+        }
+
+        guard !loadingServerSessionIds.contains(summary.sessionId) else { return }
+        guard SurveyAPIClient.shared.isConfigured() else {
+            showAlert(message: "Survey API is not configured. Set Survey API Base URL in Settings.")
+            return
+        }
+
+        loadingServerSessionIds.insert(summary.sessionId)
+        tableView.reloadRows(at: [indexPath], with: .automatic)
+
+        Task { [weak self] in
+            do {
+                let data = try await SurveyAPIClient.shared.fetchAdminSessionPackage(sessionId: summary.sessionId)
+                let cached = try LocalSessionDashboardLibrary.saveServerPackage(data: data, serverSessionId: summary.sessionId)
+                await MainActor.run {
+                    guard let self else { return }
+                    self.loadingServerSessionIds.remove(summary.sessionId)
+                    self.sessions = LocalSessionDashboardLibrary.loadSessions()
+                    self.updateHeader()
+                    self.tableView.reloadData()
+                    self.navigationController?.pushViewController(LocalSessionDetailViewController(session: cached), animated: true)
+                }
+            } catch {
+                await MainActor.run {
+                    self?.loadingServerSessionIds.remove(summary.sessionId)
+                    self?.tableView.reloadData()
+                    self?.showAlert(message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func serverDateText(_ summary: LocalSessionDashboardLibrary.ServerSessionSummary) -> String {
+        if let createdAt = summary.createdAt {
+            return Self.dateFormatter.string(from: createdAt)
+        }
+        return summary.createdAtLabel ?? "Unknown Date"
+    }
+
+    private func showAlert(message: String) {
+        let alert = UIAlertController(title: "Dashboard", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
     }
 }
 

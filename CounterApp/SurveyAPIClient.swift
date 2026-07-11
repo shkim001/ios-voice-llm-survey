@@ -150,6 +150,45 @@ final class SurveyAPIClient {
             case audioSha256 = "audio_sha256"
         }
     }
+
+    struct AdminSessionListResponse: Codable {
+        let sessions: [AdminSessionSummary]
+        let count: Int
+    }
+
+    struct AdminSessionSummary: Codable {
+        let sessionId: String
+        let cloudSessionId: String?
+        let localSessionId: String?
+        let createdAt: String?
+        let exportTime: String?
+        let uploadedAt: String?
+        let respondentName: String?
+        let respondentLocation: String?
+        let locationLabel: String?
+        let questionnaireTitle: String?
+        let answerCount: Int?
+        let trajectoryPointCount: Int?
+        let audioFilename: String?
+        let recordedAtMs: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case sessionId = "session_id"
+            case cloudSessionId = "cloud_session_id"
+            case localSessionId = "local_session_id"
+            case createdAt = "created_at"
+            case exportTime = "export_time"
+            case uploadedAt = "uploaded_at"
+            case respondentName = "respondent_name"
+            case respondentLocation = "respondent_location"
+            case locationLabel = "location_label"
+            case questionnaireTitle = "questionnaire_title"
+            case answerCount = "answer_count"
+            case trajectoryPointCount = "trajectory_point_count"
+            case audioFilename = "audio_filename"
+            case recordedAtMs = "recorded_at_ms"
+        }
+    }
     
     func postTrajectory(respondentId: String, points: [PendingTrajectoryStore.Point]) async throws {
         let body = TrajectoryBatch(points: points)
@@ -268,6 +307,20 @@ final class SurveyAPIClient {
             throw SurveyAPIError.decodingFailed(rawPreview: String(raw.prefix(300)))
         }
     }
+
+    func listAdminSessions() async throws -> AdminSessionListResponse {
+        let data = try await requestData(method: "GET", path: "/admin/sessions")
+        do {
+            return try JSONDecoder().decode(AdminSessionListResponse.self, from: data)
+        } catch {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.decodingFailed(rawPreview: String(raw.prefix(300)))
+        }
+    }
+
+    func fetchAdminSessionPackage(sessionId: String) async throws -> Data {
+        try await requestData(method: "GET", path: "/admin/sessions/\(sessionId)")
+    }
     
     // MARK: - Networking internals
     
@@ -322,6 +375,21 @@ final class SurveyAPIClient {
         let req = makeRequest(method: method, url: url, bodyData: bodyData)
         let (data, response) = try await URLSession.shared.data(for: req)
         
+        guard let http = response as? HTTPURLResponse else {
+            throw SurveyAPIError.invalidHTTPResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.httpError(statusCode: http.statusCode, bodyPreview: String(raw.prefix(500)))
+        }
+        return data
+    }
+
+    private func requestData(method: String, path: String) async throws -> Data {
+        let url = try makeURL(path: path)
+        let req = makeRequest(method: method, url: url, bodyData: nil)
+        let (data, response) = try await URLSession.shared.data(for: req)
+
         guard let http = response as? HTTPURLResponse else {
             throw SurveyAPIError.invalidHTTPResponse
         }

@@ -112,7 +112,7 @@ When the Survey API is configured:
 - After **LLM Recognition**, the app writes `session.json` into the local `SurveySessions/<local-session-id>/` folder.
 - If the Survey API is configured, the app uploads `session.json` and the `.m4a` recording together to `POST /sessions/{id}/package`.
 - The server stores both files under one VM folder, writes a package index row to MySQL, and extracts matched answers into `analysis_answers` for easier counting/filtering.
-- Recording is blocked if the app cannot retrieve a current GPS coordinate, then the app samples the latest available location about every 3 seconds while recording.
+- Recording is blocked if the app cannot retrieve a current GPS coordinate, then the app samples the latest available location about every 15 seconds while recording.
 
 ---
 
@@ -134,7 +134,8 @@ MYSQL_USER=app_user
 MYSQL_PASSWORD=your-password
 MYSQL_DATABASE=survey
 
-# Optional: require X-API-Key header on all mutating routes (leave empty to disable)
+# Optional: require X-API-Key header on protected routes, including admin reads
+# Leave empty only for local/private testing.
 API_KEY=your-shared-secret
 
 # Optional: where complete session packages are stored on the VM.
@@ -238,6 +239,24 @@ In app **Settings**:
 
 ---
 
+## Native iOS dashboard
+
+The iOS app includes a native **Dashboard** button on the main screen. It is intentionally data-light:
+
+- The dashboard opens immediately with sessions already available on the device.
+- Local sessions come from `Documents/SurveySessions/<local-session-id>/session.json`.
+- Tapping the dashboard refresh button calls `GET /admin/sessions` and fetches only the lightweight server session list.
+- Server-only sessions appear under **Available on server**.
+- Tapping one server-only row then calls `GET /admin/sessions/{session_id}` to download that one full `session.json`.
+- Downloaded server packages are cached under `Documents/DashboardCache/<server-session-id>/session.json`.
+- Cached server packages appear under **Ready on this device** and can be opened again without another full download.
+
+The dashboard uses the same **Survey API Base URL** and **Survey API Key** configured in app Settings. There is no separate admin API key.
+
+The route map is rendered natively with MapKit from `trajectory_points` in `session.json`. It does not require live location permission just to view a saved route, but map tiles may require network access.
+
+---
+
 ## Self-hosted LLM on a VM (outline)
 
 This repo does not include the LLM proxy itself; the iOS app expects an **OpenAI-compatible** HTTP API. A typical GCP setup:
@@ -261,7 +280,8 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 4. **LLM Recognition** — sends the transcript to the configured LLM; shows matched questions and extracted answers.
 5. **Respondent info** — prompted when exporting or as part of your study flow.
 6. **Export JSON** — saves or updates `session.json` under the app Documents directory (`SurveySessions/<local-session-id>/`).
-7. **Aggregate** — summarizes previously exported JSON files on device.
+7. **Dashboard** — reviews local/cached sessions, refreshes the lightweight server session list on demand, and downloads a full server `session.json` only when a server row is opened.
+8. **Aggregate** — summarizes previously exported JSON files on device.
 
 If Survey API is configured, step 4 also uploads the complete session package. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, and `analysis_answers` stores one extracted row per matched question for SQL summaries.
 
@@ -282,6 +302,7 @@ ios-voice-llm-survey/
 │   ├── SessionManager.swift           # Local session folders
 │   ├── PendingSurveyUploadStore.swift # Legacy offline answer queue
 │   ├── MapViewController.swift        # Map-first entry (optional)
+│   ├── LocalSessionDashboardViewController.swift # Local/server session dashboard + MapKit route viewer
 │   ├── questionnaire.json
 │   └── ...
 ├── CounterAppTests/
@@ -308,6 +329,8 @@ ios-voice-llm-survey/
 |-------|----------------|
 | LLM timeout / failure | VM proxy running; model name mapping for `gpt-4o-mini`; timeout ≥ 180s on proxy chain |
 | Survey API 401 | `X-API-Key` in app matches `API_KEY` in `.env` |
+| Dashboard server refresh fails | Survey API Base URL/Key are configured in app Settings; FastAPI is reachable; `/admin/sessions` returns 200 |
+| Dashboard server row does not open | `/admin/sessions/{session_id}` can read the server package `session.json`; `SURVEY_PACKAGE_STORAGE_DIR` points to the package folders |
 | Package upload fails with schema error | Apply `server/schema.sql` so `session_packages` and `analysis_answers` exist |
 | Cannot find answers/transcript on server | Open `SURVEY_PACKAGE_STORAGE_DIR/<session-id>/session.json`; new uploads no longer store full answers/transcripts as MySQL rows |
 | iOS cannot reach HTTP server | ATS / use HTTPS; VM firewall allows device IP |
