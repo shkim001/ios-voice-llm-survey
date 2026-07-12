@@ -135,11 +135,21 @@ final class QuestionnaireStore {
 
 // MARK: - Respondent Information Models
 struct RespondentInfo: Codable {
-    let name: String
-    let age: Int
+    let isAnonymous: Bool
+    let name: String?
+    let age: Int?
     let gender: String
-    let phone: String
+    let phone: String?
     let location: String
+
+    enum CodingKeys: String, CodingKey {
+        case isAnonymous = "is_anonymous"
+        case name
+        case age
+        case gender
+        case phone
+        case location
+    }
 }
 
 // MARK: - Exported Survey Models

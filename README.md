@@ -309,8 +309,8 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 2. **Review Recording** — after Stop & Review, play the audio without closing the review popup, then analyze or discard the recording.
 3. **Analyze Answers** — from the review popup, transcribes the recording (English locale), sends the transcript to the configured LLM, and shows matched questions and extracted answers.
 4. **Clarify Answers** — for medium/low-confidence answers or answers marked as needing clarification, select or type the final answer and optionally add a note. The JSON keeps both the original LLM answer and the manual correction.
-5. **Start Next Participant** — resets the screen for the next interview after the analyzed package has already been saved locally and uploaded if configured, without pre-creating an empty session folder.
-6. **Session Tools / Dashboard** — optional utilities for exporting or sharing the current/local `session.json`.
+5. **Automatic reset** — after analysis/clarification saves the package and finishes the upload attempt if configured, the main screen returns to a fresh **Start Interview** state.
+6. **Session Tools / Dashboard** — optional utilities for exporting or sharing saved `session.json` packages.
 7. **Dashboard** — reviews local/cached sessions, refreshes the lightweight server session list on demand, and downloads a full server `session.json` only when a server row is opened.
 8. **Aggregate** — summarizes analyzed local `SurveySessions/*/session.json` packages on device, with older `SurveyExports/*.json` files included for compatibility.
 

@@ -116,15 +116,18 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         // Setup record button
         setupButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
 
-        // Setup play button
+        // Playback happens in the post-recording review popup.
         setupButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
+        playButton.isHidden = true
 
         // Analyze now happens from the post-recording review flow.
         setupButton(llmButton, title: "Analyze Answers", backgroundColor: .systemBlue)
         llmButton.isHidden = true
 
         // The session package is saved automatically after analysis/clarification.
+        // Resetting for the next interview also happens automatically after save/upload.
         setupButton(exportButton, title: "Start Next Participant", backgroundColor: .systemGreen)
+        exportButton.isHidden = true
 
         // Setup aggregate button
         setupButton(aggregateButton, title: "Aggregate Results", backgroundColor: .systemTeal)
@@ -171,17 +174,16 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             clearBtn.heightAnchor.constraint(equalToConstant: 50)
         ])
 
-        // Initial state: play disabled; Start Next Participant remains available.
+        // Initial state: hidden legacy buttons are disabled for storyboard compatibility.
         playButton.isEnabled = false
         llmButton.isEnabled = false
-        exportButton.isEnabled = true
         dashboardBtn.isEnabled = true
         audioBtn.isEnabled = true
         playButton.alpha = 0.5
         llmButton.alpha = 0.5
-        exportButton.alpha = 1.0
         dashboardBtn.alpha = 1.0
         audioBtn.alpha = 1.0
+        updateNextParticipantButtonState()
     }
 
     private func setupButton(_ button: UIButton, title: String, backgroundColor: UIColor) {
@@ -209,6 +211,22 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         button.configuration?.baseBackgroundColor = backgroundColor
     }
 
+    private func updateNextParticipantButtonState() {
+        let hasParticipantState = respondentInfo != nil ||
+            transcription != nil ||
+            !matchedQuestions.isEmpty ||
+            cloudRespondentId != nil ||
+            cloudSessionId != nil ||
+            recordedData != nil ||
+            recordingURL != nil ||
+            recordingStartTrajectoryPoint != nil ||
+            !interviewTrajectoryPoints.isEmpty ||
+            isRecording
+
+        exportButton.isEnabled = hasParticipantState && !isRecording
+        exportButton.alpha = exportButton.isEnabled ? 1.0 : 0.5
+    }
+
     // MARK: - Button Actions
     @IBAction func recordButtonTapped(_ sender: UIButton) {
         resetInactivityTimer()
@@ -221,16 +239,15 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 return
             }
 
-            // Clear previous state when starting a new recording (same participant/session unless "Start next participant" was used)
+            // Clear any stale analysis state before starting a new recording.
             transcription = nil
             matchedQuestions = []
             interviewTrajectoryPoints = []
 
             // Analysis now runs from the post-recording review flow.
             llmButton.isEnabled = true  // Can start LLM analysis after recording
-            exportButton.isEnabled = true
             llmButton.alpha = 1.0
-            exportButton.alpha = 1.0
+            updateNextParticipantButtonState()
 
             selectQuestionnaireIfNeeded { [weak self] in
                 self?.showRespondentInfoForm { [weak self] info in
@@ -1181,10 +1198,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             statusLabel.textColor = .systemRed
             dashboardButton?.isEnabled = false
             audioFilesButton?.isEnabled = false
-            exportButton.isEnabled = false
             dashboardButton?.alpha = 0.5
             audioFilesButton?.alpha = 0.5
-            exportButton.alpha = 0.5
+            updateNextParticipantButtonState()
             presentRecordingMonitor()
         } catch {
             showMessage("Recording failed to start: \(error.localizedDescription)")
@@ -1192,10 +1208,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
             dashboardButton?.isEnabled = true
             audioFilesButton?.isEnabled = true
-            exportButton.isEnabled = true
             dashboardButton?.alpha = 1.0
             audioFilesButton?.alpha = 1.0
-            exportButton.alpha = 1.0
+            updateNextParticipantButtonState()
         }
     }
 
@@ -1213,15 +1228,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         // Enable buttons
         playButton.isEnabled = true
-        exportButton.isEnabled = true
         playButton.alpha = 1.0
-        exportButton.alpha = 1.0
         dashboardButton?.isEnabled = true
         audioFilesButton?.isEnabled = true
         dashboardButton?.alpha = 1.0
         audioFilesButton?.alpha = 1.0
 
         recordedData = "Recording data - Timestamp: \(Date().timeIntervalSince1970)"
+        updateNextParticipantButtonState()
         let monitorViewController = recordingMonitorViewController
         recordingMonitorViewController = nil
 
@@ -1380,14 +1394,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         updateButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
         playButton.isEnabled = false
         llmButton.isEnabled = false
-        exportButton.isEnabled = true
         playButton.alpha = 0.5
         llmButton.alpha = 0.5
-        exportButton.alpha = 1.0
         dashboardButton?.isEnabled = true
         audioFilesButton?.isEnabled = true
         dashboardButton?.alpha = 1.0
         audioFilesButton?.alpha = 1.0
+        updateNextParticipantButtonState()
 
         statusLabel.text = "Recording discarded\nReady to start again"
         statusLabel.textColor = .systemGray
@@ -1395,6 +1408,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         SessionManager.shared.clearCurrentSessionIfEmpty()
         sessionId = nil
         sessionDirectoryURL = nil
+        updateNextParticipantButtonState()
     }
 
     private func writeRecordingMetadata(for recordingURL: URL, recordingStartPoint: PendingTrajectoryStore.Point) {
@@ -1409,13 +1423,21 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         ]
 
         if let info = respondentInfo {
-            metadata["respondent_info"] = [
-                "name": info.name,
-                "age": info.age,
+            var respondentMetadata: [String: Any] = [
+                "is_anonymous": info.isAnonymous,
                 "gender": info.gender,
-                "phone": info.phone,
                 "location": info.location
             ]
+            if let name = info.name {
+                respondentMetadata["name"] = name
+            }
+            if let age = info.age {
+                respondentMetadata["age"] = age
+            }
+            if let phone = info.phone {
+                respondentMetadata["phone"] = phone
+            }
+            metadata["respondent_info"] = respondentMetadata
         }
 
         do {
@@ -1787,6 +1809,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     private func respondentInfoJSON(_ info: RespondentInfo, indent: Int) -> String {
         return orderedObject([
+            ("is_anonymous", jsonBool(info.isAnonymous)),
             ("name", jsonString(info.name)),
             ("age", jsonNumber(info.age)),
             ("gender", jsonString(info.gender)),
@@ -2089,8 +2112,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         llmButton.isEnabled = true
         llmButton.alpha = 1.0
-        exportButton.isEnabled = true
-        exportButton.alpha = 1.0
+        updateNextParticipantButtonState()
 
         Task { [weak self] in
             guard let self else { return }
@@ -2102,12 +2124,23 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 )
             } catch {
                 print("Failed to write local session package: \(error.localizedDescription)")
+                await MainActor.run {
+                    self.statusLabel.text = "Analysis complete, but local save failed"
+                    self.statusLabel.textColor = .systemRed
+                    self.updateNextParticipantButtonState()
+                }
+                return
             }
             await self.uploadSessionPackageToCloud(
                 transcription: transcription,
                 matchedQuestions: matchedQuestions,
                 recordingURL: recordingURL
             )
+            await MainActor.run {
+                self.startNextParticipant()
+                self.statusLabel.text = "Analysis saved\nReady for next interview"
+                self.statusLabel.textColor = .systemGreen
+            }
         }
     }
 
@@ -2229,15 +2262,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         // Reset UI state
         updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
         playButton.isEnabled = false
-        exportButton.isEnabled = true
         playButton.alpha = 0.5
-        exportButton.alpha = 1.0
         llmButton.isEnabled = false
         llmButton.alpha = 0.5
         dashboardButton?.isEnabled = true
         audioFilesButton?.isEnabled = true
         dashboardButton?.alpha = 1.0
         audioFilesButton?.alpha = 1.0
+        updateNextParticipantButtonState()
 
         statusLabel.text = "Ready for next participant"
         statusLabel.textColor = .systemGray
@@ -3383,7 +3415,7 @@ private final class RecordingReviewViewController: UIViewController {
     }
 }
 
-private final class RecordingMonitorViewController: UIViewController, UIScrollViewDelegate {
+private final class RecordingMonitorViewController: UIViewController {
     var questions: [Question] = []
     var levelProvider: (() -> Float)?
     var onStopReview: (() -> Void)?
@@ -3392,8 +3424,6 @@ private final class RecordingMonitorViewController: UIViewController, UIScrollVi
     private let waveformView = RecordingWaveformView()
     private let timerLabel = UILabel()
     private let qualityLabel = UILabel()
-    private let scrollView = UIScrollView()
-    private let pageControl = UIPageControl()
     private var startedAt = Date()
     private var timer: Timer?
     private var recentLevels: [Float] = []
@@ -3438,23 +3468,7 @@ private final class RecordingMonitorViewController: UIViewController, UIScrollVi
         qualityLabel.textColor = .systemOrange
         qualityLabel.text = "Listening for voice..."
 
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.isPagingEnabled = true
-        scrollView.showsHorizontalScrollIndicator = false
-        scrollView.delegate = self
-
-        let contentView = UIView()
-        contentView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.addSubview(contentView)
-
         let monitorPage = makeMonitorPage()
-        let tipsPage = makeTipsPage()
-        contentView.addSubview(monitorPage)
-        contentView.addSubview(tipsPage)
-
-        pageControl.translatesAutoresizingMaskIntoConstraints = false
-        pageControl.numberOfPages = 2
-        pageControl.currentPage = 0
 
         let stopButton = UIButton(type: .system)
         stopButton.translatesAutoresizingMaskIntoConstraints = false
@@ -3485,8 +3499,7 @@ private final class RecordingMonitorViewController: UIViewController, UIScrollVi
         view.addSubview(titleLabel)
         view.addSubview(timerLabel)
         view.addSubview(qualityLabel)
-        view.addSubview(scrollView)
-        view.addSubview(pageControl)
+        view.addSubview(monitorPage)
         view.addSubview(buttonStack)
 
         NSLayoutConstraint.activate([
@@ -3502,30 +3515,10 @@ private final class RecordingMonitorViewController: UIViewController, UIScrollVi
             qualityLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
             qualityLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
 
-            scrollView.topAnchor.constraint(equalTo: qualityLabel.bottomAnchor, constant: 18),
-            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: pageControl.topAnchor, constant: -8),
-
-            contentView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
-            contentView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
-            contentView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
-            contentView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
-            contentView.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor),
-
-            monitorPage.topAnchor.constraint(equalTo: contentView.topAnchor),
-            monitorPage.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            monitorPage.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            monitorPage.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
-
-            tipsPage.topAnchor.constraint(equalTo: contentView.topAnchor),
-            tipsPage.leadingAnchor.constraint(equalTo: monitorPage.trailingAnchor),
-            tipsPage.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            tipsPage.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            tipsPage.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
-
-            pageControl.bottomAnchor.constraint(equalTo: buttonStack.topAnchor, constant: -12),
-            pageControl.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            monitorPage.topAnchor.constraint(equalTo: qualityLabel.bottomAnchor, constant: 18),
+            monitorPage.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            monitorPage.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            monitorPage.bottomAnchor.constraint(equalTo: buttonStack.topAnchor, constant: -12),
 
             buttonStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
             buttonStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
@@ -3767,35 +3760,6 @@ private final class RecordingMonitorViewController: UIViewController, UIScrollVi
         }
     }
 
-    private func makeTipsPage() -> UIView {
-        let page = UIView()
-        page.translatesAutoresizingMaskIntoConstraints = false
-
-        let label = UILabel()
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.text = """
-        Quick field check
-
-        Keep the iPad microphone pointed toward the respondent.
-        Watch for moving bars during answers.
-        Use Discard Recording for accidental or unnecessary interviews.
-        Stop & Review before analyzing answers.
-        """
-        label.font = UIFont.systemFont(ofSize: 21, weight: .medium)
-        label.textColor = .label
-        label.numberOfLines = 0
-        label.textAlignment = .left
-
-        page.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.centerYAnchor.constraint(equalTo: page.centerYAnchor),
-            label.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 36),
-            label.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -36)
-        ])
-
-        return page
-    }
-
     private func tick() {
         let elapsed = Int(Date().timeIntervalSince(startedAt))
         timerLabel.text = String(format: "%02d:%02d", elapsed / 60, elapsed % 60)
@@ -3823,11 +3787,6 @@ private final class RecordingMonitorViewController: UIViewController, UIScrollVi
             qualityLabel.text = "No clear voice detected"
             qualityLabel.textColor = .systemRed
         }
-    }
-
-    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        let page = Int(round(scrollView.contentOffset.x / max(1, scrollView.bounds.width)))
-        pageControl.currentPage = page
     }
 
     @objc private func stopTapped() {

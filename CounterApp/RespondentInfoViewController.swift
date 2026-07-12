@@ -7,6 +7,7 @@ class RespondentInfoViewController: UIViewController {
     var onCancel: (() -> Void)?
     private var activeTextField: UITextField?
     private let allowedAgeRange = 0...100
+    private var isAnonymousSurvey = false
     
     // MARK: - UI Elements
     private let scrollView: UIScrollView = {
@@ -50,6 +51,20 @@ class RespondentInfoViewController: UIViewController {
         textField.font = UIFont.systemFont(ofSize: 16)
         return textField
     }()
+
+    private let anonymousButton: UIButton = {
+        let button = UIButton(type: .system)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.setTitle("Anonymous survey", for: .normal)
+        button.setTitleColor(.label, for: .normal)
+        button.titleLabel?.font = UIFont.systemFont(ofSize: 16, weight: .medium)
+        button.contentHorizontalAlignment = .leading
+        button.tintColor = .systemBlue
+        button.setImage(UIImage(systemName: "square"), for: .normal)
+        button.configuration = nil
+        button.imageEdgeInsets = UIEdgeInsets(top: 0, left: 0, bottom: 0, right: 8)
+        return button
+    }()
     
     private let ageTextField: UITextField = {
         let textField = UITextField()
@@ -73,7 +88,7 @@ class RespondentInfoViewController: UIViewController {
     }()
     
     private let genderSegmentedControl: UISegmentedControl = {
-        let items = ["Male", "Female", "Other"]
+        let items = ["Male", "Female", "Other", "Prefer not"]
         let control = UISegmentedControl(items: items)
         control.translatesAutoresizingMaskIntoConstraints = false
         control.selectedSegmentIndex = 0
@@ -109,6 +124,10 @@ class RespondentInfoViewController: UIViewController {
         button.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
         return button
     }()
+
+    private lazy var nameLabel = createLabel(text: "Name *")
+    private lazy var ageLabel = createLabel(text: "Age *")
+    private lazy var phoneLabel = createLabel(text: "Phone Number *")
     
     // MARK: - Lifecycle
     override func viewDidLoad() {
@@ -146,13 +165,11 @@ class RespondentInfoViewController: UIViewController {
         contentView.addSubview(stackView)
         
         // Add labels and fields to stack view
-        let nameLabel = createLabel(text: "Name *")
-        let ageLabel = createLabel(text: "Age *")
         let genderLabel = createLabel(text: "Gender *")
-        let phoneLabel = createLabel(text: "Phone Number *")
         let locationLabel = createLabel(text: "Survey Location *")
         
         stackView.addArrangedSubview(titleLabel)
+        stackView.addArrangedSubview(anonymousButton)
         stackView.addArrangedSubview(nameLabel)
         stackView.addArrangedSubview(nameTextField)
         stackView.addArrangedSubview(ageLabel)
@@ -168,6 +185,7 @@ class RespondentInfoViewController: UIViewController {
         
         // Add button action
         submitButton.addTarget(self, action: #selector(submitButtonTapped), for: .touchUpInside)
+        anonymousButton.addTarget(self, action: #selector(anonymousButtonTapped), for: .touchUpInside)
         ageTextField.addTarget(self, action: #selector(ageTextDidChange), for: .editingChanged)
         stackView.setCustomSpacing(6, after: ageTextField)
         
@@ -285,27 +303,28 @@ class RespondentInfoViewController: UIViewController {
     
     // MARK: - Actions
     @objc private func submitButtonTapped() {
-        guard let name = nameTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !name.isEmpty else {
+        let nameText = nameTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let phoneText = phoneTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let ageText = ageTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        guard isAnonymousSurvey || !nameText.isEmpty else {
             showAlert(message: "Please enter name")
             return
         }
-        
-        guard let ageText = ageTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !ageText.isEmpty,
-              let age = Int(ageText) else {
+
+        let age = Int(ageText)
+        guard isAnonymousSurvey || (!ageText.isEmpty && age != nil) else {
             showAlert(message: "Please enter a valid age")
             return
         }
 
-        guard allowedAgeRange.contains(age) else {
+        guard isAnonymousSurvey || allowedAgeRange.contains(age ?? -1) else {
             updateAgeWarning()
             showAlert(message: "Please enter an age from \(allowedAgeRange.lowerBound) to \(allowedAgeRange.upperBound)")
             return
         }
         
-        guard let phone = phoneTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !phone.isEmpty else {
+        guard isAnonymousSurvey || !phoneText.isEmpty else {
             showAlert(message: "Please enter phone number")
             return
         }
@@ -316,14 +335,15 @@ class RespondentInfoViewController: UIViewController {
             return
         }
         
-        let genderOptions = ["Male", "Female", "Other"]
+        let genderOptions = ["Male", "Female", "Other", "Prefer not to say"]
         let gender = genderOptions[genderSegmentedControl.selectedSegmentIndex]
         
         let info = RespondentInfo(
-            name: name,
-            age: age,
+            isAnonymous: isAnonymousSurvey,
+            name: isAnonymousSurvey ? nil : nameText,
+            age: isAnonymousSurvey ? nil : age,
             gender: gender,
-            phone: phone,
+            phone: isAnonymousSurvey ? nil : phoneText,
             location: location
         )
         
@@ -338,8 +358,36 @@ class RespondentInfoViewController: UIViewController {
         view.endEditing(true)
     }
 
+    @objc private func anonymousButtonTapped() {
+        isAnonymousSurvey.toggle()
+        updateAnonymousSurveyUI()
+    }
+
     @objc private func ageTextDidChange() {
         updateAgeWarning()
+    }
+
+    private func updateAnonymousSurveyUI() {
+        anonymousButton.setImage(
+            UIImage(systemName: isAnonymousSurvey ? "checkmark.square.fill" : "square"),
+            for: .normal
+        )
+
+        nameLabel.isHidden = isAnonymousSurvey
+        nameTextField.isHidden = isAnonymousSurvey
+        ageLabel.isHidden = isAnonymousSurvey
+        ageTextField.isHidden = isAnonymousSurvey
+        ageWarningLabel.isHidden = true
+        phoneLabel.isHidden = isAnonymousSurvey
+        phoneTextField.isHidden = isAnonymousSurvey
+
+        if isAnonymousSurvey {
+            nameTextField.text = nil
+            ageTextField.text = nil
+            phoneTextField.text = nil
+            ageTextField.textColor = .label
+            activeTextField?.resignFirstResponder()
+        }
     }
 
     private func updateAgeWarning() {
