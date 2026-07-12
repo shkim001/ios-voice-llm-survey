@@ -4,13 +4,14 @@ import json
 import logging
 import os
 import hashlib
+import shutil
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
 import pymysql
-from pymysql.err import IntegrityError, OperationalError
+from pymysql.err import IntegrityError, MySQLError, OperationalError
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -285,6 +286,28 @@ def read_package_json(relative_json_path: str) -> dict:
     if not isinstance(data, dict):
         raise HTTPException(status_code=500, detail="stored session.json must be a JSON object")
     return data
+
+
+def safe_package_path(relative_path: str | None) -> Path | None:
+    if not relative_path:
+        return None
+    candidate = (SURVEY_PACKAGE_STORAGE_DIR / relative_path).resolve()
+    storage_root = SURVEY_PACKAGE_STORAGE_DIR.resolve()
+    try:
+        candidate.relative_to(storage_root)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail="stored package path is outside storage root") from e
+    return candidate
+
+
+def delete_if_table_exists(cur, sql: str, params: tuple) -> None:
+    try:
+        cur.execute(sql, params)
+    except Exception as e:
+        if isinstance(e, MySQLError) and _mysql_errno(e) in {1054, 1146}:
+            logger.warning("skipping cleanup statement because table/column is missing: %s", e)
+            return
+        raise
 
 
 def normalize_answer_for_analysis(answer: object) -> str | None:
@@ -810,7 +833,12 @@ def admin_archive_questionnaire(questionnaire_id: str, version: str, _: None = D
 
 
 @app.delete("/admin/questionnaires/{questionnaire_id}/versions/{version}")
-def admin_delete_questionnaire_version(questionnaire_id: str, version: str, _: None = Depends(verify_api_key)):
+def admin_delete_questionnaire_version(
+    questionnaire_id: str,
+    version: str,
+    force: bool = False,
+    _: None = Depends(verify_api_key),
+):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -842,13 +870,33 @@ def admin_delete_questionnaire_version(questionnaire_id: str, version: str, _: N
                 (questionnaire_id, version),
             )
             analysis_count = int(cur.fetchone()["count"])
-            if package_count > 0 or analysis_count > 0:
+            if (package_count > 0 or analysis_count > 0) and not force:
                 raise HTTPException(
                     status_code=409,
                     detail=(
                         "questionnaire version is already referenced by uploaded data; "
-                        "archive it instead of deleting"
+                        "archive it instead of deleting, or retry with force=true for test cleanup"
                     ),
+                )
+            if force:
+                cur.execute(
+                    """
+                    UPDATE session_packages
+                    SET questionnaire_id = NULL,
+                        questionnaire_version = NULL,
+                        questionnaire_hash = NULL
+                    WHERE questionnaire_id = %s AND questionnaire_version = %s
+                    """,
+                    (questionnaire_id, version),
+                )
+                cur.execute(
+                    """
+                    UPDATE analysis_answers
+                    SET questionnaire_id = NULL,
+                        questionnaire_version = NULL
+                    WHERE questionnaire_id = %s AND questionnaire_version = %s
+                    """,
+                    (questionnaire_id, version),
                 )
             cur.execute(
                 """
@@ -978,6 +1026,109 @@ def admin_get_session(session_id: str, _: None = Depends(verify_api_key)):
         raise HTTPException(status_code=404, detail="session package not found")
 
     return read_package_json(row["json_path"])
+
+
+@app.delete("/admin/sessions/{session_id}")
+def admin_delete_session(session_id: str, _: None = Depends(verify_api_key)):
+    try:
+        session_bytes = uuid_to_bytes(UUID(hex=session_id))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
+
+    package_dir: Path | None = None
+    legacy_audio_paths: list[Path] = []
+    deleted_db_rows = 0
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT package_dir, json_path, audio_path
+                FROM session_packages
+                WHERE session_id = %s
+                """,
+                (session_bytes,),
+            )
+            package_row = cur.fetchone()
+            if not package_row:
+                raise HTTPException(status_code=404, detail="session package not found")
+
+            package_dir = safe_package_path(package_row.get("package_dir"))
+            if package_dir is None:
+                json_path = safe_package_path(package_row.get("json_path"))
+                package_dir = json_path.parent if json_path else None
+
+            try:
+                cur.execute(
+                    """
+                    SELECT storage_path
+                    FROM audio_recordings
+                    WHERE session_id = %s
+                    """,
+                    (session_bytes,),
+                )
+                audio_rows = cur.fetchall()
+            except MySQLError as e:
+                if _mysql_errno(e) != 1146:
+                    raise
+                logger.warning("audio_recordings table missing during session cleanup")
+                audio_rows = []
+
+            for row in audio_rows:
+                storage_path = row.get("storage_path")
+                if not storage_path:
+                    continue
+                audio_path = (AUDIO_STORAGE_DIR / storage_path).resolve()
+                audio_root = AUDIO_STORAGE_DIR.resolve()
+                try:
+                    audio_path.relative_to(audio_root)
+                except ValueError:
+                    logger.warning("skipping audio path outside storage root: %s", audio_path)
+                    continue
+                legacy_audio_paths.append(audio_path)
+
+            cleanup_statements = [
+                ("DELETE FROM analysis_answers WHERE session_id = %s", (session_bytes,)),
+                ("DELETE FROM session_packages WHERE session_id = %s", (session_bytes,)),
+                ("DELETE FROM audio_recordings WHERE session_id = %s", (session_bytes,)),
+                ("DELETE FROM trajectory_points WHERE session_id = %s", (session_bytes,)),
+                ("DELETE FROM answers WHERE session_id = %s", (session_bytes,)),
+                ("DELETE FROM llm_events WHERE session_id = %s", (session_bytes,)),
+                ("DELETE FROM survey_sessions WHERE id = %s", (session_bytes,)),
+            ]
+            for sql, params in cleanup_statements:
+                delete_if_table_exists(cur, sql, params)
+                deleted_db_rows += cur.rowcount if cur.rowcount > 0 else 0
+
+    deleted_paths: list[str] = []
+    if package_dir and package_dir.exists():
+        try:
+            if package_dir.is_dir():
+                shutil.rmtree(package_dir)
+            else:
+                package_dir.unlink()
+            deleted_paths.append(str(package_dir))
+        except Exception as e:
+            logger.exception("failed to delete session package folder")
+            raise HTTPException(status_code=500, detail="database rows deleted but package folder cleanup failed") from e
+
+    for audio_path in legacy_audio_paths:
+        try:
+            if audio_path.exists():
+                audio_path.unlink()
+                deleted_paths.append(str(audio_path))
+                parent = audio_path.parent
+                if parent != AUDIO_STORAGE_DIR.resolve() and parent.exists() and not any(parent.iterdir()):
+                    parent.rmdir()
+        except Exception:
+            logger.warning("failed to delete legacy audio path: %s", audio_path, exc_info=True)
+
+    return {
+        "deleted": True,
+        "session_id": session_id,
+        "deleted_db_rows": deleted_db_rows,
+        "deleted_paths": deleted_paths,
+    }
 
 
 class SessionCreate(BaseModel):
