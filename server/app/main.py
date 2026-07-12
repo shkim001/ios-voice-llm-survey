@@ -223,6 +223,8 @@ def analysis_answer_rows(
         question_id = str(qid_raw)
         question = question_lookup.get(question_id, {})
         extracted_answer = item.get("extracted_answer")
+        final_answer = item.get("final_answer")
+        analysis_answer = final_answer if isinstance(final_answer, str) and final_answer.strip() else extracted_answer
         confidence = item.get("confidence")
         clarification_needed = item.get("clarification_needed")
         fallback_question_text = item.get("matched_question")
@@ -241,8 +243,8 @@ def analysis_answer_rows(
                 index,
                 question_text,
                 answer_type,
-                extracted_answer if isinstance(extracted_answer, str) else None,
-                normalize_answer_for_analysis(extracted_answer),
+                analysis_answer if isinstance(analysis_answer, str) else None,
+                normalize_answer_for_analysis(analysis_answer),
                 confidence if isinstance(confidence, str) else None,
                 clarification_needed if isinstance(clarification_needed, bool) else None,
                 json.dumps(item, ensure_ascii=False),

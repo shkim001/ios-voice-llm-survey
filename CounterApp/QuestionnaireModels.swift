@@ -40,10 +40,22 @@ struct RespondentInfo: Codable {
 struct ExportedSurvey: Decodable {
     let matchedQuestions: [ExportedMatchedQuestion]
     let respondentInfo: ExportedRespondentInfo?
+    let metadata: ExportedSurveyMetadata?
+    let localSessionId: String?
     
     enum CodingKeys: String, CodingKey {
         case matchedQuestions = "matched_questions"
         case respondentInfo = "respondent_info"
+        case metadata
+        case localSessionId = "local_session_id"
+    }
+}
+
+struct ExportedSurveyMetadata: Decodable {
+    let localSessionId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case localSessionId = "local_session_id"
     }
 }
 
@@ -51,11 +63,13 @@ struct ExportedMatchedQuestion: Decodable {
     let matchedQuestionId: Int
     let matchedQuestion: String
     let extractedAnswer: String?
+    let finalAnswer: String?
     
     enum CodingKeys: String, CodingKey {
         case matchedQuestionId = "matched_question_id"
         case matchedQuestion = "matched_question"
         case extractedAnswer = "extracted_answer"
+        case finalAnswer = "final_answer"
     }
 }
 
@@ -74,6 +88,10 @@ struct MatchedQuestion: Codable {
     let extractedAnswer: String
     let confidence: String
     let clarificationNeeded: Bool
+    let finalAnswer: String?
+    let manuallyClarified: Bool?
+    let clarificationNote: String?
+    let answerSource: String?
     
     enum CodingKeys: String, CodingKey {
         case matchedQuestionId = "matched_question_id"
@@ -81,6 +99,48 @@ struct MatchedQuestion: Codable {
         case extractedAnswer = "extracted_answer"
         case confidence
         case clarificationNeeded = "clarification_needed"
+        case finalAnswer = "final_answer"
+        case manuallyClarified = "manually_clarified"
+        case clarificationNote = "clarification_note"
+        case answerSource = "answer_source"
+    }
+
+    init(
+        matchedQuestionId: Int,
+        matchedQuestion: String,
+        extractedAnswer: String,
+        confidence: String,
+        clarificationNeeded: Bool,
+        finalAnswer: String? = nil,
+        manuallyClarified: Bool? = nil,
+        clarificationNote: String? = nil,
+        answerSource: String? = nil
+    ) {
+        self.matchedQuestionId = matchedQuestionId
+        self.matchedQuestion = matchedQuestion
+        self.extractedAnswer = extractedAnswer
+        self.confidence = confidence
+        self.clarificationNeeded = clarificationNeeded
+        self.finalAnswer = finalAnswer
+        self.manuallyClarified = manuallyClarified
+        self.clarificationNote = clarificationNote
+        self.answerSource = answerSource
+    }
+
+    func withManualClarification(finalAnswer: String?, note: String?) -> MatchedQuestion {
+        let cleanedAnswer = finalAnswer?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanedNote = note?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return MatchedQuestion(
+            matchedQuestionId: matchedQuestionId,
+            matchedQuestion: matchedQuestion,
+            extractedAnswer: extractedAnswer,
+            confidence: confidence,
+            clarificationNeeded: clarificationNeeded,
+            finalAnswer: cleanedAnswer?.isEmpty == false ? cleanedAnswer : nil,
+            manuallyClarified: true,
+            clarificationNote: cleanedNote?.isEmpty == false ? cleanedNote : nil,
+            answerSource: "manual_clarification"
+        )
     }
 }
-

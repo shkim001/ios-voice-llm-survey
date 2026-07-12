@@ -80,23 +80,15 @@ class LocationAggregationViewController: UIViewController {
             }
         }
         
-        var allResponseQuestionIds: Set<Int> = []
-        
-        // First pass: collect all question IDs
-        for survey in surveys {
-            for item in survey.matchedQuestions {
-                allResponseQuestionIds.insert(item.matchedQuestionId)
-            }
-        }
-        
-        // Second pass: process responses
+        // Process responses
         for survey in surveys {
             var currentResponseQuestionIds: Set<Int> = []
             
             for item in survey.matchedQuestions {
                 currentResponseQuestionIds.insert(item.matchedQuestionId)
                 
-                guard let answer = item.extractedAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty else {
+                let preferredAnswer = item.finalAnswer ?? item.extractedAnswer
+                guard let answer = preferredAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty else {
                     continue
                 }
                 
@@ -362,27 +354,9 @@ extension LocationAggregationViewController: UITableViewDelegate {
     }
     
     private func showScrollableContent(title: String, content: String) {
-        let alert = UIAlertController(title: title, message: nil, preferredStyle: .alert)
-        
-        let textView = UITextView()
-        textView.text = content
-        textView.font = UIFont.systemFont(ofSize: 12)
-        textView.isEditable = false
-        textView.backgroundColor = .systemBackground
-        textView.translatesAutoresizingMaskIntoConstraints = false
-        
-        alert.view.addSubview(textView)
-        
-        NSLayoutConstraint.activate([
-            textView.topAnchor.constraint(equalTo: alert.view.topAnchor, constant: 60),
-            textView.leadingAnchor.constraint(equalTo: alert.view.leadingAnchor, constant: 15),
-            textView.trailingAnchor.constraint(equalTo: alert.view.trailingAnchor, constant: -15),
-            textView.bottomAnchor.constraint(equalTo: alert.view.bottomAnchor, constant: -60),
-            textView.heightAnchor.constraint(equalToConstant: 300)
-        ])
-        
-        alert.addAction(UIAlertAction(title: "OK", style: .default))
-        present(alert, animated: true)
+        let viewController = AggregationTextViewController(title: title, content: content)
+        viewController.modalPresentationStyle = .formSheet
+        present(viewController, animated: true)
     }
 }
 
@@ -394,4 +368,3 @@ private struct AggregationResult {
     let questionTexts: [Int: String]
     let processedFiles: Int
 }
-

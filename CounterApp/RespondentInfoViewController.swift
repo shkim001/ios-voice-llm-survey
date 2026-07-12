@@ -6,6 +6,7 @@ class RespondentInfoViewController: UIViewController {
     var onInfoSubmitted: ((RespondentInfo) -> Void)?
     var onCancel: (() -> Void)?
     private var activeTextField: UITextField?
+    private let allowedAgeRange = 0...100
     
     // MARK: - UI Elements
     private let scrollView: UIScrollView = {
@@ -58,6 +59,17 @@ class RespondentInfoViewController: UIViewController {
         textField.font = UIFont.systemFont(ofSize: 16)
         textField.keyboardType = .numberPad
         return textField
+    }()
+
+    private let ageWarningLabel: UILabel = {
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.text = "Age must be 100 or younger"
+        label.font = UIFont.systemFont(ofSize: 13)
+        label.textColor = .systemRed
+        label.numberOfLines = 0
+        label.isHidden = true
+        return label
     }()
     
     private let genderSegmentedControl: UISegmentedControl = {
@@ -145,6 +157,7 @@ class RespondentInfoViewController: UIViewController {
         stackView.addArrangedSubview(nameTextField)
         stackView.addArrangedSubview(ageLabel)
         stackView.addArrangedSubview(ageTextField)
+        stackView.addArrangedSubview(ageWarningLabel)
         stackView.addArrangedSubview(genderLabel)
         stackView.addArrangedSubview(genderSegmentedControl)
         stackView.addArrangedSubview(phoneLabel)
@@ -155,6 +168,8 @@ class RespondentInfoViewController: UIViewController {
         
         // Add button action
         submitButton.addTarget(self, action: #selector(submitButtonTapped), for: .touchUpInside)
+        ageTextField.addTarget(self, action: #selector(ageTextDidChange), for: .editingChanged)
+        stackView.setCustomSpacing(6, after: ageTextField)
         
         // Add tap gesture to dismiss keyboard
         let tapGesture = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
@@ -282,6 +297,12 @@ class RespondentInfoViewController: UIViewController {
             showAlert(message: "Please enter a valid age")
             return
         }
+
+        guard allowedAgeRange.contains(age) else {
+            updateAgeWarning()
+            showAlert(message: "Please enter an age from \(allowedAgeRange.lowerBound) to \(allowedAgeRange.upperBound)")
+            return
+        }
         
         guard let phone = phoneTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines),
               !phone.isEmpty else {
@@ -315,6 +336,19 @@ class RespondentInfoViewController: UIViewController {
     
     @objc private func dismissKeyboard() {
         view.endEditing(true)
+    }
+
+    @objc private func ageTextDidChange() {
+        updateAgeWarning()
+    }
+
+    private func updateAgeWarning() {
+        let ageText = ageTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let age = Int(ageText)
+        let shouldShowWarning = age.map { $0 > allowedAgeRange.upperBound } ?? false
+
+        ageWarningLabel.isHidden = !shouldShowWarning
+        ageTextField.textColor = shouldShowWarning ? .systemRed : .label
     }
     
     private func showAlert(message: String) {
@@ -351,4 +385,3 @@ extension RespondentInfoViewController: UITextFieldDelegate {
         return true
     }
 }
-

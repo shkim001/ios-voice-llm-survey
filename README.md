@@ -109,7 +109,9 @@ Open **Settings** (gear) from the main screen.
 
 When the Survey API is configured:
 
-- After **LLM Recognition**, the app writes `session.json` into the local `SurveySessions/<local-session-id>/` folder.
+- Recording creates a local `SurveySessions/<local-session-id>/` folder only when audio is about to be saved; metadata-only empty folders are cleaned up automatically.
+- After **Analyze Answers** from the recording review flow, the app writes `session.json` into that local session folder.
+- If any matched answer has medium/low confidence or needs clarification, the interviewer can select or type a final answer before the package is saved.
 - If the Survey API is configured, the app uploads `session.json` and the `.m4a` recording together to `POST /sessions/{id}/package`.
 - The server stores both files under one VM folder, writes a package index row to MySQL, and extracts matched answers into `analysis_answers` for easier counting/filtering.
 - Recording is blocked if the app cannot retrieve a current GPS coordinate, then the app samples the latest available location about every 15 seconds while recording.
@@ -274,16 +276,16 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 
 ## Usage workflow
 
-1. **Record** — tap Record, submit respondent info, wait for the required GPS point, speak, tap again to stop. If GPS is unavailable, recording does not start.
-2. **Play** (optional) — review the recording.
-3. **Transcribe** — runs automatically after recording (English locale).
-4. **LLM Recognition** — sends the transcript to the configured LLM; shows matched questions and extracted answers.
-5. **Respondent info** — prompted when exporting or as part of your study flow.
-6. **Export JSON** — saves or updates `session.json` under the app Documents directory (`SurveySessions/<local-session-id>/`).
+1. **Start Interview** — submit respondent info, wait for the required GPS point, then record from the full-screen monitor with a timer, voice-level bars, a swipeable survey-question box showing two questions per slide with answer-type hints, and discard control. If GPS is unavailable, recording does not start.
+2. **Review Recording** — after Stop & Review, play the audio without closing the review popup, then analyze or discard the recording.
+3. **Analyze Answers** — from the review popup, transcribes the recording (English locale), sends the transcript to the configured LLM, and shows matched questions and extracted answers.
+4. **Clarify Answers** — for medium/low-confidence answers or answers marked as needing clarification, select or type the final answer and optionally add a note. The JSON keeps both the original LLM answer and the manual correction.
+5. **Start Next Participant** — resets the screen for the next interview after the analyzed package has already been saved locally and uploaded if configured, without pre-creating an empty session folder.
+6. **Session Tools / Dashboard** — optional utilities for exporting or sharing the current/local `session.json`.
 7. **Dashboard** — reviews local/cached sessions, refreshes the lightweight server session list on demand, and downloads a full server `session.json` only when a server row is opened.
-8. **Aggregate** — summarizes previously exported JSON files on device.
+8. **Aggregate** — summarizes analyzed local `SurveySessions/*/session.json` packages on device, with older `SurveyExports/*.json` files included for compatibility.
 
-If Survey API is configured, step 4 also uploads the complete session package. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, and `analysis_answers` stores one extracted row per matched question for SQL summaries.
+If Survey API is configured, step 3 uploads the complete session package after any required clarification is resolved. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, and `analysis_answers` stores one extracted row per matched question for SQL summaries.
 
 The generated `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. Coordinate objects always place `lat` and `lon` next to each other. Interview paths are saved in `trajectory_points`; each point includes both `ts_ms` and readable UTC `captured_at`.
 

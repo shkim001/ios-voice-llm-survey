@@ -35,6 +35,36 @@ final class SessionManager {
         return try startNewSession()
     }
 
+    func clearCurrentSessionIfEmpty() {
+        guard let currentSession else { return }
+        _ = removeSessionIfEmpty(currentSession.directoryURL)
+        self.currentSession = nil
+    }
+
+    @discardableResult
+    func purgeEmptySessions() -> Int {
+        do {
+            let root = try sessionsRootDirectory()
+            let fm = FileManager.default
+            let dirURLs = (try? fm.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )) ?? []
+
+            var deletedCount = 0
+            for url in dirURLs where removeSessionIfEmpty(url) {
+                deletedCount += 1
+                if currentSession?.directoryURL == url {
+                    currentSession = nil
+                }
+            }
+            return deletedCount
+        } catch {
+            return 0
+        }
+    }
+
     func makeRecordingURL(fileExtension: String = "m4a", now: Date = Date()) throws -> URL {
         let session = try ensureCurrentSession()
         let timestamp = String(format: "%.0f", now.timeIntervalSince1970)
@@ -99,5 +129,28 @@ final class SessionManager {
         let url = session.directoryURL.appendingPathComponent(metadataFileName)
         try data.write(to: url, options: [.atomic])
     }
-}
 
+    private func removeSessionIfEmpty(_ sessionURL: URL) -> Bool {
+        let fm = FileManager.default
+        guard (try? sessionURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
+            return false
+        }
+
+        let fileURLs = (try? fm.contentsOfDirectory(
+            at: sessionURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        let hasRecording = fileURLs.contains { $0.pathExtension.lowercased() == "m4a" }
+        let hasSessionPackage = fileURLs.contains { $0.lastPathComponent == "session.json" }
+        guard !hasRecording && !hasSessionPackage else { return false }
+
+        do {
+            try fm.removeItem(at: sessionURL)
+            return true
+        } catch {
+            return false
+        }
+    }
+}

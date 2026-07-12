@@ -21,6 +21,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private var audioRecorder: AVAudioRecorder?
     private var audioPlayer: AVAudioPlayer?
     private var recordingURL: URL?
+    private weak var recordingMonitorViewController: RecordingMonitorViewController?
+    private weak var recordingReviewViewController: RecordingReviewViewController?
     private var recordingStartTrajectoryPoint: PendingTrajectoryStore.Point?
     private var interviewTrajectoryPoints: [PendingTrajectoryStore.Point] = []
 
@@ -91,6 +93,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         )
 
         navigationItem.rightBarButtonItems = [settingsButton, questionnaireButton]
+        navigationItem.leftBarButtonItem = UIBarButtonItem(
+            image: UIImage(systemName: "ellipsis.circle"),
+            style: .plain,
+            target: self,
+            action: #selector(sessionToolsButtonTapped)
+        )
 
         // Request microphone permission
         requestMicrophonePermission()
@@ -106,16 +114,17 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         checkAPIKeyStatus()
 
         // Setup record button
-        setupButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
+        setupButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
 
         // Setup play button
         setupButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
 
-        // Setup LLM button
-        setupButton(llmButton, title: "LLM Recognition", backgroundColor: .systemBlue)
+        // Analyze now happens from the post-recording review flow.
+        setupButton(llmButton, title: "Analyze Answers", backgroundColor: .systemBlue)
+        llmButton.isHidden = true
 
-        // Setup export button
-        setupButton(exportButton, title: "Export JSON", backgroundColor: .systemGreen)
+        // The session package is saved automatically after analysis/clarification.
+        setupButton(exportButton, title: "Start Next Participant", backgroundColor: .systemGreen)
 
         // Setup aggregate button
         setupButton(aggregateButton, title: "Aggregate Results", backgroundColor: .systemTeal)
@@ -162,15 +171,15 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             clearBtn.heightAnchor.constraint(equalToConstant: 50)
         ])
 
-        // Initial state: play, LLM and export buttons disabled
+        // Initial state: play disabled; Start Next Participant remains available.
         playButton.isEnabled = false
         llmButton.isEnabled = false
-        exportButton.isEnabled = false
+        exportButton.isEnabled = true
         dashboardBtn.isEnabled = true
         audioBtn.isEnabled = true
         playButton.alpha = 0.5
         llmButton.alpha = 0.5
-        exportButton.alpha = 0.5
+        exportButton.alpha = 1.0
         dashboardBtn.alpha = 1.0
         audioBtn.alpha = 1.0
     }
@@ -210,11 +219,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             matchedQuestions = []
             interviewTrajectoryPoints = []
 
-            // Disable LLM and export buttons until new analysis is done
+            // Analysis now runs from the post-recording review flow.
             llmButton.isEnabled = true  // Can start LLM analysis after recording
-            exportButton.isEnabled = false
+            exportButton.isEnabled = true
             llmButton.alpha = 1.0
-            exportButton.alpha = 0.5
+            exportButton.alpha = 1.0
 
             showRespondentInfoForm { [weak self] info in
                 guard let self = self else { return }
@@ -235,7 +244,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         // Stop recording
         isRecording = false
-        stopRecording()
+        stopRecording(showReview: true)
         animateButton(sender)
     }
 
@@ -277,6 +286,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     @IBAction func llmButtonTapped(_ sender: UIButton) {
         resetInactivityTimer()
+        runLLMRecognition()
+        animateButton(sender)
+    }
+
+    private func runLLMRecognition() {
         guard let recordingURL = recordingURL else {
             showMessage("No recording available. Please record first.")
             return
@@ -325,34 +339,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 do {
                     let matchedQuestions = try await LLMService.shared.analyzeTranscription(transcription, questions: questions)
 
-                    DispatchQueue.main.async {
-                        self.matchedQuestions = matchedQuestions
-                        self.displayResults(transcription: transcription, matchedQuestions: matchedQuestions)
-
-                        // Update recorded data
-                        let resultSummary = matchedQuestions.map { "Q\($0.matchedQuestionId): \($0.extractedAnswer)" }.joined(separator: "\n")
-                        self.recordedData = "Transcription: \(transcription)\n\nMatched Questions:\n\(resultSummary)"
-
-                        self.statusLabel.text = "Analysis complete!\n\(matchedQuestions.count) question(s) matched"
-                        self.statusLabel.textColor = .systemGreen
-
-                        self.llmButton.isEnabled = true
-                        self.llmButton.alpha = 1.0
-                    }
-
-                    // Best-effort: upload one complete session package to the Survey API.
-                    Task { [weak self] in
-                        guard let self else { return }
-                        do {
-                            _ = try self.writeSessionPackageJSON(
-                                transcription: transcription,
-                                matchedQuestions: matchedQuestions,
-                                recordingURL: recordingURL
-                            )
-                        } catch {
-                            print("Failed to write local session package: \(error.localizedDescription)")
-                        }
-                        await self.uploadSessionPackageToCloud(
+                    await MainActor.run {
+                        self.resolveClarificationsIfNeeded(
                             transcription: transcription,
                             matchedQuestions: matchedQuestions,
                             recordingURL: recordingURL
@@ -381,18 +369,46 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 }
             }
         }
-
-        animateButton(sender)
     }
 
     @IBAction func exportButtonTapped(_ sender: UIButton) {
+        resetInactivityTimer()
+        animateButton(sender)
+        startNextParticipant()
+    }
+
+    @objc private func sessionToolsButtonTapped() {
+        resetInactivityTimer()
+
+        let alert = UIAlertController(
+            title: "Session Tools",
+            message: "Choose a utility action",
+            preferredStyle: .actionSheet
+        )
+
+        alert.addAction(UIAlertAction(title: "Export Current Session JSON", style: .default) { [weak self] _ in
+            self?.exportCurrentSessionJSON()
+        })
+        alert.addAction(UIAlertAction(title: "Dashboard", style: .default) { [weak self] _ in
+            self?.showDashboard()
+        })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        if let popover = alert.popoverPresentationController {
+            popover.barButtonItem = navigationItem.leftBarButtonItem
+        }
+
+        present(alert, animated: true)
+    }
+
+    private func exportCurrentSessionJSON() {
         resetInactivityTimer()
         guard let transcription = transcription, !matchedQuestions.isEmpty else {
             showMessage("No analysis data to export")
             return
         }
 
-        guard let respondentInfo = respondentInfo else {
+        guard respondentInfo != nil else {
             showMessage("Missing respondent information")
             return
         }
@@ -422,7 +438,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             statusLabel.text = "Failed to create session directory"
             statusLabel.textColor = .systemRed
             showMessage("Unable to create or access the session directory: \(error.localizedDescription)")
-            animateButton(sender)
             return
         }
 
@@ -454,9 +469,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 // Show share sheet
                 self.shareFile(url: sessionFileURL)
             })
-            alert.addAction(UIAlertAction(title: "Start next participant", style: .default) { [weak self] _ in
-                self?.startNextParticipant()
-            })
             alert.addAction(UIAlertAction(title: "OK", style: .cancel))
             present(alert, animated: true)
 
@@ -468,8 +480,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             statusLabel.textColor = .systemRed
             showMessage("Failed to save file: \(error.localizedDescription)")
         }
-
-        animateButton(sender)
     }
 
     @IBAction func aggregateButtonTapped(_ sender: UIButton) {
@@ -493,8 +503,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             self?.performAggregation(action: .view)
         })
 
-        // Option 3: Export JSON
-        alert.addAction(UIAlertAction(title: "Export JSON", style: .default) { [weak self] _ in
+        // Option 3: Export aggregated JSON
+        alert.addAction(UIAlertAction(title: "Export Aggregated JSON", style: .default) { [weak self] _ in
             self?.performAggregation(action: .export)
         })
 
@@ -570,7 +580,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     @objc private func dashboardButtonTapped(_ sender: UIButton) {
         resetInactivityTimer()
         animateButton(sender)
+        showDashboard()
+    }
 
+    private func showDashboard() {
         guard !isRecording else {
             showMessage("Dashboard is unavailable while recording")
             return
@@ -673,6 +686,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let processedFiles: Int
     }
 
+    private struct AggregationSurveyRecord {
+        let sourceURL: URL
+        let survey: ExportedSurvey
+    }
+
     // Perform aggregation operation
     private func performAggregation(action: AggregationAction) {
         statusLabel.text = "Aggregating historical responses..."
@@ -684,15 +702,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             guard let self = self else { return }
 
             do {
-                let exportsDirectory = try self.ensureExportsDirectory()
-                let fileManager = FileManager.default
-                let fileURLs = try fileManager.contentsOfDirectory(at: exportsDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).filter { $0.pathExtension.lowercased() == "json" }
+                let records = try self.loadAggregationSurveyRecords()
 
-                if fileURLs.isEmpty {
+                if records.isEmpty {
                     DispatchQueue.main.async {
                         self.statusLabel.text = "No historical data available for aggregation"
                         self.statusLabel.textColor = .systemOrange
-                        self.showMessage("No export files available for aggregation")
+                        self.showMessage("No analyzed session.json packages found for aggregation")
                         self.aggregateButton.isEnabled = true
                         self.aggregateButton.alpha = 1.0
                     }
@@ -726,87 +742,66 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     }
                 }
 
-                let decoder = JSONDecoder()
                 var processedFiles = 0
-                var allResponseQuestionIds: Set<Int> = []
 
-                // First pass: collect all question IDs that appear in responses
-                for fileURL in fileURLs {
-                    do {
-                        let data = try Data(contentsOf: fileURL)
-                        let exportEntry = try decoder.decode(ExportedSurvey.self, from: data)
+                // Process responses in each session package.
+                for record in records {
+                    let exportEntry = record.survey
+                    processedFiles += 1
 
-                        for item in exportEntry.matchedQuestions {
-                            allResponseQuestionIds.insert(item.matchedQuestionId)
+                    // Track question IDs that appear in this response
+                    var currentResponseQuestionIds: Set<Int> = []
+
+                    for item in exportEntry.matchedQuestions {
+                        currentResponseQuestionIds.insert(item.matchedQuestionId)
+
+                        let preferredAnswer = item.finalAnswer ?? item.extractedAnswer
+                        guard let answer = preferredAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty else {
+                            continue
                         }
-                    } catch {
-                        print("Failed to process file \(fileURL.lastPathComponent): \(error)")
+
+                        // Classify answer type: yes, no, or other
+                        let normalizedAnswer = answer.lowercased()
+                        let answerType: String
+
+                        if normalizedAnswer.contains("yes") ||
+                           normalizedAnswer.contains("good") || normalizedAnswer.contains("safe") ||
+                           normalizedAnswer.contains("well") || normalizedAnswer.contains("appealing") {
+                            answerType = "yes"
+                        } else if normalizedAnswer.contains("no") ||
+                                  normalizedAnswer.contains("unsafe") || normalizedAnswer.contains("poor") ||
+                                  normalizedAnswer.contains("unappealing") {
+                            answerType = "no"
+                        } else {
+                            // Cannot determine, keep original answer for display
+                            answerType = normalizedAnswer
+                        }
+
+                        statistics[item.matchedQuestionId, default: [:]][answerType, default: 0] += 1
+
+                        if answerDisplayNames[item.matchedQuestionId] == nil {
+                            answerDisplayNames[item.matchedQuestionId] = [:]
+                        }
+
+                        // Save original answer for display (if yes/no type, save an example)
+                        if answerType == "yes" || answerType == "no" {
+                            if answerDisplayNames[item.matchedQuestionId]?[answerType] == nil {
+                                answerDisplayNames[item.matchedQuestionId]?[answerType] = answerType == "yes" ? "Yes" : "No"
+                            }
+                        } else {
+                            answerDisplayNames[item.matchedQuestionId]?[answerType] = answer
+                        }
+
+                        if questionTexts[item.matchedQuestionId] == nil {
+                            questionTexts[item.matchedQuestionId] = item.matchedQuestion
+                        }
                     }
-                }
 
-                // Second pass: process responses in each file
-                for fileURL in fileURLs {
-                    do {
-                        let data = try Data(contentsOf: fileURL)
-                        let exportEntry = try decoder.decode(ExportedSurvey.self, from: data)
-                        processedFiles += 1
-
-                        // Track question IDs that appear in this response
-                        var currentResponseQuestionIds: Set<Int> = []
-
-                        for item in exportEntry.matchedQuestions {
-                            currentResponseQuestionIds.insert(item.matchedQuestionId)
-
-                            guard let answer = item.extractedAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty else {
-                                continue
-                            }
-
-                            // Classify answer type: yes, no, or other
-                            let normalizedAnswer = answer.lowercased()
-                            let answerType: String
-
-                            if normalizedAnswer.contains("yes") ||
-                               normalizedAnswer.contains("good") || normalizedAnswer.contains("safe") ||
-                               normalizedAnswer.contains("well") || normalizedAnswer.contains("appealing") {
-                                answerType = "yes"
-                            } else if normalizedAnswer.contains("no") ||
-                                      normalizedAnswer.contains("unsafe") || normalizedAnswer.contains("poor") ||
-                                      normalizedAnswer.contains("unappealing") {
-                                answerType = "no"
-                            } else {
-                                // Cannot determine, keep original answer for display
-                                answerType = normalizedAnswer
-                            }
-
-                            statistics[item.matchedQuestionId, default: [:]][answerType, default: 0] += 1
-
-                            if answerDisplayNames[item.matchedQuestionId] == nil {
-                                answerDisplayNames[item.matchedQuestionId] = [:]
-                            }
-
-                            // Save original answer for display (if yes/no type, save an example)
-                            if answerType == "yes" || answerType == "no" {
-                                if answerDisplayNames[item.matchedQuestionId]?[answerType] == nil {
-                                    answerDisplayNames[item.matchedQuestionId]?[answerType] = answerType == "yes" ? "Yes" : "No"
-                                }
-                            } else {
-                                answerDisplayNames[item.matchedQuestionId]?[answerType] = answer
-                            }
-
-                            if questionTexts[item.matchedQuestionId] == nil {
-                                questionTexts[item.matchedQuestionId] = item.matchedQuestion
-                            }
+                    // For questions that don't appear in this response, mark as unanswered
+                    for questionId in allQuestionIds {
+                        if !currentResponseQuestionIds.contains(questionId) {
+                            statistics[questionId, default: [:]]["unanswered", default: 0] += 1
                         }
-
-                        // For questions that don't appear in this response, mark as unanswered
-                        for questionId in allQuestionIds {
-                            if !currentResponseQuestionIds.contains(questionId) {
-                                statistics[questionId, default: [:]]["unanswered", default: 0] += 1
-                            }
-                        }
-
-                    } catch {
-                        print("Failed to process file \(fileURL.lastPathComponent): \(error)")
                     }
                 }
 
@@ -814,14 +809,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     DispatchQueue.main.async {
                         self.statusLabel.text = "No valid response data found"
                         self.statusLabel.textColor = .systemOrange
-                        self.showMessage("No valid responses found in any export files")
+                        self.showMessage("No valid responses found in analyzed session packages")
                         self.aggregateButton.isEnabled = true
                         self.aggregateButton.alpha = 1.0
                     }
                     return
                 }
 
-                var summary = "Analyzed \(processedFiles) export file(s).\n\n"
+                var summary = "Analyzed \(processedFiles) session package(s).\n\n"
                 let sortedQuestionIds = allQuestionIds.sorted()
 
                 for questionId in sortedQuestionIds {
@@ -1071,7 +1066,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         } catch {
             showMessage("Audio session setup failed: \(error.localizedDescription)")
             isRecording = false
-            updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
+            updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
             return
         }
 
@@ -1088,7 +1083,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         } catch {
             showMessage("Failed to create session/recording path: \(error.localizedDescription)")
             isRecording = false
-            updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
+            updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
             return
         }
 
@@ -1101,6 +1096,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         do {
             audioRecorder = try AVAudioRecorder(url: url, settings: settings)
+            audioRecorder?.isMeteringEnabled = true
             audioRecorder?.record()
             TrajectoryTracker.shared.startInterviewTracking(with: recordingStartPoint)
             interviewTrajectoryPoints = [recordingStartPoint]
@@ -1110,20 +1106,25 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             statusLabel.textColor = .systemRed
             dashboardButton?.isEnabled = false
             audioFilesButton?.isEnabled = false
+            exportButton.isEnabled = false
             dashboardButton?.alpha = 0.5
             audioFilesButton?.alpha = 0.5
+            exportButton.alpha = 0.5
+            presentRecordingMonitor()
         } catch {
             showMessage("Recording failed to start: \(error.localizedDescription)")
             isRecording = false
-            updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
+            updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
             dashboardButton?.isEnabled = true
             audioFilesButton?.isEnabled = true
+            exportButton.isEnabled = true
             dashboardButton?.alpha = 1.0
             audioFilesButton?.alpha = 1.0
+            exportButton.alpha = 1.0
         }
     }
 
-    private func stopRecording() {
+    private func stopRecording(showReview: Bool = false) {
         resetInactivityTimer()
         audioRecorder?.stop()
         interviewTrajectoryPoints = TrajectoryTracker.shared.stopInterviewTracking()
@@ -1131,16 +1132,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             updateRecordingTrajectoryMetadata(for: recordingURL, points: interviewTrajectoryPoints)
         }
 
-        updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
+        updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
         statusLabel.text = "Recording stopped\nYou can play, recognize, or export"
         statusLabel.textColor = .systemGray
 
         // Enable buttons
         playButton.isEnabled = true
-        llmButton.isEnabled = true
         exportButton.isEnabled = true
         playButton.alpha = 1.0
-        llmButton.alpha = 1.0
         exportButton.alpha = 1.0
         dashboardButton?.isEnabled = true
         audioFilesButton?.isEnabled = true
@@ -1148,6 +1147,179 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         audioFilesButton?.alpha = 1.0
 
         recordedData = "Recording data - Timestamp: \(Date().timeIntervalSince1970)"
+        let monitorViewController = recordingMonitorViewController
+        recordingMonitorViewController = nil
+
+        if showReview {
+            if let monitorViewController {
+                monitorViewController.dismiss(animated: true) { [weak self] in
+                    self?.showPostRecordingReview()
+                }
+            } else {
+                showPostRecordingReview()
+            }
+        } else {
+            monitorViewController?.dismiss(animated: true)
+        }
+    }
+
+    private func presentRecordingMonitor() {
+        guard recordingMonitorViewController == nil else { return }
+
+        let monitor = RecordingMonitorViewController()
+        monitor.modalPresentationStyle = .fullScreen
+        monitor.questions = questionnaireData?.questionnaire.questions ?? []
+        monitor.levelProvider = { [weak self] in
+            self?.currentRecordingLevel() ?? 0
+        }
+        monitor.onStopReview = { [weak self] in
+            guard let self else { return }
+            self.isRecording = false
+            self.stopRecording(showReview: true)
+        }
+        monitor.onDiscard = { [weak self] in
+            self?.confirmDiscardCurrentRecording()
+        }
+
+        recordingMonitorViewController = monitor
+        present(monitor, animated: true)
+    }
+
+    private func currentRecordingLevel() -> Float {
+        guard let recorder = audioRecorder, recorder.isRecording else { return 0 }
+        recorder.updateMeters()
+        let minDb: Float = -55
+        let power = max(minDb, recorder.averagePower(forChannel: 0))
+        return max(0, min(1, (power - minDb) / abs(minDb)))
+    }
+
+    private func showPostRecordingReview() {
+        guard recordingURL != nil else { return }
+
+        let review = RecordingReviewViewController()
+        review.modalPresentationStyle = .overFullScreen
+        review.modalTransitionStyle = .crossDissolve
+        review.isModalInPresentation = true
+        review.onPlay = { [weak self, weak review] in
+            let isPlaying = self?.toggleRecordingPlaybackFromReview() ?? false
+            review?.setPlaybackActive(isPlaying)
+        }
+        review.onAnalyze = { [weak self, weak review] in
+            review?.dismiss(animated: true) {
+                self?.recordingReviewViewController = nil
+                self?.audioPlayer?.stop()
+                self?.audioPlayer = nil
+                self?.runLLMRecognition()
+            }
+        }
+        review.onDiscard = { [weak self, weak review] in
+            guard let self else { return }
+            self.confirmDiscardCurrentRecording(from: review)
+        }
+
+        recordingReviewViewController = review
+        present(review, animated: true)
+    }
+
+    private func toggleRecordingPlaybackFromReview() -> Bool {
+        guard let url = recordingURL else { return false }
+
+        if let player = audioPlayer, player.isPlaying {
+            player.stop()
+            audioPlayer = nil
+            updateButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
+            statusLabel.text = "Playback stopped"
+            statusLabel.textColor = .systemGray
+            return false
+        }
+
+        do {
+            audioPlayer = try AVAudioPlayer(contentsOf: url)
+            audioPlayer?.delegate = self
+            audioPlayer?.play()
+            updateButton(playButton, title: "Stop Playback", backgroundColor: .systemRed)
+            statusLabel.text = "Playing recording..."
+            statusLabel.textColor = .systemPurple
+            return true
+        } catch {
+            showMessage("Playback failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func confirmDiscardCurrentRecording(from presenter: UIViewController? = nil) {
+        let alert = UIAlertController(
+            title: "Discard Recording?",
+            message: "This deletes the current audio file and its local recording metadata. This cannot be undone.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Discard", style: .destructive) { [weak self] _ in
+            self?.discardCurrentRecording()
+        })
+
+        let presentingViewController = presenter ?? recordingMonitorViewController ?? recordingReviewViewController ?? self
+        presentingViewController.present(alert, animated: true)
+    }
+
+    private func discardCurrentRecording() {
+        resetInactivityTimer()
+
+        if isRecording {
+            isRecording = false
+            audioRecorder?.stop()
+            interviewTrajectoryPoints = TrajectoryTracker.shared.stopInterviewTracking()
+        }
+        audioPlayer?.stop()
+        audioPlayer = nil
+
+        if let recordingURL {
+            let metadataURL = recordingMetadataURL(for: recordingURL)
+            do {
+                if FileManager.default.fileExists(atPath: recordingURL.path) {
+                    try FileManager.default.removeItem(at: recordingURL)
+                }
+                if FileManager.default.fileExists(atPath: metadataURL.path) {
+                    try FileManager.default.removeItem(at: metadataURL)
+                }
+            } catch {
+                showMessage("Failed to discard recording: \(error.localizedDescription)")
+                return
+            }
+        }
+
+        audioRecorder = nil
+        recordingURL = nil
+        recordingStartTrajectoryPoint = nil
+        interviewTrajectoryPoints = []
+        transcription = nil
+        matchedQuestions = []
+        recordedData = nil
+
+        recordingMonitorViewController?.dismiss(animated: true)
+        recordingMonitorViewController = nil
+        recordingReviewViewController?.dismiss(animated: true)
+        recordingReviewViewController = nil
+
+        updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
+        updateButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
+        playButton.isEnabled = false
+        llmButton.isEnabled = false
+        exportButton.isEnabled = true
+        playButton.alpha = 0.5
+        llmButton.alpha = 0.5
+        exportButton.alpha = 1.0
+        dashboardButton?.isEnabled = true
+        audioFilesButton?.isEnabled = true
+        dashboardButton?.alpha = 1.0
+        audioFilesButton?.alpha = 1.0
+
+        statusLabel.text = "Recording discarded\nReady to start again"
+        statusLabel.textColor = .systemGray
+
+        SessionManager.shared.clearCurrentSessionIfEmpty()
+        sessionId = nil
+        sessionDirectoryURL = nil
     }
 
     private func writeRecordingMetadata(for recordingURL: URL, recordingStartPoint: PendingTrajectoryStore.Point) {
@@ -1561,7 +1733,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 ("matched_question", jsonString(matched.matchedQuestion)),
                 ("extracted_answer", jsonString(matched.extractedAnswer)),
                 ("confidence", jsonString(matched.confidence)),
-                ("clarification_needed", jsonBool(matched.clarificationNeeded))
+                ("clarification_needed", jsonBool(matched.clarificationNeeded)),
+                ("final_answer", jsonString(matched.finalAnswer)),
+                ("manually_clarified", jsonBool(matched.manuallyClarified)),
+                ("clarification_note", jsonString(matched.clarificationNote)),
+                ("answer_source", jsonString(matched.answerSource))
             ], indent: indent + 1)
         }
         return orderedArray(values, indent: indent)
@@ -1647,6 +1823,196 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         return url
     }
 
+    private func resolveClarificationsIfNeeded(
+        transcription: String,
+        matchedQuestions: [MatchedQuestion],
+        recordingURL: URL?
+    ) {
+        let uncertainIndices = matchedQuestions.enumerated().compactMap { index, matched in
+            requiresClarification(matched) ? index : nil
+        }
+
+        guard !uncertainIndices.isEmpty else {
+            finalizeLLMResults(
+                transcription: transcription,
+                matchedQuestions: matchedQuestions,
+                recordingURL: recordingURL
+            )
+            return
+        }
+
+        showClarificationPrompt(
+            transcription: transcription,
+            originalMatchedQuestions: matchedQuestions,
+            currentMatchedQuestions: matchedQuestions,
+            uncertainIndices: uncertainIndices,
+            position: 0,
+            recordingURL: recordingURL
+        )
+    }
+
+    private func requiresClarification(_ matched: MatchedQuestion) -> Bool {
+        return matched.clarificationNeeded || matched.confidence.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "high"
+    }
+
+    private func showClarificationPrompt(
+        transcription: String,
+        originalMatchedQuestions: [MatchedQuestion],
+        currentMatchedQuestions: [MatchedQuestion],
+        uncertainIndices: [Int],
+        position: Int,
+        recordingURL: URL?
+    ) {
+        guard position < uncertainIndices.count else {
+            finalizeLLMResults(
+                transcription: transcription,
+                matchedQuestions: currentMatchedQuestions,
+                recordingURL: recordingURL
+            )
+            return
+        }
+
+        let matchedIndex = uncertainIndices[position]
+        let matched = currentMatchedQuestions[matchedIndex]
+        let question = questionnaireData?.questionnaire.questions.first { $0.id == matched.matchedQuestionId }
+        let snippet = transcriptSnippet(for: matched, question: question, transcription: transcription)
+
+        let alert = UIAlertController(
+            title: "Clarification Needed \(position + 1) of \(uncertainIndices.count)",
+            message: """
+            Question:
+            \(matched.matchedQuestion)
+
+            LLM answer:
+            \(matched.extractedAnswer)
+
+            Confidence: \(matched.confidence)
+
+            Transcript:
+            \(snippet)
+            """,
+            preferredStyle: .alert
+        )
+
+        alert.addTextField { textField in
+            textField.placeholder = "Custom final answer"
+            textField.text = matched.finalAnswer ?? ""
+        }
+        alert.addTextField { textField in
+            textField.placeholder = "Optional clarification note"
+        }
+
+        let continueWithUpdate: (String?) -> Void = { [weak self] selectedAnswer in
+            guard let self else { return }
+            var updatedQuestions = currentMatchedQuestions
+            let customAnswer = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let note = alert.textFields?.dropFirst().first?.text
+            let finalAnswer = customAnswer?.isEmpty == false ? customAnswer : selectedAnswer
+            updatedQuestions[matchedIndex] = matched.withManualClarification(finalAnswer: finalAnswer, note: note)
+
+            self.showClarificationPrompt(
+                transcription: transcription,
+                originalMatchedQuestions: originalMatchedQuestions,
+                currentMatchedQuestions: updatedQuestions,
+                uncertainIndices: uncertainIndices,
+                position: position + 1,
+                recordingURL: recordingURL
+            )
+        }
+
+        if question?.type.lowercased() == "yes-no" {
+            alert.addAction(UIAlertAction(title: "Yes", style: .default) { _ in continueWithUpdate("Yes") })
+            alert.addAction(UIAlertAction(title: "No", style: .default) { _ in continueWithUpdate("No") })
+            alert.addAction(UIAlertAction(title: "Not sure", style: .default) { _ in continueWithUpdate("Not sure") })
+        }
+
+        alert.addAction(UIAlertAction(title: "Use Custom Text", style: .default) { _ in
+            continueWithUpdate(nil)
+        })
+        alert.addAction(UIAlertAction(title: "Leave Unresolved", style: .cancel) { [weak self] _ in
+            guard let self else { return }
+            self.showClarificationPrompt(
+                transcription: transcription,
+                originalMatchedQuestions: originalMatchedQuestions,
+                currentMatchedQuestions: currentMatchedQuestions,
+                uncertainIndices: uncertainIndices,
+                position: position + 1,
+                recordingURL: recordingURL
+            )
+        })
+
+        present(alert, animated: true)
+    }
+
+    private func transcriptSnippet(for matched: MatchedQuestion, question: Question?, transcription: String) -> String {
+        let normalizedTranscript = transcription.lowercased()
+        var phrases = [matched.matchedQuestion]
+        if let questionText = question?.question {
+            phrases.append(questionText)
+        }
+        phrases.append(contentsOf: question?.keywords ?? [])
+
+        let candidateTerms = phrases
+            .flatMap { phrase in
+                phrase
+                    .lowercased()
+                    .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                    .filter { $0.count >= 4 }
+            }
+
+        if let term = candidateTerms.first(where: { normalizedTranscript.range(of: $0) != nil }),
+           let range = normalizedTranscript.range(of: term) {
+            let start = transcription.index(range.lowerBound, offsetBy: -120, limitedBy: transcription.startIndex) ?? transcription.startIndex
+            let end = transcription.index(range.upperBound, offsetBy: 220, limitedBy: transcription.endIndex) ?? transcription.endIndex
+            return String(transcription[start..<end])
+        }
+
+        if transcription.count > 500 {
+            return String(transcription.prefix(500)) + "..."
+        }
+        return transcription
+    }
+
+    private func finalizeLLMResults(
+        transcription: String,
+        matchedQuestions: [MatchedQuestion],
+        recordingURL: URL?
+    ) {
+        self.matchedQuestions = matchedQuestions
+        displayResults(transcription: transcription, matchedQuestions: matchedQuestions)
+
+        let resultSummary = matchedQuestions.map { matched in
+            "Q\(matched.matchedQuestionId): \(matched.finalAnswer ?? matched.extractedAnswer)"
+        }.joined(separator: "\n")
+        recordedData = "Transcription: \(transcription)\n\nMatched Questions:\n\(resultSummary)"
+
+        statusLabel.text = "Analysis complete!\n\(matchedQuestions.count) question(s) matched"
+        statusLabel.textColor = .systemGreen
+
+        llmButton.isEnabled = true
+        llmButton.alpha = 1.0
+        exportButton.isEnabled = true
+        exportButton.alpha = 1.0
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try self.writeSessionPackageJSON(
+                    transcription: transcription,
+                    matchedQuestions: matchedQuestions,
+                    recordingURL: recordingURL
+                )
+            } catch {
+                print("Failed to write local session package: \(error.localizedDescription)")
+            }
+            await self.uploadSessionPackageToCloud(
+                transcription: transcription,
+                matchedQuestions: matchedQuestions,
+                recordingURL: recordingURL
+            )
+        }
+    }
+
     // MARK: - Speech Recognition
     private func transcribeAudio(url: URL, completion: @escaping (String?) -> Void) {
         resetInactivityTimer()
@@ -1684,9 +2050,15 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         for matched in matchedQuestions {
             resultText += "\nQuestion \(matched.matchedQuestionId): \(matched.matchedQuestion)\n"
             resultText += "Answer: \(matched.extractedAnswer)\n"
+            if let finalAnswer = matched.finalAnswer, !finalAnswer.isEmpty {
+                resultText += "Final answer: \(finalAnswer)\n"
+            }
             resultText += "Confidence: \(matched.confidence)\n"
             if matched.clarificationNeeded {
-                resultText += "⚠️ Clarification needed\n"
+                resultText += "Clarification needed\n"
+            }
+            if matched.manuallyClarified == true {
+                resultText += "Manually clarified\n"
             }
         }
 
@@ -1702,6 +2074,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             self.updateButton(self.playButton, title: "Play Recording", backgroundColor: .systemPurple)
             self.statusLabel.text = "Playback complete"
             self.statusLabel.textColor = .systemGray
+            self.recordingReviewViewController?.setPlaybackActive(false)
         }
     }
 
@@ -1720,16 +2093,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     private func initializeSessionAndPurge() {
         // Best-effort purge of old sessions (local-only retention)
+        SessionManager.shared.purgeEmptySessions()
         SessionManager.shared.purgeOldSessions(keepLast: 50, maxAgeDays: 7)
-
-        do {
-            let session = try SessionManager.shared.startNewSession()
-            sessionId = session.id
-            sessionDirectoryURL = session.directoryURL
-        } catch {
-            sessionId = nil
-            sessionDirectoryURL = nil
-        }
+        sessionId = nil
+        sessionDirectoryURL = nil
     }
 
     private func startNextParticipant() {
@@ -1762,11 +2129,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         interviewTrajectoryPoints = []
 
         // Reset UI state
-        updateButton(recordButton, title: "Start Recording", backgroundColor: .systemRed)
+        updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
         playButton.isEnabled = false
-        exportButton.isEnabled = false
+        exportButton.isEnabled = true
         playButton.alpha = 0.5
-        exportButton.alpha = 0.5
+        exportButton.alpha = 1.0
         llmButton.isEnabled = false
         llmButton.alpha = 0.5
         dashboardButton?.isEnabled = true
@@ -1778,14 +2145,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         statusLabel.textColor = .systemGray
 
         // Start a fresh session
-        do {
-            let session = try SessionManager.shared.startNewSession()
-            sessionId = session.id
-            sessionDirectoryURL = session.directoryURL
-        } catch {
-            sessionId = nil
-            sessionDirectoryURL = nil
-        }
+        SessionManager.shared.clearCurrentSessionIfEmpty()
+        sessionId = nil
+        sessionDirectoryURL = nil
 
         resetInactivityTimer()
     }
@@ -1840,6 +2202,70 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         present(activityViewController, animated: true)
     }
 
+    private func loadAggregationSurveyRecords() throws -> [AggregationSurveyRecord] {
+        let fileManager = FileManager.default
+        let decoder = JSONDecoder()
+        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let sessionsRoot = documentsURL.appendingPathComponent("SurveySessions", isDirectory: true)
+        let exportsRoot = documentsURL.appendingPathComponent("SurveyExports", isDirectory: true)
+
+        var records: [AggregationSurveyRecord] = []
+        var seenKeys = Set<String>()
+
+        func appendIfValid(_ url: URL, fallbackKey: String) {
+            do {
+                let data = try Data(contentsOf: url)
+                let survey = try decoder.decode(ExportedSurvey.self, from: data)
+                let key = aggregationIdentity(for: survey) ?? fallbackKey
+                guard !seenKeys.contains(key) else { return }
+                seenKeys.insert(key)
+                records.append(AggregationSurveyRecord(sourceURL: url, survey: survey))
+            } catch {
+                print("Failed to process aggregation source \(url.lastPathComponent): \(error)")
+            }
+        }
+
+        if fileManager.fileExists(atPath: sessionsRoot.path) {
+            let sessionDirectories = (try? fileManager.contentsOfDirectory(
+                at: sessionsRoot,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+
+            for directory in sessionDirectories {
+                let isDirectory = (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                guard isDirectory else { continue }
+                let sessionJSON = directory.appendingPathComponent("session.json")
+                guard fileManager.fileExists(atPath: sessionJSON.path) else { continue }
+                appendIfValid(sessionJSON, fallbackKey: "session:\(directory.lastPathComponent)")
+            }
+        }
+
+        if fileManager.fileExists(atPath: exportsRoot.path) {
+            let exportFiles = (try? fileManager.contentsOfDirectory(
+                at: exportsRoot,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )) ?? []
+
+            for fileURL in exportFiles where fileURL.pathExtension.lowercased() == "json" {
+                appendIfValid(fileURL, fallbackKey: "export:\(fileURL.lastPathComponent)")
+            }
+        }
+
+        return records
+    }
+
+    private func aggregationIdentity(for survey: ExportedSurvey) -> String? {
+        let candidates = [
+            survey.localSessionId,
+            survey.metadata?.localSessionId
+        ]
+        return candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+    }
+
     private func jsonToPrettyString(_ json: [String: Any]) -> String? {
         guard let data = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted),
               let string = String(data: data, encoding: .utf8) else {
@@ -1861,27 +2287,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func showScrollableContent(title: String, content: String) {
-        let alert = UIAlertController(title: title, message: nil, preferredStyle: .alert)
-
-        let textView = UITextView()
-        textView.text = content
-        textView.font = UIFont.systemFont(ofSize: 12)
-        textView.isEditable = false
-        textView.backgroundColor = .systemBackground
-        textView.translatesAutoresizingMaskIntoConstraints = false
-
-        alert.view.addSubview(textView)
-
-        NSLayoutConstraint.activate([
-            textView.topAnchor.constraint(equalTo: alert.view.topAnchor, constant: 60),
-            textView.leadingAnchor.constraint(equalTo: alert.view.leadingAnchor, constant: 15),
-            textView.trailingAnchor.constraint(equalTo: alert.view.trailingAnchor, constant: -15),
-            textView.bottomAnchor.constraint(equalTo: alert.view.bottomAnchor, constant: -60),
-            textView.heightAnchor.constraint(equalToConstant: 300)
-        ])
-
-        alert.addAction(UIAlertAction(title: "OK", style: .default))
-        present(alert, animated: true)
+        let viewController = AggregationTextViewController(title: title, content: content)
+        viewController.modalPresentationStyle = .formSheet
+        present(viewController, animated: true)
     }
 
     // MARK: - Settings & API Key Management
@@ -2495,15 +2903,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             guard let self = self else { return }
 
             do {
-                let exportsDirectory = try self.ensureExportsDirectory()
-                let fileManager = FileManager.default
-                let fileURLs = try fileManager.contentsOfDirectory(at: exportsDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]).filter { $0.pathExtension.lowercased() == "json" }
+                let records = try self.loadAggregationSurveyRecords()
 
-                if fileURLs.isEmpty {
+                if records.isEmpty {
                     DispatchQueue.main.async {
                         self.statusLabel.text = "No historical data available"
                         self.statusLabel.textColor = .systemOrange
-                        self.showMessage("No export files available for aggregation")
+                        self.showMessage("No analyzed session.json packages found for aggregation")
                         self.aggregateButton.isEnabled = true
                         self.aggregateButton.alpha = 1.0
                     }
@@ -2511,18 +2917,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 }
 
                 // Group files by location
-                let decoder = JSONDecoder()
                 var locationData: [String: [ExportedSurvey]] = [:]
 
-                for fileURL in fileURLs {
-                    do {
-                        let data = try Data(contentsOf: fileURL)
-                        let exportEntry = try decoder.decode(ExportedSurvey.self, from: data)
-                        let location = exportEntry.respondentInfo?.location ?? "Unknown Location"
-                        locationData[location, default: []].append(exportEntry)
-                    } catch {
-                        print("Failed to process file \(fileURL.lastPathComponent): \(error)")
-                    }
+                for record in records {
+                    let exportEntry = record.survey
+                    let location = exportEntry.respondentInfo?.location ?? "Unknown Location"
+                    locationData[location, default: []].append(exportEntry)
                 }
 
                 if locationData.isEmpty {
@@ -2560,6 +2960,699 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     self.aggregateButton.alpha = 1.0
                 }
             }
+        }
+    }
+}
+
+final class AggregationTextViewController: UIViewController {
+    private let contentTitle: String
+    private let content: String
+
+    init(title: String, content: String) {
+        self.contentTitle = title
+        self.content = content
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+        title = contentTitle
+        buildUI()
+    }
+
+    private func buildUI() {
+        let titleLabel = UILabel()
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.text = contentTitle
+        titleLabel.font = UIFont.systemFont(ofSize: 22, weight: .bold)
+        titleLabel.textAlignment = .center
+        titleLabel.numberOfLines = 0
+
+        let closeButton = UIButton(type: .system)
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        var closeConfig = UIButton.Configuration.filled()
+        closeConfig.title = "Done"
+        closeConfig.baseBackgroundColor = .systemBlue
+        closeConfig.baseForegroundColor = .white
+        closeConfig.cornerStyle = .medium
+        closeButton.configuration = closeConfig
+        closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+
+        let textView = UITextView()
+        textView.translatesAutoresizingMaskIntoConstraints = false
+        textView.text = content.isEmpty ? "No aggregation details were generated." : content
+        textView.font = UIFont.monospacedSystemFont(ofSize: 17, weight: .regular)
+        textView.textColor = .label
+        textView.backgroundColor = .secondarySystemBackground
+        textView.layer.cornerRadius = 8
+        textView.textContainerInset = UIEdgeInsets(top: 16, left: 14, bottom: 16, right: 14)
+        textView.isEditable = false
+        textView.alwaysBounceVertical = true
+
+        view.addSubview(titleLabel)
+        view.addSubview(textView)
+        view.addSubview(closeButton)
+
+        NSLayoutConstraint.activate([
+            titleLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 20),
+            titleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            titleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+
+            textView.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 16),
+            textView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            textView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            textView.bottomAnchor.constraint(equalTo: closeButton.topAnchor, constant: -16),
+
+            closeButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            closeButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            closeButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -20),
+            closeButton.heightAnchor.constraint(equalToConstant: 50)
+        ])
+    }
+
+    @objc private func closeTapped() {
+        dismiss(animated: true)
+    }
+}
+
+private final class RecordingReviewViewController: UIViewController {
+    var onPlay: (() -> Void)?
+    var onAnalyze: (() -> Void)?
+    var onDiscard: (() -> Void)?
+
+    private let statusLabel = UILabel()
+    private let playButton = UIButton(type: .system)
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = UIColor.black.withAlphaComponent(0.35)
+        buildUI()
+    }
+
+    private func buildUI() {
+        let panel = UIView()
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.backgroundColor = .systemBackground
+        panel.layer.cornerRadius = 16
+        panel.layer.shadowColor = UIColor.black.cgColor
+        panel.layer.shadowOpacity = 0.18
+        panel.layer.shadowRadius = 20
+        panel.layer.shadowOffset = CGSize(width: 0, height: 8)
+
+        let titleLabel = UILabel()
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.text = "Review Recording"
+        titleLabel.font = UIFont.systemFont(ofSize: 22, weight: .bold)
+        titleLabel.textColor = .label
+        titleLabel.textAlignment = .center
+
+        let messageLabel = UILabel()
+        messageLabel.translatesAutoresizingMaskIntoConstraints = false
+        messageLabel.text = "Listen as many times as needed, then analyze or discard this interview."
+        messageLabel.font = UIFont.systemFont(ofSize: 16)
+        messageLabel.textColor = .secondaryLabel
+        messageLabel.numberOfLines = 0
+        messageLabel.textAlignment = .center
+
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.text = "Ready to review"
+        statusLabel.font = UIFont.systemFont(ofSize: 14, weight: .medium)
+        statusLabel.textColor = .systemGray
+        statusLabel.textAlignment = .center
+
+        configureButton(playButton, title: "Play Audio", color: .systemPurple, action: #selector(playTapped))
+        let analyzeButton = makeButton(title: "Analyze Answers", color: .systemBlue, action: #selector(analyzeTapped))
+        let discardButton = makeButton(title: "Discard Recording", color: .systemRed, action: #selector(discardTapped))
+
+        let stack = UIStackView(arrangedSubviews: [playButton, analyzeButton, discardButton])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .vertical
+        stack.spacing = 12
+        stack.distribution = .fillEqually
+
+        view.addSubview(panel)
+        panel.addSubview(titleLabel)
+        panel.addSubview(messageLabel)
+        panel.addSubview(statusLabel)
+        panel.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            panel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            panel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            panel.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 22),
+            panel.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -22),
+            panel.widthAnchor.constraint(lessThanOrEqualToConstant: 430),
+
+            titleLabel.topAnchor.constraint(equalTo: panel.topAnchor, constant: 24),
+            titleLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 24),
+            titleLabel.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -24),
+
+            messageLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 10),
+            messageLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 24),
+            messageLabel.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -24),
+
+            statusLabel.topAnchor.constraint(equalTo: messageLabel.bottomAnchor, constant: 14),
+            statusLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 24),
+            statusLabel.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -24),
+
+            stack.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 18),
+            stack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -24),
+            stack.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -24),
+            playButton.heightAnchor.constraint(equalToConstant: 48)
+        ])
+    }
+
+    private func makeButton(title: String, color: UIColor, action: Selector) -> UIButton {
+        let button = UIButton(type: .system)
+        configureButton(button, title: title, color: color, action: action)
+        return button
+    }
+
+    private func configureButton(_ button: UIButton, title: String, color: UIColor, action: Selector? = nil) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        var config = UIButton.Configuration.filled()
+        config.title = title
+        config.baseBackgroundColor = color
+        config.baseForegroundColor = .white
+        config.cornerStyle = .medium
+        button.configuration = config
+        button.titleLabel?.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
+        if let action {
+            button.addTarget(self, action: action, for: .touchUpInside)
+        }
+    }
+
+    func setPlaybackActive(_ isActive: Bool) {
+        var config = playButton.configuration ?? UIButton.Configuration.filled()
+        config.title = isActive ? "Stop Audio" : "Play Audio"
+        config.baseBackgroundColor = isActive ? .systemRed : .systemPurple
+        playButton.configuration = config
+        statusLabel.text = isActive ? "Playing audio..." : "Ready to review"
+        statusLabel.textColor = isActive ? .systemPurple : .systemGray
+    }
+
+    @objc private func playTapped() {
+        onPlay?()
+    }
+
+    @objc private func analyzeTapped() {
+        onAnalyze?()
+    }
+
+    @objc private func discardTapped() {
+        onDiscard?()
+    }
+}
+
+private final class RecordingMonitorViewController: UIViewController, UIScrollViewDelegate {
+    var questions: [Question] = []
+    var levelProvider: (() -> Float)?
+    var onStopReview: (() -> Void)?
+    var onDiscard: (() -> Void)?
+
+    private let waveformView = RecordingWaveformView()
+    private let timerLabel = UILabel()
+    private let qualityLabel = UILabel()
+    private let scrollView = UIScrollView()
+    private let pageControl = UIPageControl()
+    private var startedAt = Date()
+    private var timer: Timer?
+    private var recentLevels: [Float] = []
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+        isModalInPresentation = true
+        buildUI()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        startedAt = Date()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+        timer?.fire()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func buildUI() {
+        let titleLabel = UILabel()
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.text = "Recording Interview"
+        titleLabel.font = UIFont.systemFont(ofSize: 28, weight: .bold)
+        titleLabel.textAlignment = .center
+
+        timerLabel.translatesAutoresizingMaskIntoConstraints = false
+        timerLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 34, weight: .semibold)
+        timerLabel.textAlignment = .center
+        timerLabel.text = "00:00"
+
+        qualityLabel.translatesAutoresizingMaskIntoConstraints = false
+        qualityLabel.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
+        qualityLabel.textAlignment = .center
+        qualityLabel.textColor = .systemOrange
+        qualityLabel.text = "Listening for voice..."
+
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.isPagingEnabled = true
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.delegate = self
+
+        let contentView = UIView()
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.addSubview(contentView)
+
+        let monitorPage = makeMonitorPage()
+        let tipsPage = makeTipsPage()
+        contentView.addSubview(monitorPage)
+        contentView.addSubview(tipsPage)
+
+        pageControl.translatesAutoresizingMaskIntoConstraints = false
+        pageControl.numberOfPages = 2
+        pageControl.currentPage = 0
+
+        let stopButton = UIButton(type: .system)
+        stopButton.translatesAutoresizingMaskIntoConstraints = false
+        var stopConfig = UIButton.Configuration.filled()
+        stopConfig.title = "Stop & Review"
+        stopConfig.baseBackgroundColor = .systemGreen
+        stopConfig.baseForegroundColor = .white
+        stopConfig.cornerStyle = .medium
+        stopButton.configuration = stopConfig
+        stopButton.addTarget(self, action: #selector(stopTapped), for: .touchUpInside)
+
+        let discardButton = UIButton(type: .system)
+        discardButton.translatesAutoresizingMaskIntoConstraints = false
+        var discardConfig = UIButton.Configuration.filled()
+        discardConfig.title = "Discard Recording"
+        discardConfig.baseBackgroundColor = .systemRed
+        discardConfig.baseForegroundColor = .white
+        discardConfig.cornerStyle = .medium
+        discardButton.configuration = discardConfig
+        discardButton.addTarget(self, action: #selector(discardTapped), for: .touchUpInside)
+
+        let buttonStack = UIStackView(arrangedSubviews: [discardButton, stopButton])
+        buttonStack.translatesAutoresizingMaskIntoConstraints = false
+        buttonStack.axis = .horizontal
+        buttonStack.spacing = 12
+        buttonStack.distribution = .fillEqually
+
+        view.addSubview(titleLabel)
+        view.addSubview(timerLabel)
+        view.addSubview(qualityLabel)
+        view.addSubview(scrollView)
+        view.addSubview(pageControl)
+        view.addSubview(buttonStack)
+
+        NSLayoutConstraint.activate([
+            titleLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 24),
+            titleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            titleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+
+            timerLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
+            timerLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            timerLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+
+            qualityLabel.topAnchor.constraint(equalTo: timerLabel.bottomAnchor, constant: 8),
+            qualityLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            qualityLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+
+            scrollView.topAnchor.constraint(equalTo: qualityLabel.bottomAnchor, constant: 18),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: pageControl.topAnchor, constant: -8),
+
+            contentView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            contentView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            contentView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            contentView.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor),
+
+            monitorPage.topAnchor.constraint(equalTo: contentView.topAnchor),
+            monitorPage.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            monitorPage.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            monitorPage.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
+
+            tipsPage.topAnchor.constraint(equalTo: contentView.topAnchor),
+            tipsPage.leadingAnchor.constraint(equalTo: monitorPage.trailingAnchor),
+            tipsPage.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            tipsPage.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            tipsPage.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
+
+            pageControl.bottomAnchor.constraint(equalTo: buttonStack.topAnchor, constant: -12),
+            pageControl.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+
+            buttonStack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            buttonStack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            buttonStack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -20),
+            buttonStack.heightAnchor.constraint(equalToConstant: 56)
+        ])
+    }
+
+    private func makeMonitorPage() -> UIView {
+        let page = UIView()
+        page.translatesAutoresizingMaskIntoConstraints = false
+
+        waveformView.translatesAutoresizingMaskIntoConstraints = false
+        waveformView.backgroundColor = .secondarySystemBackground
+        waveformView.layer.cornerRadius = 8
+        waveformView.clipsToBounds = true
+
+        let caption = UILabel()
+        caption.translatesAutoresizingMaskIntoConstraints = false
+        caption.text = "The bars should move while the respondent speaks. If they stay flat, move closer or check the microphone."
+        caption.font = UIFont.systemFont(ofSize: 16)
+        caption.textColor = .secondaryLabel
+        caption.textAlignment = .center
+        caption.numberOfLines = 0
+
+        let questionsBox = makeQuestionsBox()
+
+        page.addSubview(waveformView)
+        page.addSubview(caption)
+        page.addSubview(questionsBox)
+
+        NSLayoutConstraint.activate([
+            waveformView.topAnchor.constraint(equalTo: page.topAnchor, constant: 8),
+            waveformView.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 24),
+            waveformView.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -24),
+            waveformView.heightAnchor.constraint(equalToConstant: 96),
+
+            caption.topAnchor.constraint(equalTo: waveformView.bottomAnchor, constant: 10),
+            caption.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 32),
+            caption.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -32),
+
+            questionsBox.topAnchor.constraint(equalTo: caption.bottomAnchor, constant: 14),
+            questionsBox.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 24),
+            questionsBox.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -24),
+            questionsBox.bottomAnchor.constraint(equalTo: page.bottomAnchor, constant: -8)
+        ])
+
+        return page
+    }
+
+    private func makeQuestionsBox() -> UIView {
+        let container = UIView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.backgroundColor = .secondarySystemBackground
+        container.layer.cornerRadius = 8
+        container.clipsToBounds = true
+
+        let title = UILabel()
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.text = "Survey Questions"
+        title.font = UIFont.systemFont(ofSize: 23, weight: .bold)
+        title.textColor = .label
+
+        let questionScrollView = UIScrollView()
+        questionScrollView.translatesAutoresizingMaskIntoConstraints = false
+        questionScrollView.isPagingEnabled = true
+        questionScrollView.showsHorizontalScrollIndicator = false
+        questionScrollView.alwaysBounceHorizontal = true
+
+        let stack = UIStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .horizontal
+        stack.spacing = 12
+        stack.alignment = .fill
+        stack.distribution = .fill
+        var questionCards: [UIView] = []
+
+        if questions.isEmpty {
+            let card = makeQuestionCard(
+                items: [QuestionCardItem(
+                    title: "Questionnaire not loaded",
+                    detail: "Check that questionnaire.json is bundled with the app.",
+                    answerType: "Unavailable"
+                )]
+            )
+            stack.addArrangedSubview(card)
+            questionCards.append(card)
+        } else {
+            for startIndex in stride(from: 0, to: questions.count, by: 2) {
+                let slideQuestions = questions[startIndex..<min(startIndex + 2, questions.count)]
+                let items = slideQuestions.enumerated().map { offset, question in
+                    QuestionCardItem(
+                        title: "\(startIndex + offset + 1) of \(questions.count): \(question.question)",
+                        detail: question.followUp.map { "Follow-up: \($0)" },
+                        answerType: answerTypeLabel(for: question)
+                    )
+                }
+                let card = makeQuestionCard(items: items)
+                stack.addArrangedSubview(card)
+                questionCards.append(card)
+            }
+        }
+
+        let hintLabel = UILabel()
+        hintLabel.translatesAutoresizingMaskIntoConstraints = false
+        hintLabel.text = "Swipe left or right for more questions"
+        hintLabel.font = UIFont.systemFont(ofSize: 15)
+        hintLabel.textColor = .secondaryLabel
+        hintLabel.textAlignment = .center
+
+        container.addSubview(title)
+        container.addSubview(questionScrollView)
+        container.addSubview(hintLabel)
+        questionScrollView.addSubview(stack)
+
+        var constraints: [NSLayoutConstraint] = [
+            title.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
+            title.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            title.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+
+            questionScrollView.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 10),
+            questionScrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            questionScrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            questionScrollView.bottomAnchor.constraint(equalTo: hintLabel.topAnchor, constant: -8),
+
+            hintLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            hintLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            hintLabel.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+
+            stack.topAnchor.constraint(equalTo: questionScrollView.contentLayoutGuide.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: questionScrollView.contentLayoutGuide.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: questionScrollView.contentLayoutGuide.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: questionScrollView.contentLayoutGuide.bottomAnchor),
+            stack.heightAnchor.constraint(equalTo: questionScrollView.frameLayoutGuide.heightAnchor)
+        ]
+        constraints.append(contentsOf: questionCards.map {
+            $0.widthAnchor.constraint(equalTo: questionScrollView.frameLayoutGuide.widthAnchor)
+        })
+        NSLayoutConstraint.activate(constraints)
+
+        return container
+    }
+
+    private struct QuestionCardItem {
+        let title: String
+        let detail: String?
+        let answerType: String
+    }
+
+    private func makeQuestionCard(items: [QuestionCardItem]) -> UIView {
+        let card = UIView()
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.backgroundColor = .systemBackground
+        card.layer.cornerRadius = 8
+        card.clipsToBounds = true
+
+        let stack = UIStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .vertical
+        stack.spacing = 14
+        stack.distribution = .fillEqually
+
+        for item in items {
+            stack.addArrangedSubview(makeQuestionBlock(item))
+        }
+
+        card.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+        ])
+
+        return card
+    }
+
+    private func makeQuestionBlock(_ item: QuestionCardItem) -> UIView {
+        let block = UIView()
+        block.translatesAutoresizingMaskIntoConstraints = false
+
+        let answerBadge = UILabel()
+        answerBadge.translatesAutoresizingMaskIntoConstraints = false
+        answerBadge.text = item.answerType
+        answerBadge.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
+        answerBadge.textColor = .white
+        answerBadge.backgroundColor = .systemBlue
+        answerBadge.textAlignment = .center
+        answerBadge.layer.cornerRadius = 6
+        answerBadge.clipsToBounds = true
+
+        let questionLabel = UILabel()
+        questionLabel.translatesAutoresizingMaskIntoConstraints = false
+        questionLabel.text = item.title
+        questionLabel.font = UIFont.systemFont(ofSize: 27, weight: .semibold)
+        questionLabel.textColor = .label
+        questionLabel.numberOfLines = 0
+        questionLabel.adjustsFontSizeToFitWidth = true
+        questionLabel.minimumScaleFactor = 0.75
+
+        let detailLabel = UILabel()
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailLabel.text = item.detail ?? "Expected answer: \(item.answerType)"
+        detailLabel.font = UIFont.systemFont(ofSize: 18)
+        detailLabel.textColor = .secondaryLabel
+        detailLabel.numberOfLines = 0
+
+        block.addSubview(answerBadge)
+        block.addSubview(questionLabel)
+        block.addSubview(detailLabel)
+
+        NSLayoutConstraint.activate([
+            answerBadge.topAnchor.constraint(equalTo: block.topAnchor),
+            answerBadge.leadingAnchor.constraint(equalTo: block.leadingAnchor),
+            answerBadge.heightAnchor.constraint(equalToConstant: 34),
+            answerBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
+
+            questionLabel.topAnchor.constraint(equalTo: answerBadge.bottomAnchor, constant: 8),
+            questionLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
+            questionLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor),
+
+            detailLabel.topAnchor.constraint(equalTo: questionLabel.bottomAnchor, constant: 6),
+            detailLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
+            detailLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor),
+            detailLabel.bottomAnchor.constraint(lessThanOrEqualTo: block.bottomAnchor)
+        ])
+
+        return block
+    }
+
+    private func answerTypeLabel(for question: Question) -> String {
+        switch question.type.lowercased() {
+        case "yes-no":
+            return "Yes / No"
+        case "impression":
+            return "Impression"
+        default:
+            return question.type.replacingOccurrences(of: "-", with: " ").capitalized
+        }
+    }
+
+    private func makeTipsPage() -> UIView {
+        let page = UIView()
+        page.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.text = """
+        Quick field check
+
+        Keep the iPad microphone pointed toward the respondent.
+        Watch for moving bars during answers.
+        Use Discard Recording for accidental or unnecessary interviews.
+        Stop & Review before analyzing answers.
+        """
+        label.font = UIFont.systemFont(ofSize: 21, weight: .medium)
+        label.textColor = .label
+        label.numberOfLines = 0
+        label.textAlignment = .left
+
+        page.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerYAnchor.constraint(equalTo: page.centerYAnchor),
+            label.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 36),
+            label.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -36)
+        ])
+
+        return page
+    }
+
+    private func tick() {
+        let elapsed = Int(Date().timeIntervalSince(startedAt))
+        timerLabel.text = String(format: "%02d:%02d", elapsed / 60, elapsed % 60)
+
+        let level = levelProvider?() ?? 0
+        recentLevels.append(level)
+        if recentLevels.count > 18 {
+            recentLevels.removeFirst(recentLevels.count - 18)
+        }
+
+        waveformView.append(level: level)
+        updateQualityLabel()
+    }
+
+    private func updateQualityLabel() {
+        let average = recentLevels.isEmpty ? 0 : recentLevels.reduce(0, +) / Float(recentLevels.count)
+
+        if average > 0.22 {
+            qualityLabel.text = "Voice detected"
+            qualityLabel.textColor = .systemGreen
+        } else if average > 0.08 {
+            qualityLabel.text = "Voice is quiet"
+            qualityLabel.textColor = .systemOrange
+        } else {
+            qualityLabel.text = "No clear voice detected"
+            qualityLabel.textColor = .systemRed
+        }
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        let page = Int(round(scrollView.contentOffset.x / max(1, scrollView.bounds.width)))
+        pageControl.currentPage = page
+    }
+
+    @objc private func stopTapped() {
+        onStopReview?()
+    }
+
+    @objc private func discardTapped() {
+        onDiscard?()
+    }
+}
+
+private final class RecordingWaveformView: UIView {
+    private var levels: [Float] = Array(repeating: 0, count: 42)
+
+    func append(level: Float) {
+        levels.append(max(0, min(1, level)))
+        if levels.count > 42 {
+            levels.removeFirst(levels.count - 42)
+        }
+        setNeedsDisplay()
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let context = UIGraphicsGetCurrentContext() else { return }
+        context.clear(rect)
+
+        let barCount = levels.count
+        let gap: CGFloat = 4
+        let barWidth = max(3, (rect.width - CGFloat(barCount - 1) * gap) / CGFloat(barCount))
+        let midY = rect.midY
+
+        UIColor.systemBlue.setFill()
+        for (index, level) in levels.enumerated() {
+            let x = CGFloat(index) * (barWidth + gap)
+            let height = max(8, CGFloat(level) * rect.height * 0.86)
+            let barRect = CGRect(x: x, y: midY - height / 2, width: barWidth, height: height)
+            let path = UIBezierPath(roundedRect: barRect, cornerRadius: barWidth / 2)
+            path.fill()
         }
     }
 }
