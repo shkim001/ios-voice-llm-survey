@@ -232,18 +232,20 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             llmButton.alpha = 1.0
             exportButton.alpha = 1.0
 
-            showRespondentInfoForm { [weak self] info in
-                guard let self = self else { return }
-                self.respondentInfo = info
+            selectQuestionnaireIfNeeded { [weak self] in
+                self?.showRespondentInfoForm { [weak self] info in
+                    guard let self = self else { return }
+                    self.respondentInfo = info
 
-                // Create a Cloud session up-front (best-effort). If it fails, we can still enqueue answers later.
-                Task { [weak self] in
-                    await self?.ensureCloudSessionCreated()
+                    // Create a Cloud session up-front (best-effort). If it fails, we can still enqueue answers later.
+                    Task { [weak self] in
+                        await self?.ensureCloudSessionCreated()
+                    }
+
+                    // Start recording only after a fresh GPS point is captured.
+                    self.prepareAndStartRecording()
+                    self.resetInactivityTimer()
                 }
-
-                // Start recording only after a fresh GPS point is captured.
-                self.prepareAndStartRecording()
-                self.resetInactivityTimer()
             }
             animateButton(sender)
             return
@@ -981,20 +983,81 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     // MARK: - Questionnaire Loading
     private func loadQuestionnaire() {
-        guard let url = Bundle.main.url(forResource: "questionnaire", withExtension: "json") else {
-            print("Error: questionnaire.json not found in bundle")
-            return
-        }
-
         do {
-            let data = try Data(contentsOf: url)
-            let decoder = JSONDecoder()
-            questionnaireData = try decoder.decode(QuestionnaireData.self, from: data)
+            let bundled = try QuestionnaireStore.shared.loadBundledQuestionnaire()
+            let cached = QuestionnaireStore.shared.cachedQuestionnaires()
+            let selected = QuestionnaireStore.shared.selectedQuestionnaire(
+                from: cached,
+                fallback: bundled.questionnaire
+            )
+            questionnaireData = QuestionnaireData(questionnaire: selected)
             print("Questionnaire loaded successfully: \(questionnaireData?.questionnaire.title ?? "Unknown")")
+            refreshActiveQuestionnaires()
         } catch {
             print("Error loading questionnaire: \(error)")
             showMessage("Failed to load questionnaire: \(error.localizedDescription)")
         }
+    }
+
+    private func refreshActiveQuestionnaires() {
+        guard SurveyAPIClient.shared.isConfigured() else { return }
+
+        Task { [weak self] in
+            do {
+                let active = try await SurveyAPIClient.shared.fetchActiveQuestionnaires()
+                guard !active.isEmpty else { return }
+                await MainActor.run {
+                    QuestionnaireStore.shared.saveCachedQuestionnaires(active)
+                    let fallback = self?.questionnaireData?.questionnaire ?? active[0]
+                    let selected = QuestionnaireStore.shared.selectedQuestionnaire(
+                        from: active,
+                        fallback: fallback
+                    )
+                    self?.questionnaireData = QuestionnaireData(questionnaire: selected)
+                    print("Fetched \(active.count) active questionnaire(s). Current: \(selected.title)")
+                }
+            } catch {
+                print("Questionnaire refresh failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func selectQuestionnaireIfNeeded(completion: @escaping () -> Void) {
+        let cached = QuestionnaireStore.shared.cachedQuestionnaires()
+        guard cached.count > 1 else {
+            if let only = cached.first {
+                QuestionnaireStore.shared.saveSelectedQuestionnaire(only)
+                questionnaireData = QuestionnaireData(questionnaire: only)
+            }
+            completion()
+            return
+        }
+
+        let current = questionnaireData?.questionnaire
+        let alert = UIAlertController(
+            title: "Choose Questionnaire",
+            message: "Select the survey to use for this interview.",
+            preferredStyle: .actionSheet
+        )
+
+        for questionnaire in cached {
+            let versionText = questionnaire.version.map { " v\($0)" } ?? ""
+            let marker = questionnaire.id == current?.id && questionnaire.version == current?.version ? " ✓" : ""
+            alert.addAction(UIAlertAction(title: "\(questionnaire.title)\(versionText)\(marker)", style: .default) { [weak self] _ in
+                QuestionnaireStore.shared.saveSelectedQuestionnaire(questionnaire)
+                self?.questionnaireData = QuestionnaireData(questionnaire: questionnaire)
+                completion()
+            })
+        }
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = recordButton
+            popover.sourceRect = recordButton.bounds
+        }
+
+        present(alert, animated: true)
     }
 
     // MARK: - Permission Requests
@@ -1492,8 +1555,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private struct SessionPackageQuestionnaire: Encodable {
+        let id: String?
+        let version: String?
         let title: String
         let description: String
+        let hash: String?
     }
 
     private struct SessionPackageCloud: Encodable {
@@ -1593,8 +1659,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         let questionnaire = questionnaireData.map {
             SessionPackageQuestionnaire(
+                id: $0.questionnaire.id,
+                version: $0.questionnaire.version,
                 title: $0.questionnaire.title,
-                description: $0.questionnaire.description
+                description: $0.questionnaire.description,
+                hash: $0.questionnaire.hash
             )
         }
         let cloud = cloudSessionId.flatMap { cloudSessionId in
@@ -1692,8 +1761,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     private func questionnaireJSON(_ questionnaire: SessionPackageQuestionnaire, indent: Int) -> String {
         return orderedObject([
+            ("id", jsonString(questionnaire.id)),
+            ("version", jsonString(questionnaire.version)),
             ("title", jsonString(questionnaire.title)),
-            ("description", jsonString(questionnaire.description))
+            ("description", jsonString(questionnaire.description)),
+            ("hash", jsonString(questionnaire.hash))
         ], indent: indent)
     }
 
@@ -2718,7 +2790,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         do {
             let resp = try await SurveyAPIClient.shared.createSession(
-                questionnaireVersion: "1",
+                questionnaireId: questionnaireData?.questionnaire.id,
+                questionnaireVersion: questionnaireData?.questionnaire.version ?? "1",
                 appVersion: appVersionString(),
                 locale: Locale.current.identifier
             )

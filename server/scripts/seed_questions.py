@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-time: insert questionnaire rows into `questions` so `answers` FK succeeds.
+"""Seed questionnaire rows for both legacy and versioned questionnaire storage.
 
 Usage on llm-server (from `server/`):
 
@@ -13,6 +13,7 @@ Or copy `questionnaire.json` next to this script and:
 
 import json
 import os
+import hashlib
 import sys
 from pathlib import Path
 
@@ -29,8 +30,31 @@ def main():
 
     path = Path(sys.argv[1])
     data = json.loads(path.read_text(encoding="utf-8"))
-    questions = data["questionnaire"]["questions"]
+    questionnaire = data["questionnaire"]
+    questions = questionnaire["questions"]
+    questionnaire_id = os.environ.get("QUESTIONNAIRE_ID", "street-assessment")
     version = os.environ.get("QUESTIONNAIRE_VERSION", "1")
+    title = questionnaire.get("title") or "Untitled Questionnaire"
+    description = questionnaire.get("description")
+    canonical = {
+        "id": questionnaire_id,
+        "version": version,
+        "title": title,
+        "description": description or "",
+        "questions": [
+            {
+                "id": str(q["id"]),
+                "question": q["question"],
+                "type": q.get("type", "yes-no"),
+                "follow_up": q.get("follow_up"),
+                "keywords": q.get("keywords", []),
+            }
+            for q in questions
+        ],
+    }
+    questionnaire_hash = hashlib.sha256(
+        json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
     conn = pymysql.connect(
         host=os.environ["MYSQL_HOST"],
@@ -43,10 +67,65 @@ def main():
     )
     try:
         with conn.cursor() as cur:
-            for q in questions:
+            cur.execute(
+                """
+                INSERT INTO questionnaires (id, title, description)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                  title = VALUES(title),
+                  description = VALUES(description),
+                  updated_at = CURRENT_TIMESTAMP(6)
+                """,
+                (questionnaire_id, title, description),
+            )
+            cur.execute(
+                """
+                INSERT INTO questionnaire_versions (
+                  questionnaire_id, version, title, description, status,
+                  questionnaire_hash, published_at
+                )
+                VALUES (%s, %s, %s, %s, 'published', %s, CURRENT_TIMESTAMP(6))
+                ON DUPLICATE KEY UPDATE
+                  title = VALUES(title),
+                  description = VALUES(description),
+                  status = 'published',
+                  questionnaire_hash = VALUES(questionnaire_hash),
+                  published_at = COALESCE(published_at, CURRENT_TIMESTAMP(6)),
+                  archived_at = NULL,
+                  updated_at = CURRENT_TIMESTAMP(6)
+                """,
+                (questionnaire_id, version, title, description, questionnaire_hash),
+            )
+            cur.execute(
+                """
+                DELETE FROM questionnaire_questions
+                WHERE questionnaire_id = %s AND version = %s
+                """,
+                (questionnaire_id, version),
+            )
+            for index, q in enumerate(questions, start=1):
                 qid = str(q["id"])
                 prompt = q["question"]
-                answer_type = "json"
+                answer_type = q.get("type", "yes-no")
+                cur.execute(
+                    """
+                    INSERT INTO questionnaire_questions (
+                      questionnaire_id, version, question_id, order_index,
+                      prompt, answer_type, follow_up, keywords_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        questionnaire_id,
+                        version,
+                        qid,
+                        index,
+                        prompt,
+                        answer_type,
+                        q.get("follow_up"),
+                        json.dumps(q.get("keywords", []), ensure_ascii=False),
+                    ),
+                )
                 cur.execute(
                     """
                     INSERT INTO questions (id, questionnaire_version, prompt, answer_type)
@@ -58,7 +137,10 @@ def main():
                     (qid, version, prompt, answer_type),
                 )
         conn.commit()
-        print(f"Upserted {len(questions)} questions (version={version}).")
+        print(
+            f"Published questionnaire {questionnaire_id!r} version={version}; "
+            f"upserted {len(questions)} legacy question rows."
+        )
     finally:
         conn.close()
 

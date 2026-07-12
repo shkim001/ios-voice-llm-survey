@@ -72,6 +72,7 @@ def safe_json_summary(data: dict) -> dict:
     matched_questions = data.get("matched_questions")
     answers = matched_questions if isinstance(matched_questions, list) else []
     transcript = data.get("transcription")
+    questionnaire = questionnaire_identity(data)
 
     return {
         "local_session_id": data.get("local_session_id") or data.get("session_id"),
@@ -82,6 +83,9 @@ def safe_json_summary(data: dict) -> dict:
         "gps_lat": gps.get("lat"),
         "gps_lon": gps.get("lon"),
         "recorded_at_ms": audio.get("recorded_at_ms"),
+        "questionnaire_id": questionnaire.get("id"),
+        "questionnaire_version": questionnaire.get("version"),
+        "questionnaire_hash": questionnaire.get("hash"),
         "answer_count": len(answers),
         "transcript_chars": len(transcript) if isinstance(transcript, str) else None,
     }
@@ -129,6 +133,108 @@ def validate_interviewer_email(value: str) -> str:
     return email
 
 
+def questionnaire_identity(data: dict) -> dict[str, str | None]:
+    metadata = _nested_dict(data, "metadata")
+    questionnaire = _nested_dict(metadata, "questionnaire")
+    return {
+        "id": _string_value(questionnaire, "id", "questionnaire_id")
+        or _string_value(metadata, "questionnaire_id"),
+        "version": _string_value(questionnaire, "version", "questionnaire_version")
+        or _string_value(metadata, "questionnaire_version"),
+        "title": _string_value(questionnaire, "title")
+        or _string_value(metadata, "questionnaire_title"),
+        "hash": _string_value(questionnaire, "hash", "questionnaire_hash")
+        or _string_value(metadata, "questionnaire_hash"),
+    }
+
+
+def canonical_questionnaire_payload(
+    *,
+    questionnaire_id: str,
+    version: str,
+    title: str,
+    description: str | None,
+    questions: list[dict],
+) -> dict:
+    return {
+        "id": questionnaire_id,
+        "version": version,
+        "title": title,
+        "description": description or "",
+        "questions": [
+            {
+                "id": questionnaire_question_id_value(q["id"]),
+                "question": q["question"],
+                "type": q["type"],
+                "follow_up": q.get("follow_up"),
+                "keywords": q.get("keywords", []),
+            }
+            for q in questions
+        ],
+    }
+
+
+def questionnaire_hash(payload: dict) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def questionnaire_question_id_value(value: Any) -> int | str:
+    text = str(value)
+    return int(text) if text.isdigit() else text
+
+
+def questionnaire_response(row: dict, questions: list[dict]) -> dict:
+    payload = canonical_questionnaire_payload(
+        questionnaire_id=row["questionnaire_id"],
+        version=row["version"],
+        title=row["title"],
+        description=row.get("description"),
+        questions=questions,
+    )
+    return {
+        **payload,
+        "status": row["status"],
+        "hash": row.get("questionnaire_hash") or questionnaire_hash(payload),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+        "published_at": row["published_at"].isoformat() if row.get("published_at") else None,
+        "archived_at": row["archived_at"].isoformat() if row.get("archived_at") else None,
+    }
+
+
+def load_questionnaire_questions(cur, questionnaire_id: str, version: str) -> list[dict]:
+    cur.execute(
+        """
+        SELECT question_id, order_index, prompt, answer_type, follow_up, keywords_json
+        FROM questionnaire_questions
+        WHERE questionnaire_id = %s AND version = %s
+        ORDER BY order_index, question_id
+        """,
+        (questionnaire_id, version),
+    )
+    questions = []
+    for row in cur.fetchall():
+        keywords: list[str] = []
+        if row.get("keywords_json"):
+            try:
+                decoded = json.loads(row["keywords_json"])
+                if isinstance(decoded, list):
+                    keywords = [str(item) for item in decoded]
+            except json.JSONDecodeError:
+                keywords = []
+        questions.append(
+            {
+                "id": questionnaire_question_id_value(row["question_id"]),
+                "question": row["prompt"],
+                "type": row["answer_type"],
+                "follow_up": row.get("follow_up"),
+                "keywords": keywords,
+            }
+        )
+    return questions
+
+
 def admin_json_summary(data: dict) -> dict:
     metadata = _nested_dict(data, "metadata")
     cloud = _nested_dict(metadata, "cloud")
@@ -137,6 +243,7 @@ def admin_json_summary(data: dict) -> dict:
     audio = _nested_dict(data, "audio")
     trajectory_points = _list_value(data, "trajectory_points", "trajectory", "gps", "coordinates")
     matched_questions = _list_value(data, "matched_questions", "answers")
+    questionnaire = questionnaire_identity(data)
 
     return {
         "cloud_session_id": _string_value(cloud, "session_id"),
@@ -149,7 +256,10 @@ def admin_json_summary(data: dict) -> dict:
         "interviewer_name": _string_value(interviewer_info, "name"),
         "interviewer_email": _string_value(interviewer_info, "email"),
         "location_label": _string_value(data, "location_label"),
-        "questionnaire_title": _string_value(metadata, "questionnaire_title"),
+        "questionnaire_id": questionnaire.get("id"),
+        "questionnaire_version": questionnaire.get("version"),
+        "questionnaire_title": questionnaire.get("title") or _string_value(metadata, "questionnaire_title"),
+        "questionnaire_hash": questionnaire.get("hash"),
         "answer_count": len(matched_questions),
         "trajectory_point_count": len(trajectory_points),
         "audio_filename": _string_value(audio, "file_name", "filename", "original_filename"),
@@ -219,17 +329,32 @@ def analysis_answer_rows(
             question_ids.append(str(qid))
 
     question_lookup: dict[str, dict] = {}
+    identity = questionnaire_identity(package_data)
     if question_ids:
         placeholders = ", ".join(["%s"] * len(set(question_ids)))
-        cur.execute(
-            f"""
-            SELECT id, prompt, answer_type
-            FROM questions
-            WHERE id IN ({placeholders})
-            """,
-            tuple(sorted(set(question_ids))),
-        )
-        question_lookup = {str(row["id"]): row for row in cur.fetchall()}
+        unique_ids = tuple(sorted(set(question_ids)))
+        if identity.get("id") and identity.get("version"):
+            cur.execute(
+                f"""
+                SELECT question_id AS id, prompt, answer_type
+                FROM questionnaire_questions
+                WHERE questionnaire_id = %s
+                  AND version = %s
+                  AND question_id IN ({placeholders})
+                """,
+                (identity["id"], identity["version"], *unique_ids),
+            )
+            question_lookup = {str(row["id"]): row for row in cur.fetchall()}
+        if len(question_lookup) < len(unique_ids):
+            cur.execute(
+                f"""
+                SELECT id, prompt, answer_type
+                FROM questions
+                WHERE id IN ({placeholders})
+                """,
+                unique_ids,
+            )
+            question_lookup.update({str(row["id"]): row for row in cur.fetchall()})
 
     rows = []
     for index, item in enumerate(raw_matches):
@@ -259,6 +384,8 @@ def analysis_answer_rows(
             (
                 session_bytes,
                 respondent_bytes,
+                identity.get("id"),
+                identity.get("version"),
                 question_id,
                 index,
                 question_text,
@@ -297,11 +424,12 @@ def replace_analysis_answers(
     cur.executemany(
         """
         INSERT INTO analysis_answers (
-            session_id, respondent_id, question_id, matched_index,
+            session_id, respondent_id, questionnaire_id, questionnaire_version,
+            question_id, matched_index,
             question_text, answer_type, extracted_answer, normalized_answer,
             confidence, clarification_needed, raw_match_json, source_json_path
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         rows,
     )
@@ -395,6 +523,319 @@ class InterviewerResolveResponse(BaseModel):
     identity_scope: str = "server"
 
 
+class QuestionnaireQuestionPayload(BaseModel):
+    id: str | int = Field(..., description="Stable question id within this questionnaire version.")
+    question: str = Field(..., min_length=1)
+    type: str = Field(default="yes-no", min_length=1, max_length=64)
+    follow_up: str | None = None
+    keywords: list[str] = Field(default_factory=list)
+
+
+class QuestionnaireVersionPayload(BaseModel):
+    id: str = Field(..., min_length=1, max_length=64)
+    version: str = Field(..., min_length=1, max_length=64)
+    title: str = Field(..., min_length=1, max_length=255)
+    description: str | None = None
+    questions: list[QuestionnaireQuestionPayload] = Field(..., min_length=1)
+
+
+class QuestionnaireStatusChange(BaseModel):
+    status: str
+
+
+def save_questionnaire_version(cur, body: QuestionnaireVersionPayload, *, require_draft: bool) -> dict:
+    questionnaire_id = body.id.strip()
+    version = body.version.strip()
+    title = body.title.strip()
+    description = body.description.strip() if isinstance(body.description, str) else None
+    questions = [
+        {
+            "id": str(question.id).strip(),
+            "question": question.question.strip(),
+            "type": question.type.strip(),
+            "follow_up": question.follow_up.strip() if isinstance(question.follow_up, str) else None,
+            "keywords": [keyword.strip() for keyword in question.keywords if keyword.strip()],
+        }
+        for question in body.questions
+    ]
+
+    if not questionnaire_id or not version:
+        raise HTTPException(status_code=400, detail="questionnaire id and version are required")
+    if len({question["id"] for question in questions}) != len(questions):
+        raise HTTPException(status_code=400, detail="question ids must be unique within a version")
+
+    cur.execute(
+        """
+        SELECT status
+        FROM questionnaire_versions
+        WHERE questionnaire_id = %s AND version = %s
+        """,
+        (questionnaire_id, version),
+    )
+    existing = cur.fetchone()
+    if require_draft and existing and existing["status"] != "draft":
+        raise HTTPException(status_code=409, detail="only draft questionnaire versions can be edited")
+
+    payload = canonical_questionnaire_payload(
+        questionnaire_id=questionnaire_id,
+        version=version,
+        title=title,
+        description=description,
+        questions=questions,
+    )
+    payload_hash = questionnaire_hash(payload)
+
+    cur.execute(
+        """
+        INSERT INTO questionnaires (id, title, description)
+        VALUES (%s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            title = VALUES(title),
+            description = VALUES(description),
+            updated_at = CURRENT_TIMESTAMP(6)
+        """,
+        (questionnaire_id, title, description),
+    )
+    cur.execute(
+        """
+        INSERT INTO questionnaire_versions (
+            questionnaire_id, version, title, description, status, questionnaire_hash
+        )
+        VALUES (%s, %s, %s, %s, 'draft', %s)
+        ON DUPLICATE KEY UPDATE
+            title = VALUES(title),
+            description = VALUES(description),
+            questionnaire_hash = VALUES(questionnaire_hash),
+            updated_at = CURRENT_TIMESTAMP(6)
+        """,
+        (questionnaire_id, version, title, description, payload_hash),
+    )
+    cur.execute(
+        """
+        DELETE FROM questionnaire_questions
+        WHERE questionnaire_id = %s AND version = %s
+        """,
+        (questionnaire_id, version),
+    )
+    cur.executemany(
+        """
+        INSERT INTO questionnaire_questions (
+            questionnaire_id, version, question_id, order_index,
+            prompt, answer_type, follow_up, keywords_json
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        [
+            (
+                questionnaire_id,
+                version,
+                question["id"],
+                index,
+                question["question"],
+                question["type"],
+                question.get("follow_up"),
+                json.dumps(question.get("keywords", []), ensure_ascii=False),
+            )
+            for index, question in enumerate(questions, start=1)
+        ],
+    )
+
+    return {
+        "questionnaire_id": questionnaire_id,
+        "version": version,
+        "title": title,
+        "description": description,
+        "status": "draft",
+        "questionnaire_hash": payload_hash,
+    }
+
+
+@app.get("/questionnaires/active")
+def list_active_questionnaires(_: None = Depends(verify_api_key)):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    questionnaire_id, version, title, description, status,
+                    questionnaire_hash, created_at, updated_at, published_at, archived_at
+                FROM questionnaire_versions
+                WHERE status = 'published'
+                ORDER BY title, published_at DESC, version DESC
+                """
+            )
+            version_rows = cur.fetchall()
+            questionnaires = []
+            for row in version_rows:
+                questions = load_questionnaire_questions(cur, row["questionnaire_id"], row["version"])
+                questionnaires.append(questionnaire_response(row, questions))
+
+    return {"questionnaires": questionnaires, "count": len(questionnaires)}
+
+
+@app.get("/admin/questionnaires")
+def admin_list_questionnaires(_: None = Depends(verify_api_key)):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    questionnaire_id, version, title, description, status,
+                    questionnaire_hash, created_at, updated_at, published_at, archived_at
+                FROM questionnaire_versions
+                ORDER BY updated_at DESC, title, version
+                """
+            )
+            version_rows = cur.fetchall()
+            questionnaires = []
+            for row in version_rows:
+                questions = load_questionnaire_questions(cur, row["questionnaire_id"], row["version"])
+                questionnaires.append(questionnaire_response(row, questions))
+
+    return {"questionnaires": questionnaires, "count": len(questionnaires)}
+
+
+@app.post("/admin/questionnaires")
+def admin_create_questionnaire(body: QuestionnaireVersionPayload, _: None = Depends(verify_api_key)):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            row = save_questionnaire_version(cur, body, require_draft=True)
+            questions = load_questionnaire_questions(cur, row["questionnaire_id"], row["version"])
+    return {"questionnaire": questionnaire_response(row, questions)}
+
+
+@app.put("/admin/questionnaires/{questionnaire_id}/versions/{version}")
+def admin_update_questionnaire(
+    questionnaire_id: str,
+    version: str,
+    body: QuestionnaireVersionPayload,
+    _: None = Depends(verify_api_key),
+):
+    if body.id != questionnaire_id or body.version != version:
+        raise HTTPException(status_code=400, detail="path id/version must match request body")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            row = save_questionnaire_version(cur, body, require_draft=True)
+            questions = load_questionnaire_questions(cur, row["questionnaire_id"], row["version"])
+    return {"questionnaire": questionnaire_response(row, questions)}
+
+
+@app.post("/admin/questionnaires/{questionnaire_id}/versions/{version}/publish")
+def admin_publish_questionnaire(questionnaire_id: str, version: str, _: None = Depends(verify_api_key)):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT questionnaire_id, version, title, description, status, questionnaire_hash,
+                       created_at, updated_at, published_at, archived_at
+                FROM questionnaire_versions
+                WHERE questionnaire_id = %s AND version = %s
+                """,
+                (questionnaire_id, version),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="questionnaire version not found")
+            if row["status"] == "archived":
+                raise HTTPException(status_code=409, detail="archived versions cannot be published")
+
+            questions = load_questionnaire_questions(cur, questionnaire_id, version)
+            if not questions:
+                raise HTTPException(status_code=400, detail="questionnaire version has no questions")
+
+            cur.execute(
+                """
+                UPDATE questionnaire_versions
+                SET status = 'published',
+                    published_at = COALESCE(published_at, CURRENT_TIMESTAMP(6)),
+                    archived_at = NULL
+                WHERE questionnaire_id = %s AND version = %s
+                """,
+                (questionnaire_id, version),
+            )
+            cur.executemany(
+                """
+                INSERT INTO questions (id, questionnaire_version, prompt, answer_type)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                  questionnaire_version = VALUES(questionnaire_version),
+                  prompt = VALUES(prompt),
+                  answer_type = VALUES(answer_type)
+                """,
+                [
+                    (question["id"], version, question["question"], question["type"])
+                    for question in questions
+                ],
+            )
+            cur.execute(
+                """
+                SELECT questionnaire_id, version, title, description, status, questionnaire_hash,
+                       created_at, updated_at, published_at, archived_at
+                FROM questionnaire_versions
+                WHERE questionnaire_id = %s AND version = %s
+                """,
+                (questionnaire_id, version),
+            )
+            row = cur.fetchone()
+    return {"questionnaire": questionnaire_response(row, questions)}
+
+
+@app.post("/admin/questionnaires/{questionnaire_id}/versions/{version}/archive")
+def admin_archive_questionnaire(questionnaire_id: str, version: str, _: None = Depends(verify_api_key)):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE questionnaire_versions
+                SET status = 'archived',
+                    archived_at = CURRENT_TIMESTAMP(6)
+                WHERE questionnaire_id = %s AND version = %s
+                """,
+                (questionnaire_id, version),
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="questionnaire version not found")
+            cur.execute(
+                """
+                SELECT questionnaire_id, version, title, description, status, questionnaire_hash,
+                       created_at, updated_at, published_at, archived_at
+                FROM questionnaire_versions
+                WHERE questionnaire_id = %s AND version = %s
+                """,
+                (questionnaire_id, version),
+            )
+            row = cur.fetchone()
+            questions = load_questionnaire_questions(cur, questionnaire_id, version)
+    return {"questionnaire": questionnaire_response(row, questions)}
+
+
+@app.delete("/admin/questionnaires/{questionnaire_id}/versions/{version}")
+def admin_delete_draft_questionnaire(questionnaire_id: str, version: str, _: None = Depends(verify_api_key)):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status
+                FROM questionnaire_versions
+                WHERE questionnaire_id = %s AND version = %s
+                """,
+                (questionnaire_id, version),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="questionnaire version not found")
+            if row["status"] != "draft":
+                raise HTTPException(status_code=409, detail="only draft questionnaire versions can be deleted")
+            cur.execute(
+                """
+                DELETE FROM questionnaire_versions
+                WHERE questionnaire_id = %s AND version = %s
+                """,
+                (questionnaire_id, version),
+            )
+    return {"deleted": True}
+
+
 @app.post("/interviewers/resolve", response_model=InterviewerResolveResponse)
 def resolve_interviewer(body: InterviewerResolveRequest, _: None = Depends(verify_api_key)):
     name = body.name.strip()
@@ -441,7 +882,8 @@ def admin_list_sessions(_: None = Depends(verify_api_key)):
                 SELECT
                     session_id, local_session_id, json_path, audio_original_filename,
                     recorded_at_ms, location_label, interviewer_id, interviewer_name,
-                    interviewer_email, answer_count, uploaded_at
+                    interviewer_email, questionnaire_id, questionnaire_version,
+                    questionnaire_hash, answer_count, uploaded_at
                 FROM session_packages
                 ORDER BY uploaded_at DESC
                 LIMIT 500
@@ -473,7 +915,10 @@ def admin_list_sessions(_: None = Depends(verify_api_key)):
                 "interviewer_name": json_summary.get("interviewer_name") or row.get("interviewer_name"),
                 "interviewer_email": json_summary.get("interviewer_email") or row.get("interviewer_email"),
                 "location_label": json_summary.get("location_label") or row.get("location_label"),
+                "questionnaire_id": json_summary.get("questionnaire_id") or row.get("questionnaire_id"),
+                "questionnaire_version": json_summary.get("questionnaire_version") or row.get("questionnaire_version"),
                 "questionnaire_title": json_summary.get("questionnaire_title"),
+                "questionnaire_hash": json_summary.get("questionnaire_hash") or row.get("questionnaire_hash"),
                 "answer_count": json_summary.get("answer_count")
                 if json_summary.get("answer_count") is not None
                 else row.get("answer_count"),
@@ -513,6 +958,7 @@ def admin_get_session(session_id: str, _: None = Depends(verify_api_key)):
 
 class SessionCreate(BaseModel):
     questionnaire_version: str = Field(default="1")
+    questionnaire_id: str | None = Field(default=None, max_length=64)
     app_version: str | None = None
     locale: str | None = None
     respondent_id: str | None = Field(
@@ -525,6 +971,7 @@ class SessionCreateResponse(BaseModel):
     respondent_id: str
     session_id: str
     questionnaire_version: str
+    questionnaire_id: str | None = None
 
 
 @app.post("/sessions", response_model=SessionCreateResponse)
@@ -571,6 +1018,7 @@ def create_session(body: SessionCreate, _: None = Depends(verify_api_key)):
         respondent_id=bytes_to_uuid_hex(respondent_bytes),
         session_id=str(session_id),
         questionnaire_version=body.questionnaire_version,
+        questionnaire_id=body.questionnaire_id,
     )
 
 
@@ -820,10 +1268,11 @@ def upload_session_package(
                         json_path, json_file_size_bytes, json_sha256,
                         audio_path, audio_original_filename, audio_file_size_bytes, audio_sha256,
                         recorded_at_ms, location_label, interviewer_id, interviewer_name,
-                        interviewer_email, gps_lat, gps_lon,
+                        interviewer_email, questionnaire_id, questionnaire_version, questionnaire_hash,
+                        gps_lat, gps_lon,
                         answer_count, transcript_chars
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         local_session_id = VALUES(local_session_id),
                         package_dir = VALUES(package_dir),
@@ -839,6 +1288,9 @@ def upload_session_package(
                         interviewer_id = VALUES(interviewer_id),
                         interviewer_name = VALUES(interviewer_name),
                         interviewer_email = VALUES(interviewer_email),
+                        questionnaire_id = VALUES(questionnaire_id),
+                        questionnaire_version = VALUES(questionnaire_version),
+                        questionnaire_hash = VALUES(questionnaire_hash),
                         gps_lat = VALUES(gps_lat),
                         gps_lon = VALUES(gps_lon),
                         answer_count = VALUES(answer_count),
@@ -862,6 +1314,9 @@ def upload_session_package(
                         summary.get("interviewer_id"),
                         summary.get("interviewer_name"),
                         summary.get("interviewer_email"),
+                        summary.get("questionnaire_id"),
+                        summary.get("questionnaire_version"),
+                        summary.get("questionnaire_hash"),
                         summary.get("gps_lat"),
                         summary.get("gps_lon"),
                         summary.get("answer_count"),

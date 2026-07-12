@@ -208,9 +208,17 @@ For an existing database that already has `session_packages`, run the additive i
 python3 scripts/add_interviewer_schema.py
 ```
 
+For an existing database that already has `session_packages` and `analysis_answers`, run the additive questionnaire metadata migration:
+
+```bash
+python3 scripts/add_questionnaire_schema.py
+```
+
 ### 4. Questionnaire rows
 
-Package uploads read `questions` to attach prompt text and answer type to `analysis_answers`. Load rows from the app’s questionnaire file before collecting/analyzing new sessions:
+The admin dashboard is the intended place to create, edit, publish, and archive questionnaires. The iOS app downloads published questionnaire versions, caches them for field use, and stores only compact questionnaire identity metadata in each `session.json`.
+
+Use the seed script to publish the bundled app questionnaire as the first server-managed questionnaire version and keep legacy `questions` rows available:
 
 ```bash
 export $(grep -v '^#' .env | xargs)
@@ -228,6 +236,12 @@ python3 scripts/backfill_analysis_answers.py
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
+| `GET` | `/questionnaires/active` | List published questionnaire versions for the iOS app |
+| `GET` | `/admin/questionnaires` | Admin only: list draft/published/archived questionnaire versions |
+| `POST` | `/admin/questionnaires` | Admin only: create a draft questionnaire version |
+| `PUT` | `/admin/questionnaires/{questionnaire_id}/versions/{version}` | Admin only: update a draft questionnaire version |
+| `POST` | `/admin/questionnaires/{questionnaire_id}/versions/{version}/publish` | Admin only: publish a draft questionnaire version |
+| `POST` | `/admin/questionnaires/{questionnaire_id}/versions/{version}/archive` | Admin only: archive a questionnaire version |
 | `GET` | `/admin/sessions` | Admin only: list uploaded session packages |
 | `GET` | `/admin/sessions/{session_id}` | Admin only: return the stored `session.json` for one package |
 | `POST` | `/interviewers/resolve` | Resolve/register interviewer name and normalized email; email is used as `interviewer_id` |
@@ -297,7 +311,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 7. **Dashboard** — reviews local/cached sessions, refreshes the lightweight server session list on demand, and downloads a full server `session.json` only when a server row is opened.
 8. **Aggregate** — summarizes analyzed local `SurveySessions/*/session.json` packages on device, with older `SurveyExports/*.json` files included for compatibility.
 
-If Survey API is configured, step 3 uploads the complete session package after any required clarification is resolved. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, including interviewer fields, and `analysis_answers` stores one extracted row per matched question for SQL summaries.
+If Survey API is configured, step 3 uploads the complete session package after any required clarification is resolved. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, including interviewer and questionnaire identity fields, and `analysis_answers` stores one extracted row per matched question for SQL summaries.
 
 The generated `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. Coordinate objects always place `lat` and `lon` next to each other. Interview paths are saved in `trajectory_points`; each point includes both `ts_ms` and readable UTC `captured_at`.
 
@@ -325,6 +339,7 @@ ios-voice-llm-survey/
 │   ├── app/main.py                    # FastAPI Survey API
 │   ├── schema.sql                     # package index + legacy trajectory/audio tables
 │   ├── scripts/seed_questions.py
+│   ├── scripts/add_questionnaire_schema.py
 │   ├── requirements.txt
 │   ├── .env.example
 │   ├── survey_session_packages/       # runtime only: uploaded session packages, ignored by Git
@@ -346,6 +361,7 @@ ios-voice-llm-survey/
 | Dashboard server refresh fails | Survey API Base URL/Key are configured in app Settings; FastAPI is reachable; `/admin/sessions` returns 200 |
 | Dashboard server row does not open | `/admin/sessions/{session_id}` can read the server package `session.json`; `SURVEY_PACKAGE_STORAGE_DIR` points to the package folders |
 | Package upload fails with schema error | Apply `server/schema.sql` so `session_packages` and `analysis_answers` exist |
+| Questionnaire manager/API fails with missing columns | Run `server/scripts/add_questionnaire_schema.py` on existing databases, then seed/publish a questionnaire |
 | Cannot find answers/transcript on server | Open `SURVEY_PACKAGE_STORAGE_DIR/<session-id>/session.json`; new uploads no longer store full answers/transcripts as MySQL rows |
 | iOS cannot reach HTTP server | ATS / use HTTPS; VM firewall allows device IP |
 | Package/audio not uploading | `SURVEY_PACKAGE_STORAGE_DIR` writable on server; Survey API configured; cloud session created |

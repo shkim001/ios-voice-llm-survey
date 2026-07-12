@@ -35,12 +35,14 @@ final class SurveyAPIClient {
     
     struct SessionCreateRequest: Encodable {
         let questionnaireVersion: String
+        let questionnaireId: String?
         let appVersion: String?
         let locale: String?
         let respondentId: String?
         
         enum CodingKeys: String, CodingKey {
             case questionnaireVersion = "questionnaire_version"
+            case questionnaireId = "questionnaire_id"
             case appVersion = "app_version"
             case locale
             case respondentId = "respondent_id"
@@ -51,11 +53,13 @@ final class SurveyAPIClient {
         let respondentId: String
         let sessionId: String
         let questionnaireVersion: String
+        let questionnaireId: String?
         
         enum CodingKeys: String, CodingKey {
             case respondentId = "respondent_id"
             case sessionId = "session_id"
             case questionnaireVersion = "questionnaire_version"
+            case questionnaireId = "questionnaire_id"
         }
     }
     
@@ -103,9 +107,15 @@ final class SurveyAPIClient {
     
     // MARK: - API
     
-    func createSession(questionnaireVersion: String, appVersion: String?, locale: String?) async throws -> SessionCreateResponse {
+    func createSession(
+        questionnaireId: String?,
+        questionnaireVersion: String,
+        appVersion: String?,
+        locale: String?
+    ) async throws -> SessionCreateResponse {
         let body = SessionCreateRequest(
             questionnaireVersion: questionnaireVersion,
+            questionnaireId: questionnaireId,
             appVersion: appVersion,
             locale: locale,
             respondentId: nil
@@ -116,6 +126,12 @@ final class SurveyAPIClient {
             body: body,
             responseType: SessionCreateResponse.self
         )
+    }
+
+    func fetchActiveQuestionnaires() async throws -> [Questionnaire] {
+        let data = try await requestData(method: "GET", path: "/questionnaires/active")
+        let response = try JSONDecoder().decode(QuestionnaireListResponse.self, from: data)
+        return response.questionnaires
     }
 
     func resolveInterviewer(name: String, email: String) async throws -> InterviewerResolveResponse {
@@ -207,7 +223,10 @@ final class SurveyAPIClient {
         let interviewerName: String?
         let interviewerEmail: String?
         let locationLabel: String?
+        let questionnaireId: String?
+        let questionnaireVersion: String?
         let questionnaireTitle: String?
+        let questionnaireHash: String?
         let answerCount: Int?
         let trajectoryPointCount: Int?
         let audioFilename: String?
@@ -226,7 +245,10 @@ final class SurveyAPIClient {
             case interviewerName = "interviewer_name"
             case interviewerEmail = "interviewer_email"
             case locationLabel = "location_label"
+            case questionnaireId = "questionnaire_id"
+            case questionnaireVersion = "questionnaire_version"
             case questionnaireTitle = "questionnaire_title"
+            case questionnaireHash = "questionnaire_hash"
             case answerCount = "answer_count"
             case trajectoryPointCount = "trajectory_point_count"
             case audioFilename = "audio_filename"
