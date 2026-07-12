@@ -216,7 +216,7 @@ python3 scripts/add_questionnaire_schema.py
 
 ### 4. Questionnaire rows
 
-The admin dashboard is the intended place to create, edit, publish, and archive questionnaires. The iOS app downloads published questionnaire versions, caches them for field use, and stores only compact questionnaire identity metadata in each `session.json`.
+The admin dashboard is the intended place to create, edit, publish, archive, and delete unused test questionnaire versions. The iOS app downloads published questionnaire versions, caches them for field use, and stores only compact questionnaire identity metadata in each `session.json`.
 
 Use the seed script to publish the bundled app questionnaire as the first server-managed questionnaire version and keep legacy `questions` rows available:
 
@@ -242,6 +242,7 @@ python3 scripts/backfill_analysis_answers.py
 | `PUT` | `/admin/questionnaires/{questionnaire_id}/versions/{version}` | Admin only: update a draft questionnaire version |
 | `POST` | `/admin/questionnaires/{questionnaire_id}/versions/{version}/publish` | Admin only: publish a draft questionnaire version |
 | `POST` | `/admin/questionnaires/{questionnaire_id}/versions/{version}/archive` | Admin only: archive a questionnaire version |
+| `DELETE` | `/admin/questionnaires/{questionnaire_id}/versions/{version}` | Admin only: delete a questionnaire version if no uploaded data references it |
 | `GET` | `/admin/sessions` | Admin only: list uploaded session packages |
 | `GET` | `/admin/sessions/{session_id}` | Admin only: return the stored `session.json` for one package |
 | `POST` | `/interviewers/resolve` | Resolve/register interviewer name and normalized email; email is used as `interviewer_id` |

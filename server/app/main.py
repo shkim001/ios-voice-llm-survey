@@ -810,7 +810,7 @@ def admin_archive_questionnaire(questionnaire_id: str, version: str, _: None = D
 
 
 @app.delete("/admin/questionnaires/{questionnaire_id}/versions/{version}")
-def admin_delete_draft_questionnaire(questionnaire_id: str, version: str, _: None = Depends(verify_api_key)):
+def admin_delete_questionnaire_version(questionnaire_id: str, version: str, _: None = Depends(verify_api_key)):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -824,8 +824,32 @@ def admin_delete_draft_questionnaire(questionnaire_id: str, version: str, _: Non
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="questionnaire version not found")
-            if row["status"] != "draft":
-                raise HTTPException(status_code=409, detail="only draft questionnaire versions can be deleted")
+            cur.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM session_packages
+                WHERE questionnaire_id = %s AND questionnaire_version = %s
+                """,
+                (questionnaire_id, version),
+            )
+            package_count = int(cur.fetchone()["count"])
+            cur.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM analysis_answers
+                WHERE questionnaire_id = %s AND questionnaire_version = %s
+                """,
+                (questionnaire_id, version),
+            )
+            analysis_count = int(cur.fetchone()["count"])
+            if package_count > 0 or analysis_count > 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "questionnaire version is already referenced by uploaded data; "
+                        "archive it instead of deleting"
+                    ),
+                )
             cur.execute(
                 """
                 DELETE FROM questionnaire_versions
