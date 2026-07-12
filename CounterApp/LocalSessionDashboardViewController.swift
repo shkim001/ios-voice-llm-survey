@@ -124,6 +124,16 @@ enum LocalSessionDashboardLibrary {
         return session
     }
 
+    static func deleteLocalCopy(_ session: LocalSessionDashboardSession) throws {
+        let fm = FileManager.default
+        switch session.source {
+        case .local, .cachedServer:
+            if fm.fileExists(atPath: session.directoryURL.path) {
+                try fm.removeItem(at: session.directoryURL)
+            }
+        }
+    }
+
     static func loadCachedServerSummaries() -> [ServerSessionSummary] {
         guard let url = try? serverListCacheURL(),
               let data = try? Data(contentsOf: url),
@@ -457,10 +467,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
         tableView.deselectRow(at: indexPath, animated: true)
         switch rows(for: indexPath.section)[indexPath.row] {
         case .session(let session):
-            navigationController?.pushViewController(
-                LocalSessionDetailViewController(session: session),
-                animated: true
-            )
+            navigationController?.pushViewController(makeDetailViewController(for: session), animated: true)
         case .server(let summary):
             openServerSession(summary, indexPath: indexPath)
         }
@@ -555,7 +562,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
         if let cached = LocalSessionDashboardLibrary.cachedSession(serverSessionId: summary.sessionId) {
             sessions = LocalSessionDashboardLibrary.loadSessions()
             tableView.reloadData()
-            navigationController?.pushViewController(LocalSessionDetailViewController(session: cached), animated: true)
+            navigationController?.pushViewController(makeDetailViewController(for: cached), animated: true)
             return
         }
 
@@ -578,7 +585,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
                     self.sessions = LocalSessionDashboardLibrary.loadSessions()
                     self.updateHeader()
                     self.tableView.reloadData()
-                    self.navigationController?.pushViewController(LocalSessionDetailViewController(session: cached), animated: true)
+                    self.navigationController?.pushViewController(self.makeDetailViewController(for: cached), animated: true)
                 }
             } catch {
                 await MainActor.run {
@@ -602,6 +609,14 @@ final class LocalSessionDashboardViewController: UITableViewController {
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
     }
+
+    private func makeDetailViewController(for session: LocalSessionDashboardSession) -> LocalSessionDetailViewController {
+        LocalSessionDetailViewController(session: session) { [weak self] in
+            self?.sessions = LocalSessionDashboardLibrary.loadSessions()
+            self?.updateHeader()
+            self?.tableView.reloadData()
+        }
+    }
 }
 
 final class LocalSessionDetailViewController: UITableViewController {
@@ -613,6 +628,7 @@ final class LocalSessionDetailViewController: UITableViewController {
     }
 
     private let session: LocalSessionDashboardSession
+    private let onDeleted: () -> Void
 
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -621,8 +637,9 @@ final class LocalSessionDetailViewController: UITableViewController {
         return formatter
     }()
 
-    init(session: LocalSessionDashboardSession) {
+    init(session: LocalSessionDashboardSession, onDeleted: @escaping () -> Void = {}) {
         self.session = session
+        self.onDeleted = onDeleted
         super.init(style: .insetGrouped)
         title = "Session"
     }
@@ -645,7 +662,7 @@ final class LocalSessionDetailViewController: UITableViewController {
         case .overview:
             return 8
         case .actions:
-            return 2
+            return 3
         case .answers:
             return max(session.matchedAnswers.count, 1)
         case .transcript:
@@ -691,9 +708,16 @@ final class LocalSessionDetailViewController: UITableViewController {
                 cell.accessoryType = session.trajectoryPoints.isEmpty ? .none : .disclosureIndicator
                 cell.selectionStyle = session.trajectoryPoints.isEmpty ? .none : .default
             } else {
-                content.text = "Share session.json"
-                content.secondaryText = session.packageURL.lastPathComponent
-                cell.accessoryType = .disclosureIndicator
+                if indexPath.row == 1 {
+                    content.text = "Share session.json"
+                    content.secondaryText = session.packageURL.lastPathComponent
+                    cell.accessoryType = .disclosureIndicator
+                } else {
+                    content.text = deleteActionTitle()
+                    content.secondaryText = deleteActionSubtitle()
+                    content.textProperties.color = .systemRed
+                    cell.accessoryType = .none
+                }
             }
         case .answers:
             if session.matchedAnswers.isEmpty {
@@ -730,8 +754,10 @@ final class LocalSessionDetailViewController: UITableViewController {
                 LocalSessionMapViewController(session: session),
                 animated: true
             )
-        } else {
+        } else if indexPath.row == 1 {
             shareSessionJSON(sourceView: tableView.cellForRow(at: indexPath) ?? tableView)
+        } else {
+            confirmDeleteLocalCopy()
         }
     }
 
@@ -755,6 +781,55 @@ final class LocalSessionDetailViewController: UITableViewController {
             popover.sourceRect = sourceView.bounds
         }
         present(vc, animated: true)
+    }
+
+    private func deleteActionTitle() -> String {
+        switch session.source {
+        case .local:
+            return "Delete local session files"
+        case .cachedServer:
+            return "Remove cached server copy"
+        }
+    }
+
+    private func deleteActionSubtitle() -> String {
+        switch session.source {
+        case .local:
+            return session.isUploaded
+                ? "Removes this iPad copy only. Server copy can be refreshed again."
+                : "Removes this local-only session from this iPad."
+        case .cachedServer:
+            return "Removes the downloaded dashboard cache. Opening the server row downloads it again."
+        }
+    }
+
+    private func confirmDeleteLocalCopy() {
+        let alert = UIAlertController(
+            title: deleteActionTitle(),
+            message: deleteActionSubtitle(),
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+            self?.deleteLocalCopy()
+        })
+        present(alert, animated: true)
+    }
+
+    private func deleteLocalCopy() {
+        do {
+            try LocalSessionDashboardLibrary.deleteLocalCopy(session)
+            onDeleted()
+            navigationController?.popViewController(animated: true)
+        } catch {
+            let alert = UIAlertController(
+                title: "Delete Failed",
+                message: error.localizedDescription,
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
+        }
     }
 }
 

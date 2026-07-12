@@ -280,6 +280,7 @@ The iOS app includes a native **Dashboard** button on the main screen. It is int
 - Tapping one server-only row then calls `GET /admin/sessions/{session_id}` to download that one full `session.json`.
 - Downloaded server packages are cached under `Documents/DashboardCache/<server-session-id>/session.json`.
 - Cached server packages appear under **Ready on this device** and can be opened again without another full download.
+- Detail pages can delete the device-local copy. For local sessions this removes the `SurveySessions/<local-session-id>/` folder from the iPad; for cached server sessions this removes only the `DashboardCache/<server-session-id>/` copy. It does not delete the uploaded server package.
 
 The dashboard uses the same **Survey API Base URL** and **Survey API Key** configured in app Settings. There is no separate admin API key.
 
