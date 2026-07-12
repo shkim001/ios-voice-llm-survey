@@ -27,6 +27,9 @@ struct LocalSessionDashboardSession {
     let createdAt: Date
     let locationLabel: String
     let respondentName: String?
+    let interviewerId: String?
+    let interviewerName: String?
+    let interviewerEmail: String?
     let audioFileName: String?
     let isUploaded: Bool
     let transcription: String
@@ -59,6 +62,8 @@ enum LocalSessionDashboardLibrary {
         let createdAt: Date?
         let createdAtLabel: String?
         let respondentName: String?
+        let interviewerName: String?
+        let interviewerEmail: String?
         let locationLabel: String
         let answerCount: Int?
         let trajectoryPointCount: Int?
@@ -154,6 +159,7 @@ enum LocalSessionDashboardLibrary {
 
         let metadata = json["metadata"] as? [String: Any]
         let cloud = metadata?["cloud"] as? [String: Any]
+        let interviewer = json["interviewer_info"] as? [String: Any]
         let respondent = json["respondent_info"] as? [String: Any]
         let audio = json["audio"] as? [String: Any]
         let rawAnswers = json["matched_questions"] as? [[String: Any]] ?? []
@@ -173,6 +179,10 @@ enum LocalSessionDashboardLibrary {
             ?? nonEmptyString(respondent?["location"])
             ?? "Unknown Location"
         let respondentName = nonEmptyString(respondent?["name"])
+        let interviewerId = nonEmptyString(interviewer?["interviewer_id"])
+            ?? nonEmptyString(interviewer?["email"])
+        let interviewerName = nonEmptyString(interviewer?["name"])
+        let interviewerEmail = nonEmptyString(interviewer?["email"])
         let audioFileName = nonEmptyString(audio?["file_name"])
         let transcription = nonEmptyString(json["transcription"]) ?? ""
         let isUploaded = recordingMetadata(in: directoryURL, audioFileName: audioFileName)?["session_package_uploaded_at_epoch"] != nil
@@ -208,6 +218,9 @@ enum LocalSessionDashboardLibrary {
             createdAt: createdAt,
             locationLabel: locationLabel,
             respondentName: respondentName,
+            interviewerId: interviewerId,
+            interviewerName: interviewerName,
+            interviewerEmail: interviewerEmail,
             audioFileName: audioFileName,
             isUploaded: isUploaded,
             transcription: transcription,
@@ -236,6 +249,8 @@ enum LocalSessionDashboardLibrary {
             createdAt: dateValue(createdLabel),
             createdAtLabel: createdLabel,
             respondentName: summary.respondentName,
+            interviewerName: summary.interviewerName,
+            interviewerEmail: summary.interviewerEmail,
             locationLabel: nonEmptyString(summary.locationLabel)
                 ?? nonEmptyString(summary.respondentLocation)
                 ?? "Unknown Location",
@@ -415,6 +430,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
             content.secondaryText = [
                 Self.dateFormatter.string(from: session.createdAt),
                 session.locationLabel,
+                "Interviewer: \(session.interviewerName ?? session.interviewerEmail ?? "Unknown")",
                 "\(session.matchedAnswers.count) answer(s)",
                 "\(session.trajectoryPoints.count) GPS point(s)",
                 session.sourceLabel
@@ -425,6 +441,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
             content.secondaryText = [
                 serverDateText(summary),
                 summary.locationLabel,
+                "Interviewer: \(summary.interviewerName ?? summary.interviewerEmail ?? "Unknown")",
                 "\(summary.answerCount ?? 0) answer(s)",
                 "\(summary.trajectoryPointCount ?? 0) GPS point(s)",
                 loadingServerSessionIds.contains(summary.sessionId) ? "downloading" : "server"
@@ -626,7 +643,7 @@ final class LocalSessionDetailViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section) {
         case .overview:
-            return 6
+            return 8
         case .actions:
             return 2
         case .answers:
@@ -721,6 +738,8 @@ final class LocalSessionDetailViewController: UITableViewController {
     private func overviewRows() -> [(title: String, value: String)] {
         [
             ("Respondent", session.respondentName ?? "Unknown"),
+            ("Interviewer", session.interviewerName ?? "Unknown"),
+            ("Interviewer Email", session.interviewerEmail ?? session.interviewerId ?? "Unknown"),
             ("Date", Self.dateFormatter.string(from: session.createdAt)),
             ("Location", session.locationLabel),
             ("Status", session.isUploaded ? "Uploaded" : "Local only"),

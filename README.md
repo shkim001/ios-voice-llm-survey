@@ -106,14 +106,17 @@ Open **Settings** (gear) from the main screen.
 |---------|-------------|
 | **Configure Survey API Base URL** | Base URL of your FastAPI server, e.g. `https://api.example.com` or `http://YOUR_VM_IP:8000` (no trailing slash required) |
 | **Configure Survey API Key** | Must match `API_KEY` in `server/.env` if the server enforces it; leave empty if `API_KEY` is unset |
+| **Configure Interviewer** | Required before recording; saves interviewer name and normalized email, using the email as the interviewer ID across devices |
 
 When the Survey API is configured:
 
 - Recording creates a local `SurveySessions/<local-session-id>/` folder only when audio is about to be saved; metadata-only empty folders are cleaned up automatically.
+- Before recording, the app requires an interviewer profile. If the Survey API is configured, the app resolves/registers the interviewer with `POST /interviewers/resolve`; otherwise it stores the profile locally.
 - After **Analyze Answers** from the recording review flow, the app writes `session.json` into that local session folder.
+- Each `session.json` includes `interviewer_info` with `interviewer_id`, `name`, `email`, and `identity_scope`.
 - If any matched answer has medium/low confidence or needs clarification, the interviewer can select or type a final answer before the package is saved.
 - If the Survey API is configured, the app uploads `session.json` and the `.m4a` recording together to `POST /sessions/{id}/package`.
-- The server stores both files under one VM folder, writes a package index row to MySQL, and extracts matched answers into `analysis_answers` for easier counting/filtering.
+- The server stores both files under one VM folder, writes a package index row to MySQL, indexes interviewer fields, and extracts matched answers into `analysis_answers` for easier counting/filtering.
 - Recording is blocked if the app cannot retrieve a current GPS coordinate, then the app samples the latest available location about every 15 seconds while recording.
 
 ---
@@ -199,6 +202,12 @@ Ensure MySQL has the existing `respondents`, `survey_sessions`, and `questions` 
 mysql -h "$MYSQL_HOST" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" < schema.sql
 ```
 
+For an existing database that already has `session_packages`, run the additive interviewer migration:
+
+```bash
+python3 scripts/add_interviewer_schema.py
+```
+
 ### 4. Questionnaire rows
 
 Package uploads read `questions` to attach prompt text and answer type to `analysis_answers`. Load rows from the app’s questionnaire file before collecting/analyzing new sessions:
@@ -221,6 +230,7 @@ python3 scripts/backfill_analysis_answers.py
 | `GET` | `/health` | Health check |
 | `GET` | `/admin/sessions` | Admin only: list uploaded session packages |
 | `GET` | `/admin/sessions/{session_id}` | Admin only: return the stored `session.json` for one package |
+| `POST` | `/interviewers/resolve` | Resolve/register interviewer name and normalized email; email is used as `interviewer_id` |
 | `POST` | `/sessions` | Create respondent + session |
 | `POST` | `/sessions/{session_id}/package` | Upload `session.json` plus the audio file into one server folder; MySQL stores the package index and extracted analysis rows |
 | `POST` | `/sessions/{session_id}/answers` | Legacy: batch upload LLM-matched answers as MySQL rows |
@@ -238,6 +248,7 @@ In app **Settings**:
 
 - **Survey API Base URL** — e.g. `http://YOUR_VM_IP:8000`
 - **Survey API Key** — same value as `API_KEY` in `.env` (if used)
+- **Interviewer Profile** — interviewer name and email; the app lowercases/trims the email and uses it as the interviewer ID.
 
 ---
 
@@ -247,6 +258,7 @@ The iOS app includes a native **Dashboard** button on the main screen. It is int
 
 - The dashboard opens immediately with sessions already available on the device.
 - Local sessions come from `Documents/SurveySessions/<local-session-id>/session.json`.
+- Session rows and detail pages show the interviewer saved in `interviewer_info`.
 - Tapping the dashboard refresh button calls `GET /admin/sessions` and fetches only the lightweight server session list.
 - Server-only sessions appear under **Available on server**.
 - Tapping one server-only row then calls `GET /admin/sessions/{session_id}` to download that one full `session.json`.
@@ -276,7 +288,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 
 ## Usage workflow
 
-1. **Start Interview** — submit respondent info, wait for the required GPS point, then record from the full-screen monitor with a timer, voice-level bars, a swipeable survey-question box showing two questions per slide with answer-type hints, and discard control. If GPS is unavailable, recording does not start.
+1. **Start Interview** — configure the current interviewer if needed, submit respondent info, wait for the required GPS point, then record from the full-screen monitor with a timer, voice-level bars, a swipeable survey-question box showing two questions per slide with answer-type hints, and discard control. If GPS is unavailable, recording does not start.
 2. **Review Recording** — after Stop & Review, play the audio without closing the review popup, then analyze or discard the recording.
 3. **Analyze Answers** — from the review popup, transcribes the recording (English locale), sends the transcript to the configured LLM, and shows matched questions and extracted answers.
 4. **Clarify Answers** — for medium/low-confidence answers or answers marked as needing clarification, select or type the final answer and optionally add a note. The JSON keeps both the original LLM answer and the manual correction.
@@ -285,7 +297,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 7. **Dashboard** — reviews local/cached sessions, refreshes the lightweight server session list on demand, and downloads a full server `session.json` only when a server row is opened.
 8. **Aggregate** — summarizes analyzed local `SurveySessions/*/session.json` packages on device, with older `SurveyExports/*.json` files included for compatibility.
 
-If Survey API is configured, step 3 uploads the complete session package after any required clarification is resolved. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, and `analysis_answers` stores one extracted row per matched question for SQL summaries.
+If Survey API is configured, step 3 uploads the complete session package after any required clarification is resolved. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, including interviewer fields, and `analysis_answers` stores one extracted row per matched question for SQL summaries.
 
 The generated `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. Coordinate objects always place `lat` and `lon` next to each other. Interview paths are saved in `trajectory_points`; each point includes both `ts_ms` and readable UTC `captured_at`.
 

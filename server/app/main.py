@@ -62,6 +62,7 @@ def sanitize_filename(name: str) -> str:
 
 def safe_json_summary(data: dict) -> dict:
     respondent_info = data.get("respondent_info") if isinstance(data.get("respondent_info"), dict) else {}
+    interviewer_info = data.get("interviewer_info") if isinstance(data.get("interviewer_info"), dict) else {}
     audio = data.get("audio") if isinstance(data.get("audio"), dict) else {}
     gps = data.get("recording_start_trajectory_point")
     if not isinstance(gps, dict):
@@ -75,6 +76,9 @@ def safe_json_summary(data: dict) -> dict:
     return {
         "local_session_id": data.get("local_session_id") or data.get("session_id"),
         "location_label": respondent_info.get("location") or data.get("location_label"),
+        "interviewer_id": interviewer_info.get("interviewer_id") or interviewer_info.get("email"),
+        "interviewer_name": interviewer_info.get("name"),
+        "interviewer_email": interviewer_info.get("email"),
         "gps_lat": gps.get("lat"),
         "gps_lon": gps.get("lon"),
         "recorded_at_ms": audio.get("recorded_at_ms"),
@@ -113,9 +117,22 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
+def validate_interviewer_email(value: str) -> str:
+    email = normalize_email(value)
+    parts = email.split("@")
+    if len(parts) != 2 or not parts[0] or not parts[1] or "." not in parts[1]:
+        raise HTTPException(status_code=400, detail="email must be a valid email address")
+    return email
+
+
 def admin_json_summary(data: dict) -> dict:
     metadata = _nested_dict(data, "metadata")
     cloud = _nested_dict(metadata, "cloud")
+    interviewer_info = _nested_dict(data, "interviewer_info")
     respondent_info = _nested_dict(data, "respondent_info")
     audio = _nested_dict(data, "audio")
     trajectory_points = _list_value(data, "trajectory_points", "trajectory", "gps", "coordinates")
@@ -128,6 +145,9 @@ def admin_json_summary(data: dict) -> dict:
         "export_time": _string_value(metadata, "export_time", "created_at", "uploaded_at"),
         "respondent_name": _string_value(respondent_info, "name"),
         "respondent_location": _string_value(respondent_info, "location"),
+        "interviewer_id": _string_value(interviewer_info, "interviewer_id", "email"),
+        "interviewer_name": _string_value(interviewer_info, "name"),
+        "interviewer_email": _string_value(interviewer_info, "email"),
         "location_label": _string_value(data, "location_label"),
         "questionnaire_title": _string_value(metadata, "questionnaire_title"),
         "answer_count": len(matched_questions),
@@ -363,6 +383,55 @@ def health():
     return {"ok": True}
 
 
+class InterviewerResolveRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    email: str = Field(..., min_length=3, max_length=255)
+
+
+class InterviewerResolveResponse(BaseModel):
+    interviewer_id: str
+    name: str
+    email: str
+    identity_scope: str = "server"
+
+
+@app.post("/interviewers/resolve", response_model=InterviewerResolveResponse)
+def resolve_interviewer(body: InterviewerResolveRequest, _: None = Depends(verify_api_key)):
+    name = body.name.strip()
+    email = validate_interviewer_email(body.email)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO interviewers (email, name)
+                VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE
+                    name = VALUES(name),
+                    last_seen_at = CURRENT_TIMESTAMP(6)
+                """,
+                (email, name),
+            )
+            cur.execute(
+                """
+                SELECT email, name
+                FROM interviewers
+                WHERE email = %s
+                """,
+                (email,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=500, detail="interviewer lookup failed")
+
+    return InterviewerResolveResponse(
+        interviewer_id=row["email"],
+        name=row["name"],
+        email=row["email"],
+    )
+
+
 @app.get("/admin/sessions")
 def admin_list_sessions(_: None = Depends(verify_api_key)):
     with get_conn() as conn:
@@ -371,7 +440,8 @@ def admin_list_sessions(_: None = Depends(verify_api_key)):
                 """
                 SELECT
                     session_id, local_session_id, json_path, audio_original_filename,
-                    recorded_at_ms, location_label, answer_count, uploaded_at
+                    recorded_at_ms, location_label, interviewer_id, interviewer_name,
+                    interviewer_email, answer_count, uploaded_at
                 FROM session_packages
                 ORDER BY uploaded_at DESC
                 LIMIT 500
@@ -399,6 +469,9 @@ def admin_list_sessions(_: None = Depends(verify_api_key)):
                 "uploaded_at": row["uploaded_at"].isoformat() if row.get("uploaded_at") else None,
                 "respondent_name": json_summary.get("respondent_name"),
                 "respondent_location": json_summary.get("respondent_location"),
+                "interviewer_id": json_summary.get("interviewer_id") or row.get("interviewer_id"),
+                "interviewer_name": json_summary.get("interviewer_name") or row.get("interviewer_name"),
+                "interviewer_email": json_summary.get("interviewer_email") or row.get("interviewer_email"),
                 "location_label": json_summary.get("location_label") or row.get("location_label"),
                 "questionnaire_title": json_summary.get("questionnaire_title"),
                 "answer_count": json_summary.get("answer_count")
@@ -746,10 +819,11 @@ def upload_session_package(
                         session_id, respondent_id, local_session_id, package_dir,
                         json_path, json_file_size_bytes, json_sha256,
                         audio_path, audio_original_filename, audio_file_size_bytes, audio_sha256,
-                        recorded_at_ms, location_label, gps_lat, gps_lon,
+                        recorded_at_ms, location_label, interviewer_id, interviewer_name,
+                        interviewer_email, gps_lat, gps_lon,
                         answer_count, transcript_chars
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         local_session_id = VALUES(local_session_id),
                         package_dir = VALUES(package_dir),
@@ -762,6 +836,9 @@ def upload_session_package(
                         audio_sha256 = VALUES(audio_sha256),
                         recorded_at_ms = VALUES(recorded_at_ms),
                         location_label = VALUES(location_label),
+                        interviewer_id = VALUES(interviewer_id),
+                        interviewer_name = VALUES(interviewer_name),
+                        interviewer_email = VALUES(interviewer_email),
                         gps_lat = VALUES(gps_lat),
                         gps_lon = VALUES(gps_lon),
                         answer_count = VALUES(answer_count),
@@ -782,6 +859,9 @@ def upload_session_package(
                         audio_sha256,
                         summary.get("recorded_at_ms"),
                         summary.get("location_label"),
+                        summary.get("interviewer_id"),
+                        summary.get("interviewer_name"),
+                        summary.get("interviewer_email"),
                         summary.get("gps_lat"),
                         summary.get("gps_lon"),
                         summary.get("answer_count"),

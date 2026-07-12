@@ -72,6 +72,34 @@ final class SurveyAPIClient {
             case value
         }
     }
+
+    struct InterviewerResolveRequest: Encodable {
+        let name: String
+        let email: String
+    }
+
+    struct InterviewerResolveResponse: Codable {
+        let interviewerId: String
+        let name: String
+        let email: String
+        let identityScope: String
+
+        enum CodingKeys: String, CodingKey {
+            case interviewerId = "interviewer_id"
+            case name
+            case email
+            case identityScope = "identity_scope"
+        }
+
+        var profile: InterviewerProfile {
+            InterviewerProfile(
+                interviewerId: interviewerId,
+                name: name,
+                email: email,
+                identityScope: identityScope
+            )
+        }
+    }
     
     // MARK: - API
     
@@ -87,6 +115,16 @@ final class SurveyAPIClient {
             path: "/sessions",
             body: body,
             responseType: SessionCreateResponse.self
+        )
+    }
+
+    func resolveInterviewer(name: String, email: String) async throws -> InterviewerResolveResponse {
+        let body = InterviewerResolveRequest(name: name, email: email)
+        return try await requestJSON(
+            method: "POST",
+            path: "/interviewers/resolve",
+            body: body,
+            responseType: InterviewerResolveResponse.self
         )
     }
     
@@ -165,6 +203,9 @@ final class SurveyAPIClient {
         let uploadedAt: String?
         let respondentName: String?
         let respondentLocation: String?
+        let interviewerId: String?
+        let interviewerName: String?
+        let interviewerEmail: String?
         let locationLabel: String?
         let questionnaireTitle: String?
         let answerCount: Int?
@@ -181,6 +222,9 @@ final class SurveyAPIClient {
             case uploadedAt = "uploaded_at"
             case respondentName = "respondent_name"
             case respondentLocation = "respondent_location"
+            case interviewerId = "interviewer_id"
+            case interviewerName = "interviewer_name"
+            case interviewerEmail = "interviewer_email"
             case locationLabel = "location_label"
             case questionnaireTitle = "questionnaire_title"
             case answerCount = "answer_count"

@@ -214,6 +214,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         resetInactivityTimer()
         // If not recording, show info form first
         if !isRecording {
+            guard InterviewerProfileStore.shared.currentProfile != nil else {
+                showMessage("Set interviewer name and email in Settings before starting an interview.")
+                showInterviewerProfileInput()
+                animateButton(sender)
+                return
+            }
+
             // Clear previous state when starting a new recording (same participant/session unless "Start next participant" was used)
             transcription = nil
             matchedQuestions = []
@@ -410,6 +417,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         guard respondentInfo != nil else {
             showMessage("Missing respondent information")
+            return
+        }
+
+        guard InterviewerProfileStore.shared.currentProfile != nil else {
+            showMessage("Missing interviewer information")
             return
         }
 
@@ -1402,6 +1414,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let timestamp: Double
         let sessionId: String
         let localSessionId: String
+        let interviewerInfo: InterviewerProfile?
         let respondentInfo: RespondentInfo?
         let locationLabel: String?
         let audio: SessionPackageAudio?
@@ -1416,6 +1429,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             case timestamp
             case sessionId = "session_id"
             case localSessionId = "local_session_id"
+            case interviewerInfo = "interviewer_info"
             case respondentInfo = "respondent_info"
             case locationLabel = "location_label"
             case audio
@@ -1432,6 +1446,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             try container.encode(timestamp, forKey: .timestamp)
             try container.encode(sessionId, forKey: .sessionId)
             try container.encode(localSessionId, forKey: .localSessionId)
+            try container.encodeIfPresent(interviewerInfo, forKey: .interviewerInfo)
             try container.encodeIfPresent(respondentInfo, forKey: .respondentInfo)
             try container.encodeIfPresent(locationLabel, forKey: .locationLabel)
             try container.encodeIfPresent(audio, forKey: .audio)
@@ -1632,6 +1647,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             timestamp: timestamp,
             sessionId: sessionId ?? "",
             localSessionId: sessionId ?? "",
+            interviewerInfo: InterviewerProfileStore.shared.currentProfile,
             respondentInfo: respondentInfo,
             locationLabel: respondentInfo?.location,
             audio: audio,
@@ -1649,6 +1665,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("timestamp", jsonNumber(package.timestamp)),
             ("session_id", jsonString(package.sessionId)),
             ("local_session_id", jsonString(package.localSessionId)),
+            ("interviewer_info", package.interviewerInfo.map { interviewerInfoJSON($0, indent: 1) }),
             ("respondent_info", package.respondentInfo.map { respondentInfoJSON($0, indent: 1) }),
             ("location_label", jsonString(package.locationLabel)),
             ("audio", package.audio.map { sessionPackageAudioJSON($0, indent: 1) }),
@@ -1684,6 +1701,15 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         return orderedObject([
             ("session_id", jsonString(cloud.sessionId)),
             ("respondent_id", jsonString(cloud.respondentId))
+        ], indent: indent)
+    }
+
+    private func interviewerInfoJSON(_ info: InterviewerProfile, indent: Int) -> String {
+        return orderedObject([
+            ("interviewer_id", jsonString(info.interviewerId)),
+            ("name", jsonString(info.name)),
+            ("email", jsonString(info.email)),
+            ("identity_scope", jsonString(info.identityScope))
         ], indent: indent)
     }
 
@@ -2315,9 +2341,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func showAPIKeySettings() {
+        let interviewer = InterviewerProfileStore.shared.currentProfile
         let alert = UIAlertController(
-            title: "LLM API Settings",
-            message: "Select API provider and configure API Key\n\nCurrent selection: \(LLMService.shared.currentProvider.displayName)",
+            title: "App Settings",
+            message: "Current LLM: \(LLMService.shared.currentProvider.displayName)\nCurrent interviewer: \(interviewer?.name ?? "Not set")",
             preferredStyle: .alert
         )
 
@@ -2348,6 +2375,15 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         alert.addAction(UIAlertAction(title: "Configure Survey API Key", style: .default) { [weak self] _ in
             self?.showSurveyAPIKeyInput()
         })
+
+        alert.addAction(UIAlertAction(title: "Configure Interviewer", style: .default) { [weak self] _ in
+            self?.showInterviewerProfileInput()
+        })
+        if InterviewerProfileStore.shared.profiles.count > 1 {
+            alert.addAction(UIAlertAction(title: "Select Saved Interviewer", style: .default) { [weak self] _ in
+                self?.showSavedInterviewerSelection()
+            })
+        }
 
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
 
@@ -2559,6 +2595,110 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
 
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
+    }
+
+    private func showInterviewerProfileInput() {
+        let current = InterviewerProfileStore.shared.currentProfile
+        let alert = UIAlertController(
+            title: "Interviewer Profile",
+            message: "Enter the interviewer name and email. The email is used as the interviewer ID across devices.",
+            preferredStyle: .alert
+        )
+
+        alert.addTextField { textField in
+            textField.placeholder = "Name"
+            textField.text = current?.name
+            textField.autocapitalizationType = .words
+            textField.autocorrectionType = .yes
+        }
+
+        alert.addTextField { textField in
+            textField.placeholder = "email@columbia.edu"
+            textField.text = current?.email
+            textField.keyboardType = .emailAddress
+            textField.autocapitalizationType = .none
+            textField.autocorrectionType = .no
+        }
+
+        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
+            let name = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let email = alert.textFields?.dropFirst().first?.text ?? ""
+            let normalizedEmail = InterviewerProfile.normalizedEmail(email)
+
+            guard !name.isEmpty else {
+                self?.showMessage("Interviewer name cannot be empty")
+                return
+            }
+            guard InterviewerProfile.isValidEmail(normalizedEmail) else {
+                self?.showMessage("Enter a valid interviewer email")
+                return
+            }
+
+            let localProfile = InterviewerProfile(name: name, email: normalizedEmail, identityScope: "device")
+            guard SurveyAPIClient.shared.isConfigured() else {
+                InterviewerProfileStore.shared.saveCurrentProfile(localProfile)
+                self?.showMessage("Interviewer saved locally")
+                return
+            }
+
+            Task { [weak self] in
+                do {
+                    let response = try await SurveyAPIClient.shared.resolveInterviewer(name: name, email: normalizedEmail)
+                    await MainActor.run {
+                        InterviewerProfileStore.shared.saveCurrentProfile(response.profile)
+                        self?.showMessage("Interviewer saved")
+                    }
+                } catch {
+                    await MainActor.run {
+                        InterviewerProfileStore.shared.saveCurrentProfile(localProfile)
+                        self?.showMessage("Interviewer saved locally. Server lookup failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+        })
+
+        if current != nil {
+            alert.addAction(UIAlertAction(title: "Clear Current", style: .destructive) { [weak self] _ in
+                InterviewerProfileStore.shared.clearCurrentProfile()
+                self?.showMessage("Current interviewer cleared")
+            })
+        }
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
+    }
+
+    private func showSavedInterviewerSelection() {
+        let profiles = InterviewerProfileStore.shared.profiles
+        guard !profiles.isEmpty else {
+            showMessage("No saved interviewers")
+            return
+        }
+
+        let alert = UIAlertController(
+            title: "Select Interviewer",
+            message: "Choose the person using this device now.",
+            preferredStyle: .actionSheet
+        )
+
+        let currentId = InterviewerProfileStore.shared.currentProfile?.interviewerId
+        for profile in profiles {
+            let marker = profile.interviewerId == currentId ? " ✓" : ""
+            alert.addAction(UIAlertAction(title: "\(profile.name) (\(profile.email))\(marker)", style: .default) { [weak self] _ in
+                InterviewerProfileStore.shared.saveCurrentProfile(profile)
+                self?.showMessage("Current interviewer: \(profile.name)")
+            })
+        }
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            popover.permittedArrowDirections = []
+        }
+
         present(alert, animated: true)
     }
 

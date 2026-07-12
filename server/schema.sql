@@ -67,6 +67,17 @@ CREATE TABLE IF NOT EXISTS audio_recordings (
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS interviewers (
+  email VARCHAR(255) NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  last_seen_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+
+  PRIMARY KEY (email),
+  INDEX idx_interviewers_name (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS session_packages (
   session_id BINARY(16) NOT NULL,
   respondent_id BINARY(16) NOT NULL,
@@ -85,6 +96,9 @@ CREATE TABLE IF NOT EXISTS session_packages (
 
   recorded_at_ms BIGINT NULL,
   location_label VARCHAR(255) NULL,
+  interviewer_id VARCHAR(255) NULL,
+  interviewer_name VARCHAR(255) NULL,
+  interviewer_email VARCHAR(255) NULL,
   gps_lat DOUBLE NULL,
   gps_lon DOUBLE NULL,
   answer_count INT UNSIGNED NULL,
@@ -95,6 +109,7 @@ CREATE TABLE IF NOT EXISTS session_packages (
   PRIMARY KEY (session_id),
   INDEX idx_session_packages_respondent_uploaded (respondent_id, uploaded_at),
   INDEX idx_session_packages_location_uploaded (location_label, uploaded_at),
+  INDEX idx_session_packages_interviewer_uploaded (interviewer_id, uploaded_at),
 
   CONSTRAINT fk_session_packages_session
     FOREIGN KEY (session_id) REFERENCES survey_sessions(id)
