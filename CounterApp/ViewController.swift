@@ -13,7 +13,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     @IBOutlet weak var aggregateButton: UIButton!
     private var dashboardButton: UIButton?
     private var audioFilesButton: UIButton?
-    private var clearButton: UIButton?  // Created programmatically
 
     // Recording state
     private var isRecording = false
@@ -148,30 +147,17 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         view.addSubview(audioBtn)
         self.audioFilesButton = audioBtn
 
-        // Create and setup clear button programmatically
-        let clearBtn = UIButton(type: .system)
-        clearBtn.translatesAutoresizingMaskIntoConstraints = false
-        setupButton(clearBtn, title: "Clear JSON Files", backgroundColor: .systemOrange)
-        clearBtn.addTarget(self, action: #selector(clearButtonTapped(_:)), for: .touchUpInside)
-        view.addSubview(clearBtn)
-        self.clearButton = clearBtn
-
         // Add constraints for programmatic buttons positioned below aggregate button
         NSLayoutConstraint.activate([
             dashboardBtn.topAnchor.constraint(equalTo: aggregateButton.bottomAnchor, constant: 16),
             dashboardBtn.leadingAnchor.constraint(equalTo: aggregateButton.leadingAnchor),
-            dashboardBtn.trailingAnchor.constraint(equalTo: audioBtn.leadingAnchor, constant: -12),
+            dashboardBtn.trailingAnchor.constraint(equalTo: aggregateButton.trailingAnchor),
             dashboardBtn.heightAnchor.constraint(equalToConstant: 50),
-            dashboardBtn.widthAnchor.constraint(equalTo: audioBtn.widthAnchor),
 
-            audioBtn.topAnchor.constraint(equalTo: dashboardBtn.topAnchor),
+            audioBtn.topAnchor.constraint(equalTo: dashboardBtn.bottomAnchor, constant: 16),
+            audioBtn.leadingAnchor.constraint(equalTo: aggregateButton.leadingAnchor),
             audioBtn.trailingAnchor.constraint(equalTo: aggregateButton.trailingAnchor),
-            audioBtn.heightAnchor.constraint(equalToConstant: 50),
-
-            clearBtn.topAnchor.constraint(equalTo: dashboardBtn.bottomAnchor, constant: 16),
-            clearBtn.leadingAnchor.constraint(equalTo: aggregateButton.leadingAnchor),
-            clearBtn.trailingAnchor.constraint(equalTo: aggregateButton.trailingAnchor),
-            clearBtn.heightAnchor.constraint(equalToConstant: 50)
+            audioBtn.heightAnchor.constraint(equalToConstant: 50)
         ])
 
         // Initial state: hidden legacy buttons are disabled for storyboard compatibility.
@@ -631,77 +617,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         present(nav, animated: true)
     }
 
-    @objc func clearButtonTapped(_ sender: UIButton) {
-        animateButton(sender)
-
-        let alert = UIAlertController(
-            title: "Clear JSON Files",
-            message: "Are you sure you want to delete all exported JSON questionnaire response files? This action cannot be undone.",
-            preferredStyle: .alert
-        )
-
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
-            self?.clearAllJSONFiles()
-        })
-
-        present(alert, animated: true)
-    }
-
-    private func clearAllJSONFiles() {
-        statusLabel.text = "Clearing JSON files..."
-        statusLabel.textColor = .systemOrange
-        clearButton?.isEnabled = false
-        clearButton?.alpha = 0.5
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-
-            do {
-                let exportsDirectory = try self.ensureExportsDirectory()
-                let fileManager = FileManager.default
-
-                // Get all JSON files
-                let fileURLs = try fileManager.contentsOfDirectory(
-                    at: exportsDirectory,
-                    includingPropertiesForKeys: nil,
-                    options: [.skipsHiddenFiles]
-                ).filter { $0.pathExtension.lowercased() == "json" }
-
-                var deletedCount = 0
-                for fileURL in fileURLs {
-                    do {
-                        try fileManager.removeItem(at: fileURL)
-                        deletedCount += 1
-                    } catch {
-                        print("Failed to delete file \(fileURL.lastPathComponent): \(error)")
-                    }
-                }
-
-                DispatchQueue.main.async {
-                    self.statusLabel.text = "Cleared \(deletedCount) JSON file(s)"
-                    self.statusLabel.textColor = .systemGreen
-                    self.clearButton?.isEnabled = true
-                    self.clearButton?.alpha = 1.0
-
-                    if deletedCount > 0 {
-                        self.showMessage("Successfully deleted \(deletedCount) JSON questionnaire response file(s)")
-                    } else {
-                        self.showMessage("No JSON files found to delete")
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.statusLabel.text = "Clear failed"
-                    self.statusLabel.textColor = .systemRed
-                    self.showMessage("Unable to access export directory: \(error.localizedDescription)")
-                    self.clearButton?.isEnabled = true
-                    self.clearButton?.alpha = 1.0
-                }
-            }
-        }
-    }
-
     // Aggregation action type
     private enum AggregationAction {
         case view
@@ -711,9 +626,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     // Aggregation result data structure
     private struct AggregationResult {
         let summary: String
-        let statistics: [Int: [String: Int]]
-        let answerDisplayNames: [Int: [String: String]]
-        let questionTexts: [Int: String]
+        let statistics: [String: [String: Int]]
+        let answerDisplayNames: [String: [String: String]]
+        let questionTexts: [String: String]
+        let questionIds: [String: Int]
+        let questionnaireNames: [String: String]
         let processedFiles: Int
     }
 
@@ -746,32 +663,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     return
                 }
 
-                // Get all question IDs
-                let allQuestionIds: Set<Int>
-                if let questions = self.questionnaireData?.questionnaire.questions {
-                    allQuestionIds = Set(questions.map { $0.id })
-                } else {
-                    allQuestionIds = Set()
-                }
-
-                var statistics: [Int: [String: Int]] = [:]
-                var answerDisplayNames: [Int: [String: String]] = [:]
-                var questionTexts: [Int: String] = [:]
-
-                // Initialize statistics for all questions
-                for questionId in allQuestionIds {
-                    statistics[questionId] = [
-                        "yes": 0,
-                        "no": 0,
-                        "unanswered": 0
-                    ]
-                }
-
-                if let questions = self.questionnaireData?.questionnaire.questions {
-                    for question in questions {
-                        questionTexts[question.id] = question.question
-                    }
-                }
+                var allQuestionKeys = Set<String>()
+                var statistics: [String: [String: Int]] = [:]
+                var answerDisplayNames: [String: [String: String]] = [:]
+                var questionTexts: [String: String] = [:]
+                var questionIds: [String: Int] = [:]
+                var questionnaireNames: [String: String] = [:]
 
                 var processedFiles = 0
 
@@ -779,12 +676,35 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 for record in records {
                     let exportEntry = record.survey
                     processedFiles += 1
+                    let questionnaireKey = self.aggregationQuestionnaireKey(for: exportEntry)
+                    questionnaireNames[questionnaireKey] = self.aggregationQuestionnaireName(for: exportEntry)
+                    let expectedQuestionKeys = self.expectedAggregationQuestionKeys(
+                        for: exportEntry,
+                        questionTexts: &questionTexts,
+                        questionIds: &questionIds,
+                        questionnaireNames: &questionnaireNames
+                    )
+                    allQuestionKeys.formUnion(expectedQuestionKeys)
 
-                    // Track question IDs that appear in this response
-                    var currentResponseQuestionIds: Set<Int> = []
+                    for questionKey in expectedQuestionKeys where statistics[questionKey] == nil {
+                        statistics[questionKey] = [
+                            "yes": 0,
+                            "no": 0,
+                            "unanswered": 0
+                        ]
+                    }
+
+                    // Track questions that appear in this response
+                    var currentResponseQuestionKeys: Set<String> = []
 
                     for item in exportEntry.matchedQuestions {
-                        currentResponseQuestionIds.insert(item.matchedQuestionId)
+                        let questionKey = self.aggregationQuestionKey(
+                            questionnaireKey: questionnaireKey,
+                            questionId: item.matchedQuestionId
+                        )
+                        allQuestionKeys.insert(questionKey)
+                        currentResponseQuestionKeys.insert(questionKey)
+                        questionIds[questionKey] = item.matchedQuestionId
 
                         let preferredAnswer = item.finalAnswer ?? item.extractedAnswer
                         guard let answer = preferredAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty else {
@@ -808,30 +728,30 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                             answerType = normalizedAnswer
                         }
 
-                        statistics[item.matchedQuestionId, default: [:]][answerType, default: 0] += 1
+                        statistics[questionKey, default: [:]][answerType, default: 0] += 1
 
-                        if answerDisplayNames[item.matchedQuestionId] == nil {
-                            answerDisplayNames[item.matchedQuestionId] = [:]
+                        if answerDisplayNames[questionKey] == nil {
+                            answerDisplayNames[questionKey] = [:]
                         }
 
                         // Save original answer for display (if yes/no type, save an example)
                         if answerType == "yes" || answerType == "no" {
-                            if answerDisplayNames[item.matchedQuestionId]?[answerType] == nil {
-                                answerDisplayNames[item.matchedQuestionId]?[answerType] = answerType == "yes" ? "Yes" : "No"
+                            if answerDisplayNames[questionKey]?[answerType] == nil {
+                                answerDisplayNames[questionKey]?[answerType] = answerType == "yes" ? "Yes" : "No"
                             }
                         } else {
-                            answerDisplayNames[item.matchedQuestionId]?[answerType] = answer
+                            answerDisplayNames[questionKey]?[answerType] = answer
                         }
 
-                        if questionTexts[item.matchedQuestionId] == nil {
-                            questionTexts[item.matchedQuestionId] = item.matchedQuestion
+                        if questionTexts[questionKey] == nil {
+                            questionTexts[questionKey] = item.matchedQuestion
                         }
                     }
 
-                    // For questions that don't appear in this response, mark as unanswered
-                    for questionId in allQuestionIds {
-                        if !currentResponseQuestionIds.contains(questionId) {
-                            statistics[questionId, default: [:]]["unanswered", default: 0] += 1
+                    // For questions from this session's questionnaire snapshot that don't appear, mark unanswered.
+                    for questionKey in expectedQuestionKeys {
+                        if !currentResponseQuestionKeys.contains(questionKey) {
+                            statistics[questionKey, default: [:]]["unanswered", default: 0] += 1
                         }
                     }
                 }
@@ -848,13 +768,24 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 }
 
                 var summary = "Analyzed \(processedFiles) session package(s).\n\n"
-                let sortedQuestionIds = allQuestionIds.sorted()
+                let sortedQuestionKeys = self.sortedAggregationQuestionKeys(
+                    Array(allQuestionKeys),
+                    questionIds: questionIds,
+                    questionnaireNames: questionnaireNames
+                )
 
-                for questionId in sortedQuestionIds {
-                    let questionTitle = questionTexts[questionId] ?? "Question \(questionId)"
+                var currentQuestionnaireName: String?
+                for questionKey in sortedQuestionKeys {
+                    let questionnaireName = questionnaireNames[self.questionnaireKey(from: questionKey)] ?? "Unknown Questionnaire"
+                    if questionnaireName != currentQuestionnaireName {
+                        summary += "Questionnaire: \(questionnaireName)\n"
+                        currentQuestionnaireName = questionnaireName
+                    }
+                    let questionId = questionIds[questionKey] ?? 0
+                    let questionTitle = questionTexts[questionKey] ?? "Question \(questionId)"
                     summary += "Question \(questionId): \(questionTitle)\n"
 
-                    let answerCounts = statistics[questionId] ?? [:]
+                    let answerCounts = statistics[questionKey] ?? [:]
 
                     // Display yes, no, unanswered statistics
                     let yesCount = answerCounts["yes"] ?? 0
@@ -872,7 +803,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     // Display other answer types (if any)
                     let otherAnswers = answerCounts.filter { $0.key != "yes" && $0.key != "no" && $0.key != "unanswered" }
                     for (answerKey, count) in otherAnswers.sorted(by: { $0.value > $1.value }) {
-                        let displayText = answerDisplayNames[questionId]?[answerKey] ?? answerKey
+                        let displayText = answerDisplayNames[questionKey]?[answerKey] ?? answerKey
                         summary += "  - \(displayText): \(count)\n"
                     }
 
@@ -884,6 +815,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     statistics: statistics,
                     answerDisplayNames: answerDisplayNames,
                     questionTexts: questionTexts,
+                    questionIds: questionIds,
+                    questionnaireNames: questionnaireNames,
                     processedFiles: processedFiles
                 )
 
@@ -913,6 +846,98 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 
+    private func aggregationQuestionnaireKey(for survey: ExportedSurvey) -> String {
+        if let questionnaire = survey.metadata?.questionnaire {
+            let id = questionnaire.id?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let version = questionnaire.version?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let id, !id.isEmpty, let version, !version.isEmpty {
+                return "\(id)::\(version)"
+            }
+            if let id, !id.isEmpty {
+                return id
+            }
+        }
+
+        let title = aggregationQuestionnaireName(for: survey)
+        return "title::\(title)"
+    }
+
+    private func aggregationQuestionnaireName(for survey: ExportedSurvey) -> String {
+        let title = survey.metadata?.questionnaire?.title ?? survey.metadata?.questionnaireTitle
+        let trimmedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let version = survey.metadata?.questionnaire?.version?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let trimmedTitle, !trimmedTitle.isEmpty else {
+            return "Unknown Questionnaire"
+        }
+
+        if let version, !version.isEmpty {
+            return "\(trimmedTitle) v\(version)"
+        }
+        return trimmedTitle
+    }
+
+    private func aggregationQuestionKey(questionnaireKey: String, questionId: Int) -> String {
+        return "\(questionnaireKey)::q\(questionId)"
+    }
+
+    private func questionnaireKey(from questionKey: String) -> String {
+        guard let range = questionKey.range(of: "::q", options: .backwards) else {
+            return questionKey
+        }
+        return String(questionKey[..<range.lowerBound])
+    }
+
+    private func expectedAggregationQuestionKeys(
+        for survey: ExportedSurvey,
+        questionTexts: inout [String: String],
+        questionIds: inout [String: Int],
+        questionnaireNames: inout [String: String]
+    ) -> Set<String> {
+        let questionnaireKey = aggregationQuestionnaireKey(for: survey)
+        questionnaireNames[questionnaireKey] = aggregationQuestionnaireName(for: survey)
+
+        if let questions = survey.metadata?.questionnaire?.questions, !questions.isEmpty {
+            return Set(questions.map { question in
+                let questionKey = aggregationQuestionKey(questionnaireKey: questionnaireKey, questionId: question.id)
+                questionTexts[questionKey] = question.question
+                questionIds[questionKey] = question.id
+                return questionKey
+            })
+        }
+
+        // Older packages did not store the full questionnaire snapshot, so only questions that
+        // appear in matched answers can be aggregated without guessing from the current app state.
+        return Set(survey.matchedQuestions.map { item in
+            let questionKey = aggregationQuestionKey(questionnaireKey: questionnaireKey, questionId: item.matchedQuestionId)
+            if questionTexts[questionKey] == nil {
+                questionTexts[questionKey] = item.matchedQuestion
+            }
+            questionIds[questionKey] = item.matchedQuestionId
+            return questionKey
+        })
+    }
+
+    private func sortedAggregationQuestionKeys(
+        _ questionKeys: [String],
+        questionIds: [String: Int],
+        questionnaireNames: [String: String]
+    ) -> [String] {
+        return questionKeys.sorted { lhs, rhs in
+            let lhsQuestionnaire = questionnaireNames[questionnaireKey(from: lhs)] ?? ""
+            let rhsQuestionnaire = questionnaireNames[questionnaireKey(from: rhs)] ?? ""
+            if lhsQuestionnaire != rhsQuestionnaire {
+                return lhsQuestionnaire < rhsQuestionnaire
+            }
+            let lhsId = questionIds[lhs] ?? Int.max
+            let rhsId = questionIds[rhs] ?? Int.max
+            if lhsId != rhsId {
+                return lhsId < rhsId
+            }
+            return lhs < rhs
+        }
+    }
+
     // Export aggregation results as JSON
     private func exportAggregationJSON(result: AggregationResult) {
         let dateFormatter = DateFormatter()
@@ -924,25 +949,31 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             "export_info": [
                 "export_time": timestampString,
                 "total_files_processed": result.processedFiles,
-                "questionnaire_title": questionnaireData?.questionnaire.title ?? "Unknown"
+                "questionnaire_titles": Array(Set(result.questionnaireNames.values)).sorted()
             ],
             "aggregation_summary": result.summary,
             "statistics": [:]
         ]
 
         // Add statistics
-        let sortedQuestionIds = result.statistics.keys.sorted()
+        let sortedQuestionKeys = sortedAggregationQuestionKeys(
+            Array(result.statistics.keys),
+            questionIds: result.questionIds,
+            questionnaireNames: result.questionnaireNames
+        )
         var statisticsDict: [String: Any] = [:]
 
-        for questionId in sortedQuestionIds {
-            let questionTitle = result.questionTexts[questionId] ?? "Question \(questionId)"
+        for questionKey in sortedQuestionKeys {
+            let questionId = result.questionIds[questionKey] ?? 0
+            let questionTitle = result.questionTexts[questionKey] ?? "Question \(questionId)"
             var questionData: [String: Any] = [
+                "questionnaire": result.questionnaireNames[questionnaireKey(from: questionKey)] ?? "Unknown Questionnaire",
                 "question_id": questionId,
                 "question_text": questionTitle,
                 "answers": []
             ]
 
-            let answerCounts = result.statistics[questionId] ?? [:]
+            let answerCounts = result.statistics[questionKey] ?? [:]
             let sortedAnswers = answerCounts.sorted { lhs, rhs in
                 if lhs.value == rhs.value {
                     return lhs.key < rhs.key
@@ -952,7 +983,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
             var answersArray: [[String: Any]] = []
             for (answerKey, count) in sortedAnswers {
-                let displayText = result.answerDisplayNames[questionId]?[answerKey] ?? answerKey
+                let displayText = result.answerDisplayNames[questionKey]?[answerKey] ?? answerKey
                 answersArray.append([
                     "answer": displayText,
                     "count": count
@@ -960,7 +991,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
 
             questionData["answers"] = answersArray
-            statisticsDict["question_\(questionId)"] = questionData
+            statisticsDict[questionKey] = questionData
         }
 
         jsonData["statistics"] = statisticsDict
@@ -1582,6 +1613,23 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let title: String
         let description: String
         let hash: String?
+        let questions: [SessionPackageQuestion]
+    }
+
+    private struct SessionPackageQuestion: Encodable {
+        let id: Int
+        let question: String
+        let type: String
+        let followUp: String?
+        let keywords: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case question
+            case type
+            case followUp = "follow_up"
+            case keywords
+        }
     }
 
     private struct SessionPackageCloud: Encodable {
@@ -1685,7 +1733,16 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 version: $0.questionnaire.version,
                 title: $0.questionnaire.title,
                 description: $0.questionnaire.description,
-                hash: $0.questionnaire.hash
+                hash: $0.questionnaire.hash,
+                questions: $0.questionnaire.questions.map {
+                    SessionPackageQuestion(
+                        id: $0.id,
+                        question: $0.question,
+                        type: $0.type,
+                        followUp: $0.followUp,
+                        keywords: $0.keywords
+                    )
+                }
             )
         }
         let cloud = cloudSessionId.flatMap { cloudSessionId in
@@ -1787,8 +1844,22 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("version", jsonString(questionnaire.version)),
             ("title", jsonString(questionnaire.title)),
             ("description", jsonString(questionnaire.description)),
-            ("hash", jsonString(questionnaire.hash))
+            ("hash", jsonString(questionnaire.hash)),
+            ("questions", sessionPackageQuestionsJSON(questionnaire.questions, indent: indent + 1))
         ], indent: indent)
+    }
+
+    private func sessionPackageQuestionsJSON(_ questions: [SessionPackageQuestion], indent: Int) -> String {
+        let values = questions.map { question in
+            orderedObject([
+                ("id", jsonNumber(question.id)),
+                ("question", jsonString(question.question)),
+                ("type", jsonString(question.type)),
+                ("follow_up", jsonString(question.followUp)),
+                ("keywords", jsonStringArray(question.keywords, indent: indent + 1))
+            ], indent: indent + 1)
+        }
+        return orderedArray(values, indent: indent)
     }
 
     private func cloudJSON(_ cloud: SessionPackageCloud, indent: Int) -> String {
@@ -1893,6 +1964,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func jsonString(_ value: String?) -> String? {
         guard let value else { return nil }
         return jsonFragment(value)
+    }
+
+    private func jsonStringArray(_ values: [String], indent: Int) -> String {
+        return orderedArray(values.map { jsonFragment($0) }, indent: indent)
     }
 
     private func jsonNumber(_ value: Int?) -> String? {
@@ -2066,32 +2141,80 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func transcriptSnippet(for matched: MatchedQuestion, question: Question?, transcription: String) -> String {
-        let normalizedTranscript = transcription.lowercased()
-        var phrases = [matched.matchedQuestion]
-        if let questionText = question?.question {
-            phrases.append(questionText)
-        }
-        phrases.append(contentsOf: question?.keywords ?? [])
+        let text = transcription.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return transcription }
 
-        let candidateTerms = phrases
-            .flatMap { phrase in
-                phrase
-                    .lowercased()
-                    .components(separatedBy: CharacterSet.alphanumerics.inverted)
-                    .filter { $0.count >= 4 }
+        let lowerText = text.lowercased()
+        let lowerNSString = lowerText as NSString
+
+        func rangeOfPhrase(_ phrase: String?) -> NSRange? {
+            guard let phrase else { return nil }
+            let normalized = phrase
+                .lowercased()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard normalized.count >= 4 else { return nil }
+
+            let range = lowerNSString.range(of: normalized)
+            return range.location == NSNotFound ? nil : range
+        }
+
+        func trimmedSubstring(location: Int, length: Int) -> String {
+            let boundedLocation = max(0, min(location, lowerNSString.length))
+            let boundedEnd = max(boundedLocation, min(boundedLocation + length, lowerNSString.length))
+            let start = String.Index(utf16Offset: boundedLocation, in: text)
+            let end = String.Index(utf16Offset: boundedEnd, in: text)
+            return String(text[start..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let questionRange = [
+            question?.question,
+            matched.matchedQuestion
+        ].compactMap { rangeOfPhrase($0) }.first
+
+        if let questionRange {
+            let followingQuestionRanges = (questionnaireData?.questionnaire.questions ?? [])
+                .filter { $0.id != matched.matchedQuestionId }
+                .compactMap { rangeOfPhrase($0.question) }
+                .filter { $0.location > questionRange.location }
+                .sorted { $0.location < $1.location }
+
+            let segmentEnd = followingQuestionRanges.first?.location ?? lowerNSString.length
+            let segmentLength = min(max(segmentEnd - questionRange.location, questionRange.length), 360)
+            let segment = trimmedSubstring(location: questionRange.location, length: segmentLength)
+            if !segment.isEmpty {
+                return segment
             }
-
-        if let term = candidateTerms.first(where: { normalizedTranscript.range(of: $0) != nil }),
-           let range = normalizedTranscript.range(of: term) {
-            let start = transcription.index(range.lowerBound, offsetBy: -120, limitedBy: transcription.startIndex) ?? transcription.startIndex
-            let end = transcription.index(range.upperBound, offsetBy: 220, limitedBy: transcription.endIndex) ?? transcription.endIndex
-            return String(transcription[start..<end])
         }
 
-        if transcription.count > 500 {
-            return String(transcription.prefix(500)) + "..."
+        let answerRange = [
+            matched.finalAnswer,
+            matched.extractedAnswer
+        ].compactMap { rangeOfPhrase($0) }.first
+
+        if let answerRange {
+            let location = max(0, answerRange.location - 80)
+            let length = min(220, lowerNSString.length - location)
+            let segment = trimmedSubstring(location: location, length: length)
+            if !segment.isEmpty {
+                return segment
+            }
         }
-        return transcription
+
+        let keywordRange = (question?.keywords ?? [])
+            .sorted { $0.count > $1.count }
+            .compactMap { rangeOfPhrase($0) }
+            .first
+
+        if let keywordRange {
+            let location = max(0, keywordRange.location - 60)
+            let length = min(220, lowerNSString.length - location)
+            let segment = trimmedSubstring(location: location, length: length)
+            if !segment.isEmpty {
+                return segment
+            }
+        }
+
+        return text.count > 240 ? String(text.prefix(240)) + "..." : text
     }
 
     private func finalizeLLMResults(
@@ -2193,10 +2316,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
         }
 
-        // Show results in alert
-        let alert = UIAlertController(title: "Analysis Results", message: resultText, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "OK", style: .default))
-        present(alert, animated: true)
+        showScrollableContent(title: "Analysis Results", content: resultText)
     }
 
     // MARK: - AVAudioPlayerDelegate
@@ -3190,7 +3310,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     // Show location aggregation view
                     let locationVC = LocationAggregationViewController()
                     locationVC.locationData = locationData
-                    locationVC.questionnaireData = self.questionnaireData
                     locationVC.exportsDirectory = try? self.ensureExportsDirectory()
 
                     let navController = UINavigationController(rootViewController: locationVC)

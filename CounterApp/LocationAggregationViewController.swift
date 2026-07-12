@@ -4,7 +4,6 @@ class LocationAggregationViewController: UIViewController {
     
     // MARK: - Properties
     var locationData: [String: [ExportedSurvey]] = [:]
-    var questionnaireData: QuestionnaireData?
     var exportsDirectory: URL?
     
     // MARK: - UI Elements
@@ -53,39 +52,42 @@ class LocationAggregationViewController: UIViewController {
     
     // MARK: - Aggregation Helpers
     private func aggregateForLocation(_ location: String, surveys: [ExportedSurvey]) -> AggregationResult {
-        // Get all question IDs
-        let allQuestionIds: Set<Int>
-        if let questions = questionnaireData?.questionnaire.questions {
-            allQuestionIds = Set(questions.map { $0.id })
-        } else {
-            allQuestionIds = Set()
-        }
-        
-        var statistics: [Int: [String: Int]] = [:]
-        var answerDisplayNames: [Int: [String: String]] = [:]
-        var questionTexts: [Int: String] = [:]
-        
-        // Initialize statistics for all questions
-        for questionId in allQuestionIds {
-            statistics[questionId] = [
-                "yes": 0,
-                "no": 0,
-                "unanswered": 0
-            ]
-        }
-        
-        if let questions = questionnaireData?.questionnaire.questions {
-            for question in questions {
-                questionTexts[question.id] = question.question
-            }
-        }
+        var allQuestionKeys = Set<String>()
+        var statistics: [String: [String: Int]] = [:]
+        var answerDisplayNames: [String: [String: String]] = [:]
+        var questionTexts: [String: String] = [:]
+        var questionIds: [String: Int] = [:]
+        var questionnaireNames: [String: String] = [:]
         
         // Process responses
         for survey in surveys {
-            var currentResponseQuestionIds: Set<Int> = []
+            let questionnaireKey = aggregationQuestionnaireKey(for: survey)
+            questionnaireNames[questionnaireKey] = aggregationQuestionnaireName(for: survey)
+            let expectedQuestionKeys = expectedAggregationQuestionKeys(
+                for: survey,
+                questionTexts: &questionTexts,
+                questionIds: &questionIds,
+                questionnaireNames: &questionnaireNames
+            )
+            allQuestionKeys.formUnion(expectedQuestionKeys)
+            for questionKey in expectedQuestionKeys where statistics[questionKey] == nil {
+                statistics[questionKey] = [
+                    "yes": 0,
+                    "no": 0,
+                    "unanswered": 0
+                ]
+            }
+
+            var currentResponseQuestionKeys: Set<String> = []
             
             for item in survey.matchedQuestions {
-                currentResponseQuestionIds.insert(item.matchedQuestionId)
+                let questionKey = aggregationQuestionKey(
+                    questionnaireKey: questionnaireKey,
+                    questionId: item.matchedQuestionId
+                )
+                allQuestionKeys.insert(questionKey)
+                currentResponseQuestionKeys.insert(questionKey)
+                questionIds[questionKey] = item.matchedQuestionId
                 
                 let preferredAnswer = item.finalAnswer ?? item.extractedAnswer
                 guard let answer = preferredAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty else {
@@ -108,29 +110,29 @@ class LocationAggregationViewController: UIViewController {
                     answerType = normalizedAnswer
                 }
                 
-                statistics[item.matchedQuestionId, default: [:]][answerType, default: 0] += 1
+                statistics[questionKey, default: [:]][answerType, default: 0] += 1
                 
-                if answerDisplayNames[item.matchedQuestionId] == nil {
-                    answerDisplayNames[item.matchedQuestionId] = [:]
+                if answerDisplayNames[questionKey] == nil {
+                    answerDisplayNames[questionKey] = [:]
                 }
                 
                 if answerType == "yes" || answerType == "no" {
-                    if answerDisplayNames[item.matchedQuestionId]?[answerType] == nil {
-                        answerDisplayNames[item.matchedQuestionId]?[answerType] = answerType == "yes" ? "Yes" : "No"
+                    if answerDisplayNames[questionKey]?[answerType] == nil {
+                        answerDisplayNames[questionKey]?[answerType] = answerType == "yes" ? "Yes" : "No"
                     }
                 } else {
-                    answerDisplayNames[item.matchedQuestionId]?[answerType] = answer
+                    answerDisplayNames[questionKey]?[answerType] = answer
                 }
                 
-                if questionTexts[item.matchedQuestionId] == nil {
-                    questionTexts[item.matchedQuestionId] = item.matchedQuestion
+                if questionTexts[questionKey] == nil {
+                    questionTexts[questionKey] = item.matchedQuestion
                 }
             }
             
             // Mark unanswered questions
-            for questionId in allQuestionIds {
-                if !currentResponseQuestionIds.contains(questionId) {
-                    statistics[questionId, default: [:]]["unanswered", default: 0] += 1
+            for questionKey in expectedQuestionKeys {
+                if !currentResponseQuestionKeys.contains(questionKey) {
+                    statistics[questionKey, default: [:]]["unanswered", default: 0] += 1
                 }
             }
         }
@@ -139,12 +141,23 @@ class LocationAggregationViewController: UIViewController {
         var summary = "Location: \(location)\n"
         summary += "Total Surveys: \(surveys.count)\n\n"
         
-        let sortedQuestionIds = allQuestionIds.sorted()
-        for questionId in sortedQuestionIds {
-            let questionTitle = questionTexts[questionId] ?? "Question \(questionId)"
+        let sortedQuestionKeys = sortedAggregationQuestionKeys(
+            Array(allQuestionKeys),
+            questionIds: questionIds,
+            questionnaireNames: questionnaireNames
+        )
+        var currentQuestionnaireName: String?
+        for questionKey in sortedQuestionKeys {
+            let questionnaireName = questionnaireNames[questionnaireKey(from: questionKey)] ?? "Unknown Questionnaire"
+            if questionnaireName != currentQuestionnaireName {
+                summary += "Questionnaire: \(questionnaireName)\n"
+                currentQuestionnaireName = questionnaireName
+            }
+            let questionId = questionIds[questionKey] ?? 0
+            let questionTitle = questionTexts[questionKey] ?? "Question \(questionId)"
             summary += "Question \(questionId): \(questionTitle)\n"
             
-            let answerCounts = statistics[questionId] ?? [:]
+            let answerCounts = statistics[questionKey] ?? [:]
             let yesCount = answerCounts["yes"] ?? 0
             let noCount = answerCounts["no"] ?? 0
             let unansweredCount = answerCounts["unanswered"] ?? 0
@@ -159,7 +172,7 @@ class LocationAggregationViewController: UIViewController {
             
             let otherAnswers = answerCounts.filter { $0.key != "yes" && $0.key != "no" && $0.key != "unanswered" }
             for (answerKey, count) in otherAnswers.sorted(by: { $0.value > $1.value }) {
-                let displayText = answerDisplayNames[questionId]?[answerKey] ?? answerKey
+                let displayText = answerDisplayNames[questionKey]?[answerKey] ?? answerKey
                 summary += "  - \(displayText): \(count)\n"
             }
             
@@ -171,8 +184,100 @@ class LocationAggregationViewController: UIViewController {
             statistics: statistics,
             answerDisplayNames: answerDisplayNames,
             questionTexts: questionTexts,
+            questionIds: questionIds,
+            questionnaireNames: questionnaireNames,
             processedFiles: surveys.count
         )
+    }
+
+    private func aggregationQuestionnaireKey(for survey: ExportedSurvey) -> String {
+        if let questionnaire = survey.metadata?.questionnaire {
+            let id = questionnaire.id?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let version = questionnaire.version?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let id, !id.isEmpty, let version, !version.isEmpty {
+                return "\(id)::\(version)"
+            }
+            if let id, !id.isEmpty {
+                return id
+            }
+        }
+
+        let title = aggregationQuestionnaireName(for: survey)
+        return "title::\(title)"
+    }
+
+    private func aggregationQuestionnaireName(for survey: ExportedSurvey) -> String {
+        let title = survey.metadata?.questionnaire?.title ?? survey.metadata?.questionnaireTitle
+        let trimmedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let version = survey.metadata?.questionnaire?.version?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let trimmedTitle, !trimmedTitle.isEmpty else {
+            return "Unknown Questionnaire"
+        }
+
+        if let version, !version.isEmpty {
+            return "\(trimmedTitle) v\(version)"
+        }
+        return trimmedTitle
+    }
+
+    private func aggregationQuestionKey(questionnaireKey: String, questionId: Int) -> String {
+        return "\(questionnaireKey)::q\(questionId)"
+    }
+
+    private func questionnaireKey(from questionKey: String) -> String {
+        guard let range = questionKey.range(of: "::q", options: .backwards) else {
+            return questionKey
+        }
+        return String(questionKey[..<range.lowerBound])
+    }
+
+    private func expectedAggregationQuestionKeys(
+        for survey: ExportedSurvey,
+        questionTexts: inout [String: String],
+        questionIds: inout [String: Int],
+        questionnaireNames: inout [String: String]
+    ) -> Set<String> {
+        let questionnaireKey = aggregationQuestionnaireKey(for: survey)
+        questionnaireNames[questionnaireKey] = aggregationQuestionnaireName(for: survey)
+
+        if let questions = survey.metadata?.questionnaire?.questions, !questions.isEmpty {
+            return Set(questions.map { question in
+                let questionKey = aggregationQuestionKey(questionnaireKey: questionnaireKey, questionId: question.id)
+                questionTexts[questionKey] = question.question
+                questionIds[questionKey] = question.id
+                return questionKey
+            })
+        }
+
+        return Set(survey.matchedQuestions.map { item in
+            let questionKey = aggregationQuestionKey(questionnaireKey: questionnaireKey, questionId: item.matchedQuestionId)
+            if questionTexts[questionKey] == nil {
+                questionTexts[questionKey] = item.matchedQuestion
+            }
+            questionIds[questionKey] = item.matchedQuestionId
+            return questionKey
+        })
+    }
+
+    private func sortedAggregationQuestionKeys(
+        _ questionKeys: [String],
+        questionIds: [String: Int],
+        questionnaireNames: [String: String]
+    ) -> [String] {
+        return questionKeys.sorted { lhs, rhs in
+            let lhsQuestionnaire = questionnaireNames[questionnaireKey(from: lhs)] ?? ""
+            let rhsQuestionnaire = questionnaireNames[questionnaireKey(from: rhs)] ?? ""
+            if lhsQuestionnaire != rhsQuestionnaire {
+                return lhsQuestionnaire < rhsQuestionnaire
+            }
+            let lhsId = questionIds[lhs] ?? Int.max
+            let rhsId = questionIds[rhs] ?? Int.max
+            if lhsId != rhsId {
+                return lhsId < rhsId
+            }
+            return lhs < rhs
+        }
     }
     
     private func exportLocationData(_ location: String, surveys: [ExportedSurvey], result: AggregationResult) {
@@ -191,7 +296,7 @@ class LocationAggregationViewController: UIViewController {
                 "export_time": timestampString,
                 "location": location,
                 "total_responses": surveys.count,
-                "questionnaire_title": questionnaireData?.questionnaire.title ?? "Unknown"
+                "questionnaire_titles": Array(Set(result.questionnaireNames.values)).sorted()
             ],
             "aggregation_summary": result.summary,
             "statistics": [:],
@@ -221,18 +326,24 @@ class LocationAggregationViewController: UIViewController {
         ]
         
         // Add statistics
-        let sortedQuestionIds = result.statistics.keys.sorted()
+        let sortedQuestionKeys = sortedAggregationQuestionKeys(
+            Array(result.statistics.keys),
+            questionIds: result.questionIds,
+            questionnaireNames: result.questionnaireNames
+        )
         var statisticsDict: [String: Any] = [:]
         
-        for questionId in sortedQuestionIds {
-            let questionTitle = result.questionTexts[questionId] ?? "Question \(questionId)"
+        for questionKey in sortedQuestionKeys {
+            let questionId = result.questionIds[questionKey] ?? 0
+            let questionTitle = result.questionTexts[questionKey] ?? "Question \(questionId)"
             var questionData: [String: Any] = [
+                "questionnaire": result.questionnaireNames[questionnaireKey(from: questionKey)] ?? "Unknown Questionnaire",
                 "question_id": questionId,
                 "question_text": questionTitle,
                 "answers": []
             ]
             
-            let answerCounts = result.statistics[questionId] ?? [:]
+            let answerCounts = result.statistics[questionKey] ?? [:]
             let sortedAnswers = answerCounts.sorted { lhs, rhs in
                 if lhs.value == rhs.value {
                     return lhs.key < rhs.key
@@ -242,7 +353,7 @@ class LocationAggregationViewController: UIViewController {
             
             var answersArray: [[String: Any]] = []
             for (answerKey, count) in sortedAnswers {
-                let displayText = result.answerDisplayNames[questionId]?[answerKey] ?? answerKey
+                let displayText = result.answerDisplayNames[questionKey]?[answerKey] ?? answerKey
                 answersArray.append([
                     "answer": displayText,
                     "count": count
@@ -250,7 +361,7 @@ class LocationAggregationViewController: UIViewController {
             }
             
             questionData["answers"] = answersArray
-            statisticsDict["question_\(questionId)"] = questionData
+            statisticsDict[questionKey] = questionData
         }
         
         jsonData["statistics"] = statisticsDict
@@ -363,8 +474,10 @@ extension LocationAggregationViewController: UITableViewDelegate {
 // MARK: - AggregationResult
 private struct AggregationResult {
     let summary: String
-    let statistics: [Int: [String: Int]]
-    let answerDisplayNames: [Int: [String: String]]
-    let questionTexts: [Int: String]
+    let statistics: [String: [String: Int]]
+    let answerDisplayNames: [String: [String: String]]
+    let questionTexts: [String: String]
+    let questionIds: [String: Int]
+    let questionnaireNames: [String: String]
     let processedFiles: Int
 }

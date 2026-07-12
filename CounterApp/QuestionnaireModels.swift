@@ -169,10 +169,23 @@ struct ExportedSurvey: Decodable {
 
 struct ExportedSurveyMetadata: Decodable {
     let localSessionId: String?
+    let questionnaireTitle: String?
+    let questionnaire: ExportedQuestionnaire?
 
     enum CodingKeys: String, CodingKey {
         case localSessionId = "local_session_id"
+        case questionnaireTitle = "questionnaire_title"
+        case questionnaire
     }
+}
+
+struct ExportedQuestionnaire: Decodable {
+    let id: String?
+    let version: String?
+    let title: String?
+    let description: String?
+    let hash: String?
+    let questions: [Question]?
 }
 
 struct ExportedMatchedQuestion: Decodable {
