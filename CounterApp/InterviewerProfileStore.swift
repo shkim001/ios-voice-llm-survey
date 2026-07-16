@@ -69,6 +69,14 @@ final class InterviewerProfileStore {
         defaults.set(profile.interviewerId, forKey: DefaultsKeys.currentInterviewerId)
     }
 
+    func deleteProfile(interviewerId: String) {
+        let updated = profiles.filter { $0.interviewerId != interviewerId }
+        saveProfiles(updated)
+        if defaults.string(forKey: DefaultsKeys.currentInterviewerId) == interviewerId {
+            clearCurrentProfile()
+        }
+    }
+
     func clearCurrentProfile() {
         defaults.removeObject(forKey: DefaultsKeys.currentInterviewerId)
     }

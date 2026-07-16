@@ -2868,9 +2868,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         alert.addAction(UIAlertAction(title: "Configure Interviewer", style: .default) { [weak self] _ in
             self?.showInterviewerProfileInput()
         })
-        if InterviewerProfileStore.shared.profiles.count > 1 {
-            alert.addAction(UIAlertAction(title: "Select Saved Interviewer", style: .default) { [weak self] _ in
-                self?.showSavedInterviewerSelection()
+        alert.addAction(UIAlertAction(title: "Select Saved Interviewer", style: .default) { [weak self] _ in
+            self?.showSavedInterviewerSelection()
+        })
+        if !InterviewerProfileStore.shared.profiles.isEmpty {
+            alert.addAction(UIAlertAction(title: "Delete Saved Interviewer", style: .destructive) { [weak self] _ in
+                self?.showSavedInterviewerDeletion()
             })
         }
 
@@ -3161,7 +3164,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func showSavedInterviewerSelection() {
         let profiles = InterviewerProfileStore.shared.profiles
         guard !profiles.isEmpty else {
-            showMessage("No saved interviewers")
+            showMessage("None saved")
             return
         }
 
@@ -3188,6 +3191,52 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             popover.permittedArrowDirections = []
         }
 
+        present(alert, animated: true)
+    }
+
+    private func showSavedInterviewerDeletion() {
+        let profiles = InterviewerProfileStore.shared.profiles
+        guard !profiles.isEmpty else {
+            showMessage("No saved interviewers")
+            return
+        }
+
+        let alert = UIAlertController(
+            title: "Delete Saved Interviewer",
+            message: "Remove a saved interviewer from this device. Existing session records will keep their saved interviewer name and email.",
+            preferredStyle: .actionSheet
+        )
+
+        let currentId = InterviewerProfileStore.shared.currentProfile?.interviewerId
+        for profile in profiles {
+            let marker = profile.interviewerId == currentId ? " (current)" : ""
+            alert.addAction(UIAlertAction(title: "\(profile.name) (\(profile.email))\(marker)", style: .destructive) { [weak self] _ in
+                self?.confirmDeleteSavedInterviewer(profile)
+            })
+        }
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+            popover.permittedArrowDirections = []
+        }
+
+        present(alert, animated: true)
+    }
+
+    private func confirmDeleteSavedInterviewer(_ profile: InterviewerProfile) {
+        let alert = UIAlertController(
+            title: "Delete \(profile.name)?",
+            message: "This removes \(profile.email) from saved interviewers on this device only. Past sessions and server records are not deleted.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+            InterviewerProfileStore.shared.deleteProfile(interviewerId: profile.interviewerId)
+            self?.showMessage("Deleted saved interviewer: \(profile.name)")
+        })
         present(alert, animated: true)
     }
 
