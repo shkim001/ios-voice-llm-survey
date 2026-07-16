@@ -375,6 +375,35 @@ final class LocalSessionDashboardViewController: UITableViewController {
     private var serverSummaries: [LocalSessionDashboardLibrary.ServerSessionSummary]
     private var loadingServerSessionIds: Set<String> = []
 
+    private lazy var refreshButton = UIBarButtonItem(
+        barButtonSystemItem: .refresh,
+        target: self,
+        action: #selector(refreshTapped)
+    )
+    private lazy var selectButton = UIBarButtonItem(
+        title: "Select",
+        style: .plain,
+        target: self,
+        action: #selector(selectTapped)
+    )
+    private lazy var cancelSelectionButton = UIBarButtonItem(
+        barButtonSystemItem: .cancel,
+        target: self,
+        action: #selector(cancelSelectionTapped)
+    )
+    private lazy var deleteSelectedButton = UIBarButtonItem(
+        title: "Delete",
+        style: .plain,
+        target: self,
+        action: #selector(deleteSelectedTapped)
+    )
+    private lazy var downloadSelectedButton = UIBarButtonItem(
+        title: "Get",
+        style: .plain,
+        target: self,
+        action: #selector(downloadSelectedTapped)
+    )
+
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
@@ -400,13 +429,37 @@ final class LocalSessionDashboardViewController: UITableViewController {
             target: self,
             action: #selector(closeTapped)
         )
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            barButtonSystemItem: .refresh,
-            target: self,
-            action: #selector(refreshTapped)
-        )
+        navigationItem.rightBarButtonItems = [refreshButton, selectButton]
+        tableView.allowsMultipleSelectionDuringEditing = true
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "DashboardCell")
         updateHeader()
+        updateBatchButtons()
+    }
+
+    override func setEditing(_ editing: Bool, animated: Bool) {
+        super.setEditing(editing, animated: animated)
+        tableView.setEditing(editing, animated: animated)
+        if editing {
+            navigationItem.leftBarButtonItem = cancelSelectionButton
+            navigationItem.rightBarButtonItems = nil
+            setToolbarItems([
+                deleteSelectedButton,
+                UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil),
+                downloadSelectedButton
+            ], animated: animated)
+            navigationController?.setToolbarHidden(false, animated: animated)
+        } else {
+            tableView.indexPathsForSelectedRows?.forEach { tableView.deselectRow(at: $0, animated: false) }
+            navigationItem.leftBarButtonItem = UIBarButtonItem(
+                barButtonSystemItem: .close,
+                target: self,
+                action: #selector(closeTapped)
+            )
+            navigationItem.rightBarButtonItems = [refreshButton, selectButton]
+            setToolbarItems(nil, animated: animated)
+            navigationController?.setToolbarHidden(true, animated: animated)
+        }
+        updateBatchButtons()
     }
 
     override func numberOfSections(in tableView: UITableView) -> Int {
@@ -464,6 +517,10 @@ final class LocalSessionDashboardViewController: UITableViewController {
     }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        guard !tableView.isEditing else {
+            updateBatchButtons()
+            return
+        }
         tableView.deselectRow(at: indexPath, animated: true)
         switch rows(for: indexPath.section)[indexPath.row] {
         case .session(let session):
@@ -471,6 +528,11 @@ final class LocalSessionDashboardViewController: UITableViewController {
         case .server(let summary):
             openServerSession(summary, indexPath: indexPath)
         }
+    }
+
+    override func tableView(_ tableView: UITableView, didDeselectRowAt indexPath: IndexPath) {
+        guard tableView.isEditing else { return }
+        updateBatchButtons()
     }
 
     private func updateHeader() {
@@ -496,7 +558,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
             return
         }
 
-        navigationItem.rightBarButtonItem?.isEnabled = false
+        refreshButton.isEnabled = false
         Task { [weak self] in
             do {
                 let response = try await SurveyAPIClient.shared.listAdminSessions()
@@ -505,21 +567,69 @@ final class LocalSessionDashboardViewController: UITableViewController {
                     guard let self else { return }
                     self.serverSummaries = LocalSessionDashboardLibrary.serverSummaries(from: response)
                     self.sessions = LocalSessionDashboardLibrary.loadSessions()
-                    self.navigationItem.rightBarButtonItem?.isEnabled = true
+                    self.refreshButton.isEnabled = true
                     self.updateHeader()
                     self.tableView.reloadData()
                 }
             } catch {
                 await MainActor.run {
-                    self?.navigationItem.rightBarButtonItem?.isEnabled = true
+                    self?.refreshButton.isEnabled = true
                     self?.showAlert(message: error.localizedDescription)
                 }
             }
         }
     }
 
+    @objc private func selectTapped() {
+        setEditing(true, animated: true)
+    }
+
+    @objc private func cancelSelectionTapped() {
+        setEditing(false, animated: true)
+    }
+
     @objc private func closeTapped() {
         dismiss(animated: true)
+    }
+
+    @objc private func deleteSelectedTapped() {
+        let selectedSessions = selectedDeviceSessions()
+        guard !selectedSessions.isEmpty else {
+            showAlert(message: "Select one or more local or cached sessions to delete.")
+            return
+        }
+
+        let localCount = selectedSessions.filter { $0.source == .local }.count
+        let cachedCount = selectedSessions.filter { $0.source == .cachedServer }.count
+        let pieces = [
+            localCount == 0 ? nil : "\(localCount) local",
+            cachedCount == 0 ? nil : "\(cachedCount) cached"
+        ].compactMap { $0 }.joined(separator: " and ")
+        let alert = UIAlertController(
+            title: "Delete Selected Sessions?",
+            message: "This removes \(pieces) session copy/copies from this iPad. Uploaded server packages are not deleted.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+            self?.deleteSelectedDeviceSessions(selectedSessions)
+        })
+        present(alert, animated: true)
+    }
+
+    @objc private func downloadSelectedTapped() {
+        let selectedSummaries = selectedServerSummaries()
+            .filter { !loadingServerSessionIds.contains($0.sessionId) }
+        guard !selectedSummaries.isEmpty else {
+            showAlert(message: "Select one or more server sessions to get.")
+            return
+        }
+        guard SurveyAPIClient.shared.isConfigured() else {
+            showAlert(message: "Survey API is not configured. Set Survey API Base URL in Settings.")
+            return
+        }
+
+        downloadServerSummaries(selectedSummaries)
     }
 
     private func rows(for section: Int) -> [Row] {
@@ -592,6 +702,96 @@ final class LocalSessionDashboardViewController: UITableViewController {
                     self?.loadingServerSessionIds.remove(summary.sessionId)
                     self?.tableView.reloadData()
                     self?.showAlert(message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func selectedRows() -> [Row] {
+        (tableView.indexPathsForSelectedRows ?? []).compactMap { indexPath in
+            let sectionRows = rows(for: indexPath.section)
+            guard indexPath.row < sectionRows.count else { return nil }
+            return sectionRows[indexPath.row]
+        }
+    }
+
+    private func selectedDeviceSessions() -> [LocalSessionDashboardSession] {
+        selectedRows().compactMap { row in
+            if case .session(let session) = row { return session }
+            return nil
+        }
+    }
+
+    private func selectedServerSummaries() -> [LocalSessionDashboardLibrary.ServerSessionSummary] {
+        selectedRows().compactMap { row in
+            if case .server(let summary) = row { return summary }
+            return nil
+        }
+    }
+
+    private func updateBatchButtons() {
+        let deviceCount = selectedDeviceSessions().count
+        let serverCount = selectedServerSummaries()
+            .filter { !loadingServerSessionIds.contains($0.sessionId) }
+            .count
+        deleteSelectedButton.isEnabled = deviceCount > 0
+        downloadSelectedButton.isEnabled = serverCount > 0
+        deleteSelectedButton.title = deviceCount > 0 ? "Delete (\(deviceCount))" : "Delete"
+        downloadSelectedButton.title = serverCount > 0 ? "Get (\(serverCount))" : "Get"
+    }
+
+    private func deleteSelectedDeviceSessions(_ selectedSessions: [LocalSessionDashboardSession]) {
+        var failures: [String] = []
+        for session in selectedSessions {
+            do {
+                try LocalSessionDashboardLibrary.deleteLocalCopy(session)
+            } catch {
+                failures.append("\(session.titleText): \(error.localizedDescription)")
+            }
+        }
+
+        setEditing(false, animated: true)
+        sessions = LocalSessionDashboardLibrary.loadSessions()
+        updateHeader()
+        tableView.reloadData()
+
+        if failures.isEmpty {
+            showAlert(message: "Deleted \(selectedSessions.count) selected session copy/copies from this iPad.")
+        } else {
+            showAlert(message: "Deleted \(selectedSessions.count - failures.count) session copy/copies. Failed:\n\(failures.joined(separator: "\n"))")
+        }
+    }
+
+    private func downloadServerSummaries(_ summaries: [LocalSessionDashboardLibrary.ServerSessionSummary]) {
+        loadingServerSessionIds.formUnion(summaries.map(\.sessionId))
+        refreshButton.isEnabled = false
+        setEditing(false, animated: true)
+        tableView.reloadData()
+
+        Task { [weak self] in
+            var successCount = 0
+            var failures: [String] = []
+            for summary in summaries {
+                do {
+                    let data = try await SurveyAPIClient.shared.fetchAdminSessionPackage(sessionId: summary.sessionId)
+                    _ = try LocalSessionDashboardLibrary.saveServerPackage(data: data, serverSessionId: summary.sessionId)
+                    successCount += 1
+                } catch {
+                    failures.append("\(summary.respondentName ?? summary.localSessionId ?? summary.sessionId): \(error.localizedDescription)")
+                }
+            }
+
+            await MainActor.run {
+                guard let self else { return }
+                summaries.forEach { self.loadingServerSessionIds.remove($0.sessionId) }
+                self.refreshButton.isEnabled = true
+                self.sessions = LocalSessionDashboardLibrary.loadSessions()
+                self.updateHeader()
+                self.tableView.reloadData()
+                if failures.isEmpty {
+                    self.showAlert(message: "Got \(successCount) server session package(s).")
+                } else {
+                    self.showAlert(message: "Got \(successCount) server session package(s). Failed:\n\(failures.joined(separator: "\n"))")
                 }
             }
         }

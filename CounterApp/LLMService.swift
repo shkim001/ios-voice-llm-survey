@@ -146,7 +146,7 @@ class LLMService {
         - For impression questions, capture the user's assessment (safe/unsafe, appealing/unappealing, etc.).
         - For multiple-choice questions, select only from the listed option codes.
         - For multiple-choice questions with multiple selections allowed, return all selected option codes in the order the user gave them.
-        - For multiple-choice questions, use both the spoken letter codes and the option labels to interpret the response. For example, if option A is "Shade", then "A", "ay", and "shade" can all refer to A.
+        - For multiple-choice questions, use both the spoken option codes/numbers and the option labels to interpret the response. For example, if option 1 is "Shade", then "1", "number one", "one", "first", and "shade" can all refer to option 1.
         - If the user gives an option code that is not listed, or if the chosen option is ambiguous, set `"clarification_needed": true` and `"confidence": "low"`.
         - If a question cannot be confidently matched, set `"clarification_needed": true` and `"confidence": "low"`.
         - Be concise, factual, and neutral in tone.
@@ -163,8 +163,8 @@ class LLMService {
             "matched_question_id": <question_id>,
             "matched_question": "<the question text>",
             "extracted_answer": "<user's extracted answer>",
-            "selected_option_codes": ["A", "C"],
-            "selected_option_labels": ["Option label for A", "Option label for C"],
+            "selected_option_codes": ["1", "3"],
+            "selected_option_labels": ["Option label for 1", "Option label for 3"],
             "confidence": "<high/medium/low>",
             "clarification_needed": <true/false>
           },
@@ -225,8 +225,13 @@ class LLMService {
             }
 
             let validCodes = Set(question.options.map { $0.code.uppercased() })
-            let selectedCodes = (match.selectedOptionCodes ?? codesFromAnswer(match.extractedAnswer))
-                .flatMap { codesFromAnswer($0).isEmpty ? [$0] : codesFromAnswer($0) }
+            let rawSelectedCodes = match.selectedOptionCodes ?? []
+            let sourceCodes = rawSelectedCodes.isEmpty ? codesFromAnswer(match.extractedAnswer, validCodes: validCodes) : rawSelectedCodes
+            let selectedCodes = sourceCodes
+                .flatMap {
+                    let parsedCodes = codesFromAnswer($0, validCodes: validCodes)
+                    return parsedCodes.isEmpty ? [$0] : parsedCodes
+                }
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
                 .filter { !$0.isEmpty }
             let uniqueCodes = Array(NSOrderedSet(array: selectedCodes)).compactMap { $0 as? String }
@@ -255,16 +260,53 @@ class LLMService {
         }
     }
 
-    private func codesFromAnswer(_ answer: String) -> [String] {
-        let pattern = #"\b[A-J]\b"#
+    private func codesFromAnswer(_ answer: String, validCodes: Set<String>) -> [String] {
+        let aliasToCode = optionCodeAliases(for: validCodes)
+        let alternatives = aliasToCode.keys
+            .filter { !$0.isEmpty }
+            .sorted { lhs, rhs in
+                if lhs.count == rhs.count { return lhs < rhs }
+                return lhs.count > rhs.count
+            }
+            .map { NSRegularExpression.escapedPattern(for: $0) }
+            .joined(separator: "|")
+        guard !alternatives.isEmpty else {
+            return []
+        }
+        let pattern = "(?<![A-Za-z0-9])(?:\(alternatives))(?![A-Za-z0-9])"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return []
         }
         let range = NSRange(answer.startIndex..<answer.endIndex, in: answer)
         return regex.matches(in: answer, options: [], range: range).compactMap { match in
             guard let codeRange = Range(match.range, in: answer) else { return nil }
-            return String(answer[codeRange])
+            let matchedText = String(answer[codeRange]).uppercased()
+            return aliasToCode[matchedText]
         }
+    }
+
+    private func optionCodeAliases(for validCodes: Set<String>) -> [String: String] {
+        let spokenNumberAliases: [String: [String]] = [
+            "1": ["ONE", "NUMBER ONE", "FIRST"],
+            "2": ["TWO", "TO", "TOO", "NUMBER TWO", "SECOND"],
+            "3": ["THREE", "NUMBER THREE", "THIRD"],
+            "4": ["FOUR", "FOR", "NUMBER FOUR", "FOURTH"],
+            "5": ["FIVE", "NUMBER FIVE", "FIFTH"],
+            "6": ["SIX", "NUMBER SIX", "SIXTH"],
+            "7": ["SEVEN", "NUMBER SEVEN", "SEVENTH"],
+            "8": ["EIGHT", "ATE", "NUMBER EIGHT", "EIGHTH"],
+            "9": ["NINE", "NUMBER NINE", "NINTH"],
+            "10": ["TEN", "NUMBER TEN", "TENTH"]
+        ]
+        var aliases: [String: String] = [:]
+        for code in validCodes {
+            let normalizedCode = code.uppercased()
+            aliases[normalizedCode] = normalizedCode
+            for alias in spokenNumberAliases[normalizedCode] ?? [] {
+                aliases[alias] = normalizedCode
+            }
+        }
+        return aliases
     }
     
     // MARK: - OpenAI Implementation

@@ -41,6 +41,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private var questionnaireData: QuestionnaireData?
     private var transcription: String?
     private var matchedQuestions: [MatchedQuestion] = []
+    private var interviewerCheckedOptionCodesByQuestionId: [Int: [String]] = [:]
     private var respondentInfo: RespondentInfo?
     /// Set when pushing from `MapViewController`; passed into the respondent form until a successful submit.
     var mapLocationPrefill: MapLocationPayload?
@@ -228,6 +229,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             // Clear any stale analysis state before starting a new recording.
             transcription = nil
             matchedQuestions = []
+            interviewerCheckedOptionCodesByQuestionId = [:]
             interviewTrajectoryPoints = []
 
             // Analysis now runs from the post-recording review flow.
@@ -350,11 +352,15 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             Task {
                 do {
                     let matchedQuestions = try await LLMService.shared.analyzeTranscription(transcription, questions: questions)
+                    let assistedMatches = self.applyInterviewerCheckedOptions(
+                        to: matchedQuestions,
+                        questions: questions
+                    )
 
                     await MainActor.run {
                         self.resolveClarificationsIfNeeded(
                             transcription: transcription,
-                            matchedQuestions: matchedQuestions,
+                            matchedQuestions: assistedMatches,
                             recordingURL: recordingURL
                         )
                     }
@@ -1090,7 +1096,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     private func selectQuestionnaireIfNeeded(completion: @escaping () -> Void) {
         let cached = QuestionnaireStore.shared.cachedQuestionnaires()
-        guard cached.count > 1 else {
+        guard cached.count > 1 || SurveyAPIClient.shared.isConfigured() else {
             if let only = cached.first {
                 QuestionnaireStore.shared.saveSelectedQuestionnaire(only)
                 questionnaireData = QuestionnaireData(questionnaire: only)
@@ -1099,31 +1105,77 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             return
         }
 
-        let current = questionnaireData?.questionnaire
-        let alert = UIAlertController(
-            title: "Choose Questionnaire",
-            message: "Select the survey to use for this interview.",
-            preferredStyle: .actionSheet
-        )
+        presentQuestionnaireSelection(cached: cached, completion: completion)
+    }
 
-        for questionnaire in cached {
-            let versionText = questionnaire.version.map { " v\($0)" } ?? ""
-            let marker = questionnaire.id == current?.id && questionnaire.version == current?.version ? " ✓" : ""
-            alert.addAction(UIAlertAction(title: "\(questionnaire.title)\(versionText)\(marker)", style: .default) { [weak self] _ in
+    private func presentQuestionnaireSelection(cached: [Questionnaire], completion: @escaping () -> Void) {
+        let selector = QuestionnaireSelectionViewController(
+            cached: cached,
+            current: questionnaireData?.questionnaire,
+            canRefresh: SurveyAPIClient.shared.isConfigured(),
+            onSelect: { [weak self] questionnaire in
                 QuestionnaireStore.shared.saveSelectedQuestionnaire(questionnaire)
                 self?.questionnaireData = QuestionnaireData(questionnaire: questionnaire)
                 completion()
-            })
+            },
+            onRefresh: { [weak self] in
+                self?.refreshQuestionnaireSelection(completion: completion)
+            }
+        )
+        selector.modalPresentationStyle = .overFullScreen
+        selector.modalTransitionStyle = .crossDissolve
+        present(selector, animated: true)
+    }
+
+    private func refreshQuestionnaireSelection(completion: @escaping () -> Void) {
+        guard SurveyAPIClient.shared.isConfigured() else {
+            showMessage("Survey API is not configured.")
+            return
         }
 
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        statusLabel.text = "Refreshing questionnaires..."
+        statusLabel.textColor = .systemBlue
 
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = recordButton
-            popover.sourceRect = recordButton.bounds
+        Task { [weak self] in
+            do {
+                let active = try await SurveyAPIClient.shared.fetchActiveQuestionnaires()
+                await MainActor.run {
+                    guard let self else { return }
+                    guard !active.isEmpty else {
+                        self.statusLabel.text = "No published questionnaires found"
+                        self.statusLabel.textColor = .systemOrange
+                        self.showMessage("No published questionnaires were returned by the server.")
+                        self.presentQuestionnaireSelection(
+                            cached: QuestionnaireStore.shared.cachedQuestionnaires(),
+                            completion: completion
+                        )
+                        return
+                    }
+
+                    QuestionnaireStore.shared.saveCachedQuestionnaires(active)
+                    let fallback = self.questionnaireData?.questionnaire ?? active[0]
+                    let selected = QuestionnaireStore.shared.selectedQuestionnaire(
+                        from: active,
+                        fallback: fallback
+                    )
+                    self.questionnaireData = QuestionnaireData(questionnaire: selected)
+                    self.statusLabel.text = "Questionnaire list refreshed"
+                    self.statusLabel.textColor = .systemGreen
+                    self.presentQuestionnaireSelection(cached: active, completion: completion)
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self else { return }
+                    self.statusLabel.text = "Questionnaire refresh failed"
+                    self.statusLabel.textColor = .systemRed
+                    self.showMessage("Failed to refresh questionnaires: \(error.localizedDescription)")
+                    self.presentQuestionnaireSelection(
+                        cached: QuestionnaireStore.shared.cachedQuestionnaires(),
+                        completion: completion
+                    )
+                }
+            }
         }
-
-        present(alert, animated: true)
     }
 
     // MARK: - Permission Requests
@@ -1286,6 +1338,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         recordedData = "Recording data - Timestamp: \(Date().timeIntervalSince1970)"
         updateNextParticipantButtonState()
         let monitorViewController = recordingMonitorViewController
+        interviewerCheckedOptionCodesByQuestionId = monitorViewController?.selectedMultipleChoiceAnswers() ?? [:]
         recordingMonitorViewController = nil
 
         if showReview {
@@ -1432,6 +1485,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         interviewTrajectoryPoints = []
         transcription = nil
         matchedQuestions = []
+        interviewerCheckedOptionCodesByQuestionId = [:]
         recordedData = nil
 
         recordingMonitorViewController?.dismiss(animated: true)
@@ -2089,6 +2143,81 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         return matched.clarificationNeeded || matched.confidence.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "high"
     }
 
+    private func applyInterviewerCheckedOptions(
+        to matches: [MatchedQuestion],
+        questions: [Question]
+    ) -> [MatchedQuestion] {
+        guard !interviewerCheckedOptionCodesByQuestionId.isEmpty else {
+            return matches
+        }
+
+        var updatedMatches = matches
+        let questionsById = Dictionary(uniqueKeysWithValues: questions.map { ($0.id, $0) })
+
+        for (questionId, checkedCodes) in interviewerCheckedOptionCodesByQuestionId {
+            guard let question = questionsById[questionId],
+                  question.type.lowercased() == "multiple-choice",
+                  !checkedCodes.isEmpty else {
+                continue
+            }
+
+            let validOptions = Dictionary(uniqueKeysWithValues: question.options.map { ($0.code.uppercased(), $0.text) })
+            let orderedCodes = question.options
+                .map { $0.code.uppercased() }
+                .filter { checkedCodes.map { $0.uppercased() }.contains($0) && validOptions[$0] != nil }
+            guard !orderedCodes.isEmpty else {
+                continue
+            }
+
+            let labels = orderedCodes.compactMap { validOptions[$0] }
+            let checkedAnswer = labels.isEmpty ? orderedCodes.joined(separator: ", ") : labels.joined(separator: ", ")
+
+            if let existingIndex = updatedMatches.firstIndex(where: { $0.matchedQuestionId == questionId }) {
+                let existing = updatedMatches[existingIndex]
+                let noteParts = [
+                    "Interviewer checked choices used as primary answer.",
+                    "LLM transcript answer: \(existing.extractedAnswer)"
+                ]
+                updatedMatches[existingIndex] = MatchedQuestion(
+                    matchedQuestionId: existing.matchedQuestionId,
+                    matchedQuestion: existing.matchedQuestion,
+                    extractedAnswer: checkedAnswer,
+                    selectedOptionCodes: orderedCodes,
+                    selectedOptionLabels: labels,
+                    confidence: "high",
+                    clarificationNeeded: false,
+                    finalAnswer: checkedAnswer,
+                    manuallyClarified: existing.manuallyClarified,
+                    clarificationNote: noteParts.joined(separator: " "),
+                    answerSource: "interviewer_checked"
+                )
+            } else {
+                updatedMatches.append(
+                    MatchedQuestion(
+                        matchedQuestionId: question.id,
+                        matchedQuestion: question.question,
+                        extractedAnswer: checkedAnswer,
+                        selectedOptionCodes: orderedCodes,
+                        selectedOptionLabels: labels,
+                        confidence: "high",
+                        clarificationNeeded: false,
+                        finalAnswer: checkedAnswer,
+                        manuallyClarified: false,
+                        clarificationNote: "Interviewer checked choices used as primary answer; voice transcript retained as supporting evidence.",
+                        answerSource: "interviewer_checked"
+                    )
+                )
+            }
+        }
+
+        return updatedMatches.sorted { lhs, rhs in
+            if lhs.matchedQuestionId == rhs.matchedQuestionId {
+                return lhs.matchedQuestion < rhs.matchedQuestion
+            }
+            return lhs.matchedQuestionId < rhs.matchedQuestionId
+        }
+    }
+
     private func showClarificationPrompt(
         transcription: String,
         originalMatchedQuestions: [MatchedQuestion],
@@ -2132,7 +2261,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         )
 
         alert.addTextField { textField in
-            textField.placeholder = question?.type.lowercased() == "multiple-choice" ? "Final answer codes, e.g. A, C" : "Custom final answer"
+            textField.placeholder = question?.type.lowercased() == "multiple-choice" ? "Final answer codes, e.g. 1, 3" : "Custom final answer"
             textField.text = matched.finalAnswer ?? ""
         }
         alert.addTextField { textField in
@@ -2203,7 +2332,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         return question.options
             .prefix(10)
             .map { "\($0.code.uppercased()). \($0.text)" }
-            .joined(separator: "\n")
+            .joined(separator: "\n\n")
     }
 
     private func selectedOptions(from answer: String?, question: Question?) -> (codes: [String]?, labels: [String]?) {
@@ -2215,15 +2344,27 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
 
         let validOptions = Dictionary(uniqueKeysWithValues: question.options.map { ($0.code.uppercased(), $0.text) })
-        let pattern = #"\b[A-J]\b"#
+        let aliasToCode = optionCodeAliases(for: Set(validOptions.keys))
+        let alternatives = aliasToCode.keys
+            .filter { !$0.isEmpty }
+            .sorted { lhs, rhs in
+                if lhs.count == rhs.count { return lhs < rhs }
+                return lhs.count > rhs.count
+            }
+            .map { NSRegularExpression.escapedPattern(for: $0) }
+            .joined(separator: "|")
+        guard !alternatives.isEmpty else {
+            return (nil, nil)
+        }
+        let pattern = "(?<![A-Za-z0-9])(?:\(alternatives))(?![A-Za-z0-9])"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return (nil, nil)
         }
         let range = NSRange(answer.startIndex..<answer.endIndex, in: answer)
         let codes = regex.matches(in: answer, options: [], range: range).compactMap { match -> String? in
             guard let codeRange = Range(match.range, in: answer) else { return nil }
-            let code = String(answer[codeRange]).uppercased()
-            return validOptions[code] == nil ? nil : code
+            let matchedText = String(answer[codeRange]).uppercased()
+            return aliasToCode[matchedText]
         }
         let uniqueCodes = Array(NSOrderedSet(array: codes)).compactMap { $0 as? String }
         guard !uniqueCodes.isEmpty else {
@@ -2231,6 +2372,30 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
         let labels = uniqueCodes.compactMap { validOptions[$0] }
         return (uniqueCodes, labels)
+    }
+
+    private func optionCodeAliases(for validCodes: Set<String>) -> [String: String] {
+        let spokenNumberAliases: [String: [String]] = [
+            "1": ["ONE", "NUMBER ONE", "FIRST"],
+            "2": ["TWO", "TO", "TOO", "NUMBER TWO", "SECOND"],
+            "3": ["THREE", "NUMBER THREE", "THIRD"],
+            "4": ["FOUR", "FOR", "NUMBER FOUR", "FOURTH"],
+            "5": ["FIVE", "NUMBER FIVE", "FIFTH"],
+            "6": ["SIX", "NUMBER SIX", "SIXTH"],
+            "7": ["SEVEN", "NUMBER SEVEN", "SEVENTH"],
+            "8": ["EIGHT", "ATE", "NUMBER EIGHT", "EIGHTH"],
+            "9": ["NINE", "NUMBER NINE", "NINTH"],
+            "10": ["TEN", "NUMBER TEN", "TENTH"]
+        ]
+        var aliases: [String: String] = [:]
+        for code in validCodes {
+            let normalizedCode = code.uppercased()
+            aliases[normalizedCode] = normalizedCode
+            for alias in spokenNumberAliases[normalizedCode] ?? [] {
+                aliases[alias] = normalizedCode
+            }
+        }
+        return aliases
     }
 
     private func transcriptSnippet(for matched: MatchedQuestion, question: Question?, transcription: String) -> String {
@@ -2470,6 +2635,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         respondentInfo = nil
         transcription = nil
         matchedQuestions = []
+        interviewerCheckedOptionCodesByQuestionId = [:]
         cloudRespondentId = nil
         cloudSessionId = nil
         TrajectoryTracker.shared.setCurrentIdentity(respondentId: nil, sessionId: nil)
@@ -3503,6 +3669,234 @@ final class AggregationTextViewController: UIViewController {
     }
 }
 
+private final class QuestionnaireSelectionViewController: UIViewController {
+    private let cached: [Questionnaire]
+    private let current: Questionnaire?
+    private let canRefresh: Bool
+    private let onSelect: (Questionnaire) -> Void
+    private let onRefresh: () -> Void
+
+    init(
+        cached: [Questionnaire],
+        current: Questionnaire?,
+        canRefresh: Bool,
+        onSelect: @escaping (Questionnaire) -> Void,
+        onRefresh: @escaping () -> Void
+    ) {
+        self.cached = cached
+        self.current = current
+        self.canRefresh = canRefresh
+        self.onSelect = onSelect
+        self.onRefresh = onRefresh
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = UIColor.black.withAlphaComponent(0.28)
+        buildUI()
+    }
+
+    private func buildUI() {
+        let panel = UIView()
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.backgroundColor = .systemBackground
+        panel.layer.cornerRadius = 18
+        panel.layer.shadowColor = UIColor.black.cgColor
+        panel.layer.shadowOpacity = 0.18
+        panel.layer.shadowRadius = 20
+        panel.layer.shadowOffset = CGSize(width: 0, height: 8)
+
+        let titleLabel = UILabel()
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.text = "Choose Questionnaire"
+        titleLabel.font = UIFont.systemFont(ofSize: 24, weight: .bold)
+        titleLabel.textColor = .label
+        titleLabel.textAlignment = .center
+
+        let messageLabel = UILabel()
+        messageLabel.translatesAutoresizingMaskIntoConstraints = false
+        messageLabel.text = cached.isEmpty ? "Refresh to load published questionnaires from the server." : "Select the survey to use for this interview."
+        messageLabel.font = UIFont.systemFont(ofSize: 18)
+        messageLabel.textColor = .secondaryLabel
+        messageLabel.textAlignment = .center
+        messageLabel.numberOfLines = 0
+
+        let scrollView = UIScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.alwaysBounceVertical = true
+        let listHeight = min(max(CGFloat(max(cached.count, 1)) * 62, 62), 330)
+
+        let listStack = UIStackView()
+        listStack.translatesAutoresizingMaskIntoConstraints = false
+        listStack.axis = .vertical
+        listStack.spacing = 10
+
+        if cached.isEmpty {
+            let emptyLabel = UILabel()
+            emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+            emptyLabel.text = "No questionnaires loaded yet."
+            emptyLabel.font = UIFont.systemFont(ofSize: 18, weight: .medium)
+            emptyLabel.textColor = .secondaryLabel
+            emptyLabel.textAlignment = .center
+            listStack.addArrangedSubview(emptyLabel)
+            emptyLabel.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        } else {
+            for (index, questionnaire) in cached.enumerated() {
+                let button = makeQuestionnaireButton(for: questionnaire, index: index)
+                listStack.addArrangedSubview(button)
+                button.heightAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
+            }
+        }
+
+        let actionStack = UIStackView()
+        actionStack.translatesAutoresizingMaskIntoConstraints = false
+        actionStack.axis = .vertical
+        actionStack.spacing = 10
+        actionStack.distribution = .fillEqually
+
+        if canRefresh {
+            actionStack.addArrangedSubview(
+                makeActionButton(
+                    title: "Refresh List",
+                    backgroundColor: .systemGreen,
+                    foregroundColor: .white,
+                    action: #selector(refreshTapped)
+                )
+            )
+        }
+
+        actionStack.addArrangedSubview(
+            makeActionButton(
+                title: "Cancel",
+                backgroundColor: .systemRed,
+                foregroundColor: .white,
+                action: #selector(cancelTapped)
+            )
+        )
+
+        view.addSubview(panel)
+        panel.addSubview(titleLabel)
+        panel.addSubview(messageLabel)
+        panel.addSubview(scrollView)
+        panel.addSubview(actionStack)
+        scrollView.addSubview(listStack)
+
+        NSLayoutConstraint.activate([
+            panel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            panel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            panel.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            panel.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
+            panel.topAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.topAnchor, constant: 24),
+            panel.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
+            panel.widthAnchor.constraint(lessThanOrEqualToConstant: 460),
+
+            titleLabel.topAnchor.constraint(equalTo: panel.topAnchor, constant: 24),
+            titleLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 24),
+            titleLabel.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -24),
+
+            messageLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 10),
+            messageLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 24),
+            messageLabel.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -24),
+
+            scrollView.topAnchor.constraint(equalTo: messageLabel.bottomAnchor, constant: 18),
+            scrollView.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 22),
+            scrollView.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -22),
+            scrollView.heightAnchor.constraint(equalToConstant: listHeight),
+
+            listStack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            listStack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            listStack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            listStack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            listStack.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
+
+            actionStack.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 14),
+            actionStack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 22),
+            actionStack.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -22),
+            actionStack.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -22)
+        ])
+
+        for button in actionStack.arrangedSubviews {
+            button.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        }
+    }
+
+    private func makeQuestionnaireButton(for questionnaire: Questionnaire, index: Int) -> UIButton {
+        let versionText = questionnaire.version.map { " v\($0)" } ?? ""
+        let isCurrent = questionnaire.id == current?.id && questionnaire.version == current?.version
+        let marker = isCurrent ? " ✓" : ""
+        let button = makeConfiguredButton(
+            title: "\(questionnaire.title)\(versionText)\(marker)",
+            backgroundColor: isCurrent ? .systemBlue.withAlphaComponent(0.16) : .secondarySystemFill,
+            foregroundColor: .label,
+            fontSize: 18
+        )
+        button.tag = index
+        button.addTarget(self, action: #selector(questionnaireTapped(_:)), for: .touchUpInside)
+        button.contentHorizontalAlignment = .center
+        return button
+    }
+
+    private func makeActionButton(
+        title: String,
+        backgroundColor: UIColor,
+        foregroundColor: UIColor,
+        action: Selector
+    ) -> UIButton {
+        let button = makeConfiguredButton(
+            title: title,
+            backgroundColor: backgroundColor,
+            foregroundColor: foregroundColor,
+            fontSize: 19
+        )
+        button.addTarget(self, action: action, for: .touchUpInside)
+        return button
+    }
+
+    private func makeConfiguredButton(
+        title: String,
+        backgroundColor: UIColor,
+        foregroundColor: UIColor,
+        fontSize: CGFloat
+    ) -> UIButton {
+        let button = UIButton(type: .system)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        var config = UIButton.Configuration.filled()
+        var attributedTitle = AttributedString(title)
+        attributedTitle.font = UIFont.systemFont(ofSize: fontSize, weight: .semibold)
+        config.attributedTitle = attributedTitle
+        config.baseBackgroundColor = backgroundColor
+        config.baseForegroundColor = foregroundColor
+        config.cornerStyle = .medium
+        config.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16)
+        button.configuration = config
+        button.titleLabel?.numberOfLines = 0
+        return button
+    }
+
+    @objc private func questionnaireTapped(_ sender: UIButton) {
+        guard cached.indices.contains(sender.tag) else { return }
+        let questionnaire = cached[sender.tag]
+        dismiss(animated: true) { [onSelect] in
+            onSelect(questionnaire)
+        }
+    }
+
+    @objc private func refreshTapped() {
+        dismiss(animated: true) { [onRefresh] in
+            onRefresh()
+        }
+    }
+
+    @objc private func cancelTapped() {
+        dismiss(animated: true)
+    }
+}
+
 private final class RecordingReviewViewController: UIViewController {
     var onPlay: (() -> Void)?
     var onAnalyze: (() -> Void)?
@@ -3645,6 +4039,8 @@ private final class RecordingMonitorViewController: UIViewController {
     private var startedAt = Date()
     private var timer: Timer?
     private var recentLevels: [Float] = []
+    private var selectedOptionCodesByQuestionId: [Int: Set<String>] = [:]
+    private var optionButtonsByQuestionId: [Int: [String: UIButton]] = [:]
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -3666,6 +4062,20 @@ private final class RecordingMonitorViewController: UIViewController {
         super.viewWillDisappear(animated)
         timer?.invalidate()
         timer = nil
+    }
+
+    func selectedMultipleChoiceAnswers() -> [Int: [String]] {
+        var answers: [Int: [String]] = [:]
+        for question in questions where question.type.lowercased() == "multiple-choice" {
+            let selectedCodes = selectedOptionCodesByQuestionId[question.id] ?? []
+            let orderedCodes = question.options
+                .map { $0.code.uppercased() }
+                .filter { selectedCodes.contains($0) }
+            if !orderedCodes.isEmpty {
+                answers[question.id] = orderedCodes
+            }
+        }
+        return answers
     }
 
     private func buildUI() {
@@ -3772,7 +4182,7 @@ private final class RecordingMonitorViewController: UIViewController {
             waveformView.topAnchor.constraint(equalTo: page.topAnchor, constant: 8),
             waveformView.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 24),
             waveformView.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -24),
-            waveformView.heightAnchor.constraint(equalToConstant: 96),
+            waveformView.heightAnchor.constraint(equalToConstant: 76),
 
             caption.topAnchor.constraint(equalTo: waveformView.bottomAnchor, constant: 10),
             caption.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 32),
@@ -3797,7 +4207,7 @@ private final class RecordingMonitorViewController: UIViewController {
         let title = UILabel()
         title.translatesAutoresizingMaskIntoConstraints = false
         title.text = "Survey Questions"
-        title.font = UIFont.systemFont(ofSize: 23, weight: .bold)
+        title.font = UIFont.systemFont(ofSize: 28, weight: .bold)
         title.textColor = .label
 
         let questionScrollView = UIScrollView()
@@ -3817,10 +4227,12 @@ private final class RecordingMonitorViewController: UIViewController {
         if questions.isEmpty {
             let card = makeQuestionCard(
                 items: [QuestionCardItem(
+                    questionId: -1,
                     title: "Questionnaire not loaded",
                     detail: "Check that questionnaire.json is bundled with the app.",
                     answerType: "Unavailable",
-                    options: []
+                    options: [],
+                    allowsMultiple: false
                 )]
             )
             stack.addArrangedSubview(card)
@@ -3836,10 +4248,12 @@ private final class RecordingMonitorViewController: UIViewController {
                 let slideQuestions = questions[startIndex..<slideEnd]
                 let items = slideQuestions.enumerated().map { offset, question in
                     QuestionCardItem(
+                        questionId: question.id,
                         title: "\(startIndex + offset + 1) of \(questions.count): \(question.question)",
                         detail: question.followUp.map { "Follow-up: \($0)" },
                         answerType: answerTypeLabel(for: question),
-                        options: question.options
+                        options: question.options,
+                        allowsMultiple: question.allowsMultiple
                     )
                 }
                 let card = makeQuestionCard(items: items)
@@ -3852,7 +4266,7 @@ private final class RecordingMonitorViewController: UIViewController {
         let hintLabel = UILabel()
         hintLabel.translatesAutoresizingMaskIntoConstraints = false
         hintLabel.text = "Swipe left or right for more questions"
-        hintLabel.font = UIFont.systemFont(ofSize: 15)
+        hintLabel.font = UIFont.systemFont(ofSize: 18)
         hintLabel.textColor = .secondaryLabel
         hintLabel.textAlignment = .center
 
@@ -3890,10 +4304,12 @@ private final class RecordingMonitorViewController: UIViewController {
     }
 
     private struct QuestionCardItem {
+        let questionId: Int
         let title: String
         let detail: String?
         let answerType: String
         let options: [QuestionOption]
+        let allowsMultiple: Bool
     }
 
     private func makeQuestionCard(items: [QuestionCardItem]) -> UIView {
@@ -3931,7 +4347,7 @@ private final class RecordingMonitorViewController: UIViewController {
         let answerBadge = UILabel()
         answerBadge.translatesAutoresizingMaskIntoConstraints = false
         answerBadge.text = item.answerType
-        answerBadge.font = UIFont.systemFont(ofSize: 16, weight: .semibold)
+        answerBadge.font = UIFont.systemFont(ofSize: 21, weight: .semibold)
         answerBadge.textColor = .white
         answerBadge.backgroundColor = .systemBlue
         answerBadge.textAlignment = .center
@@ -3941,48 +4357,199 @@ private final class RecordingMonitorViewController: UIViewController {
         let questionLabel = UILabel()
         questionLabel.translatesAutoresizingMaskIntoConstraints = false
         questionLabel.text = item.title
-        questionLabel.font = UIFont.systemFont(ofSize: item.options.isEmpty ? 27 : 23, weight: .semibold)
+        questionLabel.font = UIFont.systemFont(ofSize: item.options.isEmpty ? 38 : 34, weight: .semibold)
         questionLabel.textColor = .label
         questionLabel.numberOfLines = 0
         questionLabel.adjustsFontSizeToFitWidth = true
-        questionLabel.minimumScaleFactor = 0.75
-        questionLabel.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        questionLabel.minimumScaleFactor = 0.68
+        questionLabel.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let detailLabel = UILabel()
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
-        if !item.options.isEmpty {
-            let choices = item.options.map { "\($0.code.uppercased()). \($0.text)" }.joined(separator: "\n")
-            let prefix = item.detail.map { "\($0)\n" } ?? ""
-            detailLabel.text = "\(prefix)\(choices)"
-        } else {
-            detailLabel.text = item.detail ?? "Expected answer: \(item.answerType)"
-        }
-        detailLabel.font = UIFont.systemFont(ofSize: item.options.isEmpty ? 18 : 17)
+        detailLabel.text = item.detail ?? "Expected answer: \(item.answerType)"
+        detailLabel.font = UIFont.systemFont(ofSize: 24)
         detailLabel.textColor = .secondaryLabel
         detailLabel.numberOfLines = 0
-        detailLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+        detailLabel.setContentCompressionResistancePriority(item.options.isEmpty ? .required : .defaultLow, for: .vertical)
 
         block.addSubview(answerBadge)
         block.addSubview(questionLabel)
-        block.addSubview(detailLabel)
 
-        NSLayoutConstraint.activate([
+        var constraints: [NSLayoutConstraint] = [
             answerBadge.topAnchor.constraint(equalTo: block.topAnchor),
             answerBadge.leadingAnchor.constraint(equalTo: block.leadingAnchor),
-            answerBadge.heightAnchor.constraint(equalToConstant: 34),
-            answerBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
+            answerBadge.heightAnchor.constraint(equalToConstant: 44),
+            answerBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 150),
 
             questionLabel.topAnchor.constraint(equalTo: answerBadge.bottomAnchor, constant: 8),
             questionLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
-            questionLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor),
+            questionLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor)
+        ]
 
-            detailLabel.topAnchor.constraint(equalTo: questionLabel.bottomAnchor, constant: 6),
-            detailLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
-            detailLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor),
-            detailLabel.bottomAnchor.constraint(lessThanOrEqualTo: block.bottomAnchor)
-        ])
+        if !item.options.isEmpty {
+            let instructionLabel = UILabel()
+            instructionLabel.translatesAutoresizingMaskIntoConstraints = false
+            instructionLabel.text = "Please say the number, e.g. \"Number 3.\""
+            instructionLabel.font = UIFont.systemFont(ofSize: 19, weight: .semibold)
+            instructionLabel.textColor = .systemOrange
+            instructionLabel.numberOfLines = 0
+            instructionLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+
+            let optionsScrollView = UIScrollView()
+            optionsScrollView.translatesAutoresizingMaskIntoConstraints = false
+            optionsScrollView.alwaysBounceVertical = true
+            optionsScrollView.showsVerticalScrollIndicator = true
+
+            let optionStack = UIStackView()
+            optionStack.translatesAutoresizingMaskIntoConstraints = false
+            optionStack.axis = .vertical
+            optionStack.spacing = 10
+
+            let moreChoicesLabel = UILabel()
+            moreChoicesLabel.translatesAutoresizingMaskIntoConstraints = false
+            moreChoicesLabel.text = "More choices below - scroll down"
+            moreChoicesLabel.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
+            moreChoicesLabel.textColor = .systemBlue
+            moreChoicesLabel.textAlignment = .center
+            moreChoicesLabel.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.10)
+            moreChoicesLabel.layer.cornerRadius = 6
+            moreChoicesLabel.clipsToBounds = true
+
+            block.addSubview(instructionLabel)
+            block.addSubview(optionsScrollView)
+            block.addSubview(moreChoicesLabel)
+            optionsScrollView.addSubview(optionStack)
+
+            optionButtonsByQuestionId[item.questionId] = [:]
+            for option in item.options {
+                let code = option.code.uppercased()
+                let optionButton = makeOptionButton(
+                    questionId: item.questionId,
+                    code: code,
+                    text: option.text,
+                    allowsMultiple: item.allowsMultiple
+                )
+                optionStack.addArrangedSubview(optionButton)
+                optionButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
+                optionButtonsByQuestionId[item.questionId]?[code] = optionButton
+            }
+
+            let optionsToIndicatorConstraint = optionsScrollView.bottomAnchor.constraint(equalTo: moreChoicesLabel.topAnchor, constant: -8)
+            let moreChoicesHeightConstraint = moreChoicesLabel.heightAnchor.constraint(equalToConstant: 32)
+
+            constraints.append(contentsOf: [
+                instructionLabel.topAnchor.constraint(equalTo: questionLabel.bottomAnchor, constant: 8),
+                instructionLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
+                instructionLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor),
+
+                optionsScrollView.topAnchor.constraint(equalTo: instructionLabel.bottomAnchor, constant: 10),
+                optionsScrollView.leadingAnchor.constraint(equalTo: block.leadingAnchor),
+                optionsScrollView.trailingAnchor.constraint(equalTo: block.trailingAnchor),
+                optionsToIndicatorConstraint,
+
+                moreChoicesLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
+                moreChoicesLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor),
+                moreChoicesLabel.bottomAnchor.constraint(equalTo: block.bottomAnchor),
+                moreChoicesHeightConstraint,
+
+                optionStack.topAnchor.constraint(equalTo: optionsScrollView.contentLayoutGuide.topAnchor),
+                optionStack.leadingAnchor.constraint(equalTo: optionsScrollView.contentLayoutGuide.leadingAnchor),
+                optionStack.trailingAnchor.constraint(equalTo: optionsScrollView.contentLayoutGuide.trailingAnchor),
+                optionStack.bottomAnchor.constraint(equalTo: optionsScrollView.contentLayoutGuide.bottomAnchor),
+                optionStack.widthAnchor.constraint(equalTo: optionsScrollView.frameLayoutGuide.widthAnchor)
+            ])
+
+            DispatchQueue.main.async { [weak optionsScrollView, weak moreChoicesLabel] in
+                guard let optionsScrollView, let moreChoicesLabel else { return }
+                optionsScrollView.layoutIfNeeded()
+                let hasHiddenChoices = optionsScrollView.contentSize.height > optionsScrollView.bounds.height + 4
+                moreChoicesLabel.isHidden = !hasHiddenChoices
+                moreChoicesHeightConstraint.constant = hasHiddenChoices ? 32 : 0
+                optionsToIndicatorConstraint.constant = hasHiddenChoices ? -8 : 0
+            }
+        } else {
+            block.addSubview(detailLabel)
+            constraints.append(contentsOf: [
+                detailLabel.topAnchor.constraint(equalTo: questionLabel.bottomAnchor, constant: 6),
+                detailLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
+                detailLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor),
+                detailLabel.bottomAnchor.constraint(lessThanOrEqualTo: block.bottomAnchor)
+            ])
+        }
+
+        NSLayoutConstraint.activate(constraints)
 
         return block
+    }
+
+    private func makeOptionButton(
+        questionId: Int,
+        code: String,
+        text: String,
+        allowsMultiple: Bool
+    ) -> UIButton {
+        let button = UIButton(type: .system)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.contentHorizontalAlignment = .leading
+        button.titleLabel?.numberOfLines = 0
+        button.addAction(UIAction { [weak self] _ in
+            self?.toggleOption(questionId: questionId, code: code, allowsMultiple: allowsMultiple)
+        }, for: .touchUpInside)
+        updateOptionButton(button, code: code, text: text, isSelected: false)
+        return button
+    }
+
+    private func toggleOption(questionId: Int, code: String, allowsMultiple: Bool) {
+        let normalizedCode = code.uppercased()
+        var selectedCodes = selectedOptionCodesByQuestionId[questionId] ?? []
+
+        if selectedCodes.contains(normalizedCode) {
+            selectedCodes.remove(normalizedCode)
+        } else {
+            if allowsMultiple {
+                selectedCodes.insert(normalizedCode)
+            } else {
+                selectedCodes = [normalizedCode]
+            }
+        }
+
+        selectedOptionCodesByQuestionId[questionId] = selectedCodes
+        refreshOptionButtons(questionId: questionId)
+    }
+
+    private func refreshOptionButtons(questionId: Int) {
+        guard let buttons = optionButtonsByQuestionId[questionId] else { return }
+        let selectedCodes = selectedOptionCodesByQuestionId[questionId] ?? []
+        for question in questions where question.id == questionId {
+            for option in question.options {
+                let code = option.code.uppercased()
+                guard let button = buttons[code] else { continue }
+                updateOptionButton(
+                    button,
+                    code: code,
+                    text: option.text,
+                    isSelected: selectedCodes.contains(code)
+                )
+            }
+        }
+    }
+
+    private func updateOptionButton(
+        _ button: UIButton,
+        code: String,
+        text: String,
+        isSelected: Bool
+    ) {
+        var config = UIButton.Configuration.filled()
+        var title = AttributedString("\(isSelected ? "[x]" : "[ ]") \(code). \(text)")
+        title.font = UIFont.systemFont(ofSize: 24, weight: .semibold)
+        config.attributedTitle = title
+        config.baseBackgroundColor = isSelected ? .systemGreen.withAlphaComponent(0.22) : .secondarySystemFill
+        config.baseForegroundColor = .label
+        config.cornerStyle = .medium
+        config.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 14, bottom: 10, trailing: 14)
+        button.configuration = config
+        button.accessibilityLabel = "\(isSelected ? "Selected" : "Not selected") choice \(code), \(text)"
     }
 
     private func answerTypeLabel(for question: Question) -> String {
