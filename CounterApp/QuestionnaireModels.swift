@@ -31,6 +31,8 @@ struct Question: Codable {
     let type: String
     let followUp: String?
     let keywords: [String]
+    let options: [QuestionOption]
+    let allowsMultiple: Bool
     
     enum CodingKeys: String, CodingKey {
         case id
@@ -38,6 +40,8 @@ struct Question: Codable {
         case type
         case followUp = "follow_up"
         case keywords
+        case options
+        case allowsMultiple = "allows_multiple"
     }
 
     init(
@@ -45,13 +49,17 @@ struct Question: Codable {
         question: String,
         type: String,
         followUp: String?,
-        keywords: [String]
+        keywords: [String],
+        options: [QuestionOption] = [],
+        allowsMultiple: Bool = false
     ) {
         self.id = id
         self.question = question
         self.type = type
         self.followUp = followUp
         self.keywords = keywords
+        self.options = options
+        self.allowsMultiple = allowsMultiple
     }
 
     init(from decoder: Decoder) throws {
@@ -73,6 +81,35 @@ struct Question: Codable {
         type = try container.decode(String.self, forKey: .type)
         followUp = try container.decodeIfPresent(String.self, forKey: .followUp)
         keywords = try container.decodeIfPresent([String].self, forKey: .keywords) ?? []
+        options = try container.decodeIfPresent([QuestionOption].self, forKey: .options) ?? []
+        allowsMultiple = try container.decodeIfPresent(Bool.self, forKey: .allowsMultiple) ?? false
+    }
+}
+
+struct QuestionOption: Codable {
+    let code: String
+    let text: String
+
+    enum CodingKeys: String, CodingKey {
+        case code
+        case text
+    }
+
+    init(code: String, text: String) {
+        self.code = code
+        self.text = text
+    }
+
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+            code = try container.decode(String.self, forKey: .code)
+            text = try container.decode(String.self, forKey: .text)
+        } else {
+            let container = try decoder.singleValueContainer()
+            let value = try container.decode(String.self)
+            code = value
+            text = value
+        }
     }
 }
 
@@ -193,12 +230,16 @@ struct ExportedMatchedQuestion: Decodable {
     let matchedQuestion: String
     let extractedAnswer: String?
     let finalAnswer: String?
+    let selectedOptionCodes: [String]?
+    let selectedOptionLabels: [String]?
     
     enum CodingKeys: String, CodingKey {
         case matchedQuestionId = "matched_question_id"
         case matchedQuestion = "matched_question"
         case extractedAnswer = "extracted_answer"
         case finalAnswer = "final_answer"
+        case selectedOptionCodes = "selected_option_codes"
+        case selectedOptionLabels = "selected_option_labels"
     }
 }
 
@@ -215,6 +256,8 @@ struct MatchedQuestion: Codable {
     let matchedQuestionId: Int
     let matchedQuestion: String
     let extractedAnswer: String
+    let selectedOptionCodes: [String]?
+    let selectedOptionLabels: [String]?
     let confidence: String
     let clarificationNeeded: Bool
     let finalAnswer: String?
@@ -226,6 +269,8 @@ struct MatchedQuestion: Codable {
         case matchedQuestionId = "matched_question_id"
         case matchedQuestion = "matched_question"
         case extractedAnswer = "extracted_answer"
+        case selectedOptionCodes = "selected_option_codes"
+        case selectedOptionLabels = "selected_option_labels"
         case confidence
         case clarificationNeeded = "clarification_needed"
         case finalAnswer = "final_answer"
@@ -238,6 +283,8 @@ struct MatchedQuestion: Codable {
         matchedQuestionId: Int,
         matchedQuestion: String,
         extractedAnswer: String,
+        selectedOptionCodes: [String]? = nil,
+        selectedOptionLabels: [String]? = nil,
         confidence: String,
         clarificationNeeded: Bool,
         finalAnswer: String? = nil,
@@ -248,6 +295,8 @@ struct MatchedQuestion: Codable {
         self.matchedQuestionId = matchedQuestionId
         self.matchedQuestion = matchedQuestion
         self.extractedAnswer = extractedAnswer
+        self.selectedOptionCodes = selectedOptionCodes
+        self.selectedOptionLabels = selectedOptionLabels
         self.confidence = confidence
         self.clarificationNeeded = clarificationNeeded
         self.finalAnswer = finalAnswer
@@ -256,7 +305,12 @@ struct MatchedQuestion: Codable {
         self.answerSource = answerSource
     }
 
-    func withManualClarification(finalAnswer: String?, note: String?) -> MatchedQuestion {
+    func withManualClarification(
+        finalAnswer: String?,
+        note: String?,
+        selectedOptionCodes: [String]? = nil,
+        selectedOptionLabels: [String]? = nil
+    ) -> MatchedQuestion {
         let cleanedAnswer = finalAnswer?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedNote = note?.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -264,6 +318,8 @@ struct MatchedQuestion: Codable {
             matchedQuestionId: matchedQuestionId,
             matchedQuestion: matchedQuestion,
             extractedAnswer: extractedAnswer,
+            selectedOptionCodes: selectedOptionCodes ?? self.selectedOptionCodes,
+            selectedOptionLabels: selectedOptionLabels ?? self.selectedOptionLabels,
             confidence: confidence,
             clarificationNeeded: clarificationNeeded,
             finalAnswer: cleanedAnswer?.isEmpty == false ? cleanedAnswer : nil,

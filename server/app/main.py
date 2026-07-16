@@ -169,6 +169,8 @@ def canonical_questionnaire_payload(
                 "type": q["type"],
                 "follow_up": q.get("follow_up"),
                 "keywords": q.get("keywords", []),
+                "options": q.get("options", []),
+                "allows_multiple": bool(q.get("allows_multiple", False)),
             }
             for q in questions
         ],
@@ -207,7 +209,8 @@ def questionnaire_response(row: dict, questions: list[dict]) -> dict:
 def load_questionnaire_questions(cur, questionnaire_id: str, version: str) -> list[dict]:
     cur.execute(
         """
-        SELECT question_id, order_index, prompt, answer_type, follow_up, keywords_json
+        SELECT question_id, order_index, prompt, answer_type, follow_up, keywords_json,
+               options_json, allows_multiple
         FROM questionnaire_questions
         WHERE questionnaire_id = %s AND version = %s
         ORDER BY order_index, question_id
@@ -224,6 +227,19 @@ def load_questionnaire_questions(cur, questionnaire_id: str, version: str) -> li
                     keywords = [str(item) for item in decoded]
             except json.JSONDecodeError:
                 keywords = []
+        options: list[dict[str, str]] = []
+        if row.get("options_json"):
+            try:
+                decoded_options = json.loads(row["options_json"])
+                if isinstance(decoded_options, list):
+                    for item in decoded_options:
+                        if isinstance(item, dict):
+                            code = str(item.get("code", "")).strip().upper()
+                            text = str(item.get("text", "")).strip()
+                            if code and text:
+                                options.append({"code": code, "text": text})
+            except json.JSONDecodeError:
+                options = []
         questions.append(
             {
                 "id": questionnaire_question_id_value(row["question_id"]),
@@ -231,6 +247,8 @@ def load_questionnaire_questions(cur, questionnaire_id: str, version: str) -> li
                 "type": row["answer_type"],
                 "follow_up": row.get("follow_up"),
                 "keywords": keywords,
+                "options": options,
+                "allows_multiple": bool(row.get("allows_multiple")),
             }
         )
     return questions
@@ -311,6 +329,10 @@ def delete_if_table_exists(cur, sql: str, params: tuple) -> None:
 
 
 def normalize_answer_for_analysis(answer: object) -> str | None:
+    if isinstance(answer, list):
+        codes = [str(item).strip().lower() for item in answer if str(item).strip()]
+        return ",".join(codes) if codes else None
+
     if not isinstance(answer, str):
         return None
 
@@ -392,7 +414,11 @@ def analysis_answer_rows(
         question = question_lookup.get(question_id, {})
         extracted_answer = item.get("extracted_answer")
         final_answer = item.get("final_answer")
-        analysis_answer = final_answer if isinstance(final_answer, str) and final_answer.strip() else extracted_answer
+        selected_option_codes = item.get("selected_option_codes")
+        if isinstance(selected_option_codes, list) and selected_option_codes:
+            analysis_answer = ", ".join(str(code).strip().upper() for code in selected_option_codes if str(code).strip())
+        else:
+            analysis_answer = final_answer if isinstance(final_answer, str) and final_answer.strip() else extracted_answer
         confidence = item.get("confidence")
         clarification_needed = item.get("clarification_needed")
         fallback_question_text = item.get("matched_question")
@@ -546,12 +572,19 @@ class InterviewerResolveResponse(BaseModel):
     identity_scope: str = "server"
 
 
+class QuestionOptionPayload(BaseModel):
+    code: str = Field(..., min_length=1, max_length=4)
+    text: str = Field(..., min_length=1, max_length=255)
+
+
 class QuestionnaireQuestionPayload(BaseModel):
     id: str | int = Field(..., description="Stable question id within this questionnaire version.")
     question: str = Field(..., min_length=1)
     type: str = Field(default="yes-no", min_length=1, max_length=64)
     follow_up: str | None = None
     keywords: list[str] = Field(default_factory=list)
+    options: list[QuestionOptionPayload] = Field(default_factory=list, max_length=10)
+    allows_multiple: bool = False
 
 
 class QuestionnaireVersionPayload(BaseModel):
@@ -578,6 +611,15 @@ def save_questionnaire_version(cur, body: QuestionnaireVersionPayload, *, requir
             "type": question.type.strip(),
             "follow_up": question.follow_up.strip() if isinstance(question.follow_up, str) else None,
             "keywords": [keyword.strip() for keyword in question.keywords if keyword.strip()],
+            "options": [
+                {
+                    "code": option.code.strip().upper(),
+                    "text": option.text.strip(),
+                }
+                for option in question.options
+                if option.code.strip() and option.text.strip()
+            ],
+            "allows_multiple": bool(question.allows_multiple),
         }
         for question in body.questions
     ]
@@ -586,6 +628,18 @@ def save_questionnaire_version(cur, body: QuestionnaireVersionPayload, *, requir
         raise HTTPException(status_code=400, detail="questionnaire id and version are required")
     if len({question["id"] for question in questions}) != len(questions):
         raise HTTPException(status_code=400, detail="question ids must be unique within a version")
+    for question in questions:
+        if question["type"].lower() == "multiple-choice":
+            if not question["options"]:
+                raise HTTPException(status_code=400, detail="multiple-choice questions require at least one option")
+            if len(question["options"]) > 10:
+                raise HTTPException(status_code=400, detail="multiple-choice questions can have at most 10 options")
+            option_codes = [option["code"] for option in question["options"]]
+            if len(set(option_codes)) != len(option_codes):
+                raise HTTPException(status_code=400, detail="multiple-choice option codes must be unique")
+        else:
+            question["options"] = []
+            question["allows_multiple"] = False
 
     cur.execute(
         """
@@ -644,9 +698,9 @@ def save_questionnaire_version(cur, body: QuestionnaireVersionPayload, *, requir
         """
         INSERT INTO questionnaire_questions (
             questionnaire_id, version, question_id, order_index,
-            prompt, answer_type, follow_up, keywords_json
+            prompt, answer_type, follow_up, keywords_json, options_json, allows_multiple
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         [
             (
@@ -658,6 +712,8 @@ def save_questionnaire_version(cur, body: QuestionnaireVersionPayload, *, requir
                 question["type"],
                 question.get("follow_up"),
                 json.dumps(question.get("keywords", []), ensure_ascii=False),
+                json.dumps(question.get("options", []), ensure_ascii=False),
+                question.get("allows_multiple", False),
             )
             for index, question in enumerate(questions, start=1)
         ],

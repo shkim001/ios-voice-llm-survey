@@ -88,6 +88,24 @@ class LocationAggregationViewController: UIViewController {
                 allQuestionKeys.insert(questionKey)
                 currentResponseQuestionKeys.insert(questionKey)
                 questionIds[questionKey] = item.matchedQuestionId
+
+                if let selectedCodes = item.selectedOptionCodes, !selectedCodes.isEmpty {
+                    for (index, code) in selectedCodes.enumerated() {
+                        let normalizedCode = code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                        guard !normalizedCode.isEmpty else { continue }
+                        let answerType = "option:\(normalizedCode)"
+                        statistics[questionKey, default: [:]][answerType, default: 0] += 1
+                        if answerDisplayNames[questionKey] == nil {
+                            answerDisplayNames[questionKey] = [:]
+                        }
+                        let label = item.selectedOptionLabels?.indices.contains(index) == true ? item.selectedOptionLabels?[index] : nil
+                        answerDisplayNames[questionKey]?[answerType] = label.map { "\(normalizedCode). \($0)" } ?? normalizedCode
+                    }
+                    if questionTexts[questionKey] == nil {
+                        questionTexts[questionKey] = item.matchedQuestion
+                    }
+                    continue
+                }
                 
                 let preferredAnswer = item.finalAnswer ?? item.extractedAnswer
                 guard let answer = preferredAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty else {
@@ -306,7 +324,9 @@ class LocationAggregationViewController: UIViewController {
                         [
                             "matched_question_id": item.matchedQuestionId,
                             "matched_question": item.matchedQuestion,
-                            "extracted_answer": item.extractedAnswer ?? ""
+                            "extracted_answer": item.extractedAnswer ?? "",
+                            "selected_option_codes": item.selectedOptionCodes ?? [],
+                            "selected_option_labels": item.selectedOptionLabels ?? []
                         ]
                     }
                 ]

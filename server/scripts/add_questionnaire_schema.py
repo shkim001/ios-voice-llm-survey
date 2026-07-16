@@ -87,6 +87,14 @@ def main():
                 "idx_analysis_answers_questionnaire",
                 "(questionnaire_id, questionnaire_version, question_id)",
             )
+
+            add_column(cur, "questionnaire_questions", "options_json", "TEXT NULL")
+            add_column(
+                cur,
+                "questionnaire_questions",
+                "allows_multiple",
+                "BOOLEAN NOT NULL DEFAULT FALSE",
+            )
         conn.commit()
     finally:
         conn.close()

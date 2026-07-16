@@ -48,6 +48,8 @@ def main():
                 "type": q.get("type", "yes-no"),
                 "follow_up": q.get("follow_up"),
                 "keywords": q.get("keywords", []),
+                "options": q.get("options", []),
+                "allows_multiple": bool(q.get("allows_multiple", False)),
             }
             for q in questions
         ],
@@ -107,13 +109,15 @@ def main():
                 qid = str(q["id"])
                 prompt = q["question"]
                 answer_type = q.get("type", "yes-no")
+                options = q.get("options", []) if answer_type == "multiple-choice" else []
+                allows_multiple = bool(q.get("allows_multiple", False)) if answer_type == "multiple-choice" else False
                 cur.execute(
                     """
                     INSERT INTO questionnaire_questions (
                       questionnaire_id, version, question_id, order_index,
-                      prompt, answer_type, follow_up, keywords_json
+                      prompt, answer_type, follow_up, keywords_json, options_json, allows_multiple
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         questionnaire_id,
@@ -124,6 +128,8 @@ def main():
                         answer_type,
                         q.get("follow_up"),
                         json.dumps(q.get("keywords", []), ensure_ascii=False),
+                        json.dumps(options, ensure_ascii=False),
+                        allows_multiple,
                     ),
                 )
                 cur.execute(

@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS questionnaire_questions (
   answer_type VARCHAR(64) NOT NULL,
   follow_up TEXT NULL,
   keywords_json TEXT NULL,
+  options_json TEXT NULL,
+  allows_multiple BOOLEAN NOT NULL DEFAULT FALSE,
 
   PRIMARY KEY (questionnaire_id, version, question_id),
   INDEX idx_questionnaire_questions_order (questionnaire_id, version, order_index),

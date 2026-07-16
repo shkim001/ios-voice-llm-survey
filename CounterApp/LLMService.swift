@@ -108,6 +108,16 @@ class LLMService {
             if let followUp = q.followUp {
                 questionsText += "Follow-up: \(followUp)\n"
             }
+            if q.type.lowercased() == "multiple-choice" {
+                let selectionMode = q.allowsMultiple ? "Choose one or more options." : "Choose exactly one option."
+                questionsText += "Selection rule: \(selectionMode)\n"
+                if !q.options.isEmpty {
+                    questionsText += "Options:\n"
+                    for option in q.options {
+                        questionsText += "- \(option.code.uppercased()). \(option.text)\n"
+                    }
+                }
+            }
             questionsText += "Related keywords: \(q.keywords.joined(separator: ", "))\n"
             questionsText += "\n"
         }
@@ -134,6 +144,10 @@ class LLMService {
         - Look for keywords related to: seating, trees, landscaping, shelter, water fountains, restrooms, transit, trash, buildings, signage, lighting, speed limits, safety, accessibility.
         - For yes/no questions, extract the clear answer (yes/no/not sure).
         - For impression questions, capture the user's assessment (safe/unsafe, appealing/unappealing, etc.).
+        - For multiple-choice questions, select only from the listed option codes.
+        - For multiple-choice questions with multiple selections allowed, return all selected option codes in the order the user gave them.
+        - For multiple-choice questions, use both the spoken letter codes and the option labels to interpret the response. For example, if option A is "Shade", then "A", "ay", and "shade" can all refer to A.
+        - If the user gives an option code that is not listed, or if the chosen option is ambiguous, set `"clarification_needed": true` and `"confidence": "low"`.
         - If a question cannot be confidently matched, set `"clarification_needed": true` and `"confidence": "low"`.
         - Be concise, factual, and neutral in tone.
         - Avoid paraphrasing or adding opinions.
@@ -149,6 +163,8 @@ class LLMService {
             "matched_question_id": <question_id>,
             "matched_question": "<the question text>",
             "extracted_answer": "<user's extracted answer>",
+            "selected_option_codes": ["A", "C"],
+            "selected_option_labels": ["Option label for A", "Option label for C"],
             "confidence": "<high/medium/low>",
             "clarification_needed": <true/false>
           },
@@ -190,9 +206,64 @@ class LLMService {
         // Call appropriate API based on current provider
         switch currentProvider {
         case .openai:
-            return try await analyzeWithOpenAI(transcription: transcription, questions: questions)
+            let matches = try await analyzeWithOpenAI(transcription: transcription, questions: questions)
+            return validateMultipleChoiceAnswers(matches, questions: questions)
         case .gemini:
-            return try await analyzeWithGemini(transcription: transcription, questions: questions)
+            let matches = try await analyzeWithGemini(transcription: transcription, questions: questions)
+            return validateMultipleChoiceAnswers(matches, questions: questions)
+        }
+    }
+
+    private func validateMultipleChoiceAnswers(_ matches: [MatchedQuestion], questions: [Question]) -> [MatchedQuestion] {
+        let questionsById = Dictionary(uniqueKeysWithValues: questions.map { ($0.id, $0) })
+
+        return matches.map { match in
+            guard let question = questionsById[match.matchedQuestionId],
+                  question.type.lowercased() == "multiple-choice",
+                  !question.options.isEmpty else {
+                return match
+            }
+
+            let validCodes = Set(question.options.map { $0.code.uppercased() })
+            let selectedCodes = (match.selectedOptionCodes ?? codesFromAnswer(match.extractedAnswer))
+                .flatMap { codesFromAnswer($0).isEmpty ? [$0] : codesFromAnswer($0) }
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() }
+                .filter { !$0.isEmpty }
+            let uniqueCodes = Array(NSOrderedSet(array: selectedCodes)).compactMap { $0 as? String }
+            let invalidCodes = uniqueCodes.filter { !validCodes.contains($0) }
+            let hasTooMany = !question.allowsMultiple && uniqueCodes.count > 1
+            let needsClarification = match.clarificationNeeded || uniqueCodes.isEmpty || !invalidCodes.isEmpty || hasTooMany
+            let confidence = needsClarification ? "low" : match.confidence
+            let labels = uniqueCodes.compactMap { code in
+                question.options.first { $0.code.uppercased() == code }?.text
+            }
+            let extractedAnswer = uniqueCodes.isEmpty ? match.extractedAnswer : uniqueCodes.joined(separator: ", ")
+
+            return MatchedQuestion(
+                matchedQuestionId: match.matchedQuestionId,
+                matchedQuestion: match.matchedQuestion,
+                extractedAnswer: extractedAnswer,
+                selectedOptionCodes: uniqueCodes.isEmpty ? match.selectedOptionCodes : uniqueCodes,
+                selectedOptionLabels: labels.isEmpty ? match.selectedOptionLabels : labels,
+                confidence: confidence,
+                clarificationNeeded: needsClarification,
+                finalAnswer: match.finalAnswer,
+                manuallyClarified: match.manuallyClarified,
+                clarificationNote: match.clarificationNote,
+                answerSource: match.answerSource
+            )
+        }
+    }
+
+    private func codesFromAnswer(_ answer: String) -> [String] {
+        let pattern = #"\b[A-J]\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return []
+        }
+        let range = NSRange(answer.startIndex..<answer.endIndex, in: answer)
+        return regex.matches(in: answer, options: [], range: range).compactMap { match in
+            guard let codeRange = Range(match.range, in: answer) else { return nil }
+            return String(answer[codeRange])
         }
     }
     
@@ -430,4 +501,3 @@ class LLMService {
         )
     }
 }
-

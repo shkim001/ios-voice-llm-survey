@@ -706,6 +706,24 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         currentResponseQuestionKeys.insert(questionKey)
                         questionIds[questionKey] = item.matchedQuestionId
 
+                        if let selectedCodes = item.selectedOptionCodes, !selectedCodes.isEmpty {
+                            for (index, code) in selectedCodes.enumerated() {
+                                let normalizedCode = code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                                guard !normalizedCode.isEmpty else { continue }
+                                let answerType = "option:\(normalizedCode)"
+                                statistics[questionKey, default: [:]][answerType, default: 0] += 1
+                                if answerDisplayNames[questionKey] == nil {
+                                    answerDisplayNames[questionKey] = [:]
+                                }
+                                let label = item.selectedOptionLabels?.indices.contains(index) == true ? item.selectedOptionLabels?[index] : nil
+                                answerDisplayNames[questionKey]?[answerType] = label.map { "\(normalizedCode). \($0)" } ?? normalizedCode
+                            }
+                            if questionTexts[questionKey] == nil {
+                                questionTexts[questionKey] = item.matchedQuestion
+                            }
+                            continue
+                        }
+
                         let preferredAnswer = item.finalAnswer ?? item.extractedAnswer
                         guard let answer = preferredAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answer.isEmpty else {
                             continue
@@ -1622,6 +1640,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let type: String
         let followUp: String?
         let keywords: [String]
+        let options: [QuestionOption]
+        let allowsMultiple: Bool
 
         enum CodingKeys: String, CodingKey {
             case id
@@ -1629,6 +1649,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             case type
             case followUp = "follow_up"
             case keywords
+            case options
+            case allowsMultiple = "allows_multiple"
         }
     }
 
@@ -1740,7 +1762,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         question: $0.question,
                         type: $0.type,
                         followUp: $0.followUp,
-                        keywords: $0.keywords
+                        keywords: $0.keywords,
+                        options: $0.options,
+                        allowsMultiple: $0.allowsMultiple
                     )
                 }
             )
@@ -1856,7 +1880,19 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 ("question", jsonString(question.question)),
                 ("type", jsonString(question.type)),
                 ("follow_up", jsonString(question.followUp)),
-                ("keywords", jsonStringArray(question.keywords, indent: indent + 1))
+                ("keywords", jsonStringArray(question.keywords, indent: indent + 1)),
+                ("allows_multiple", question.type.lowercased() == "multiple-choice" ? jsonBool(question.allowsMultiple) : nil),
+                ("options", question.type.lowercased() == "multiple-choice" ? questionOptionsJSON(question.options, indent: indent + 1) : nil)
+            ], indent: indent + 1)
+        }
+        return orderedArray(values, indent: indent)
+    }
+
+    private func questionOptionsJSON(_ options: [QuestionOption], indent: Int) -> String {
+        let values = options.map { option in
+            orderedObject([
+                ("code", jsonString(option.code)),
+                ("text", jsonString(option.text))
             ], indent: indent + 1)
         }
         return orderedArray(values, indent: indent)
@@ -1924,6 +1960,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 ("matched_question_id", jsonNumber(matched.matchedQuestionId)),
                 ("matched_question", jsonString(matched.matchedQuestion)),
                 ("extracted_answer", jsonString(matched.extractedAnswer)),
+                ("selected_option_codes", matched.selectedOptionCodes.map { jsonStringArray($0, indent: indent + 1) }),
+                ("selected_option_labels", matched.selectedOptionLabels.map { jsonStringArray($0, indent: indent + 1) }),
                 ("confidence", jsonString(matched.confidence)),
                 ("clarification_needed", jsonBool(matched.clarificationNeeded)),
                 ("final_answer", jsonString(matched.finalAnswer)),
@@ -2072,12 +2110,15 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let matched = currentMatchedQuestions[matchedIndex]
         let question = questionnaireData?.questionnaire.questions.first { $0.id == matched.matchedQuestionId }
         let snippet = transcriptSnippet(for: matched, question: question, transcription: transcription)
+        let optionText = multipleChoiceOptionText(for: question)
+        let optionSection = optionText.isEmpty ? "" : "\nOptions:\n\(optionText)\n"
 
         let alert = UIAlertController(
             title: "Clarification Needed \(position + 1) of \(uncertainIndices.count)",
             message: """
             Question:
             \(matched.matchedQuestion)
+            \(optionSection)
 
             LLM answer:
             \(matched.extractedAnswer)
@@ -2091,7 +2132,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         )
 
         alert.addTextField { textField in
-            textField.placeholder = "Custom final answer"
+            textField.placeholder = question?.type.lowercased() == "multiple-choice" ? "Final answer codes, e.g. A, C" : "Custom final answer"
             textField.text = matched.finalAnswer ?? ""
         }
         alert.addTextField { textField in
@@ -2104,7 +2145,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             let customAnswer = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines)
             let note = alert.textFields?.dropFirst().first?.text
             let finalAnswer = customAnswer?.isEmpty == false ? customAnswer : selectedAnswer
-            updatedQuestions[matchedIndex] = matched.withManualClarification(finalAnswer: finalAnswer, note: note)
+            let selectedOptions = self.selectedOptions(from: finalAnswer, question: question)
+            updatedQuestions[matchedIndex] = matched.withManualClarification(
+                finalAnswer: finalAnswer,
+                note: note,
+                selectedOptionCodes: selectedOptions.codes,
+                selectedOptionLabels: selectedOptions.labels
+            )
 
             self.showClarificationPrompt(
                 transcription: transcription,
@@ -2120,6 +2167,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             alert.addAction(UIAlertAction(title: "Yes", style: .default) { _ in continueWithUpdate("Yes") })
             alert.addAction(UIAlertAction(title: "No", style: .default) { _ in continueWithUpdate("No") })
             alert.addAction(UIAlertAction(title: "Not sure", style: .default) { _ in continueWithUpdate("Not sure") })
+        }
+
+        if let question, question.type.lowercased() == "multiple-choice", !question.allowsMultiple {
+            for option in question.options.prefix(10) {
+                let code = option.code.uppercased()
+                alert.addAction(UIAlertAction(title: "\(code). \(option.text)", style: .default) { _ in continueWithUpdate(code) })
+            }
         }
 
         alert.addAction(UIAlertAction(title: "Use Custom Text", style: .default) { _ in
@@ -2138,6 +2192,45 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         })
 
         present(alert, animated: true)
+    }
+
+    private func multipleChoiceOptionText(for question: Question?) -> String {
+        guard let question,
+              question.type.lowercased() == "multiple-choice",
+              !question.options.isEmpty else {
+            return ""
+        }
+        return question.options
+            .prefix(10)
+            .map { "\($0.code.uppercased()). \($0.text)" }
+            .joined(separator: "\n")
+    }
+
+    private func selectedOptions(from answer: String?, question: Question?) -> (codes: [String]?, labels: [String]?) {
+        guard let question,
+              question.type.lowercased() == "multiple-choice",
+              !question.options.isEmpty,
+              let answer else {
+            return (nil, nil)
+        }
+
+        let validOptions = Dictionary(uniqueKeysWithValues: question.options.map { ($0.code.uppercased(), $0.text) })
+        let pattern = #"\b[A-J]\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return (nil, nil)
+        }
+        let range = NSRange(answer.startIndex..<answer.endIndex, in: answer)
+        let codes = regex.matches(in: answer, options: [], range: range).compactMap { match -> String? in
+            guard let codeRange = Range(match.range, in: answer) else { return nil }
+            let code = String(answer[codeRange]).uppercased()
+            return validOptions[code] == nil ? nil : code
+        }
+        let uniqueCodes = Array(NSOrderedSet(array: codes)).compactMap { $0 as? String }
+        guard !uniqueCodes.isEmpty else {
+            return (nil, nil)
+        }
+        let labels = uniqueCodes.compactMap { validOptions[$0] }
+        return (uniqueCodes, labels)
     }
 
     private func transcriptSnippet(for matched: MatchedQuestion, question: Question?, transcription: String) -> String {
@@ -2304,6 +2397,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         for matched in matchedQuestions {
             resultText += "\nQuestion \(matched.matchedQuestionId): \(matched.matchedQuestion)\n"
             resultText += "Answer: \(matched.extractedAnswer)\n"
+            if let codes = matched.selectedOptionCodes, !codes.isEmpty {
+                resultText += "Selected choices: \(codes.joined(separator: ", "))\n"
+            }
+            if let labels = matched.selectedOptionLabels, !labels.isEmpty {
+                resultText += "Choice labels: \(labels.joined(separator: ", "))\n"
+            }
             if let finalAnswer = matched.finalAnswer, !finalAnswer.isEmpty {
                 resultText += "Final answer: \(finalAnswer)\n"
             }
@@ -3710,7 +3809,7 @@ private final class RecordingMonitorViewController: UIViewController {
         let stack = UIStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .horizontal
-        stack.spacing = 12
+        stack.spacing = 0
         stack.alignment = .fill
         stack.distribution = .fill
         var questionCards: [UIView] = []
@@ -3720,24 +3819,33 @@ private final class RecordingMonitorViewController: UIViewController {
                 items: [QuestionCardItem(
                     title: "Questionnaire not loaded",
                     detail: "Check that questionnaire.json is bundled with the app.",
-                    answerType: "Unavailable"
+                    answerType: "Unavailable",
+                    options: []
                 )]
             )
             stack.addArrangedSubview(card)
             questionCards.append(card)
         } else {
-            for startIndex in stride(from: 0, to: questions.count, by: 2) {
-                let slideQuestions = questions[startIndex..<min(startIndex + 2, questions.count)]
+            var startIndex = 0
+            while startIndex < questions.count {
+                let currentQuestion = questions[startIndex]
+                let shouldTakeFullSlide = currentQuestion.type.lowercased() == "multiple-choice" && currentQuestion.options.count > 4
+                let nextQuestion = startIndex + 1 < questions.count ? questions[startIndex + 1] : nil
+                let nextShouldTakeFullSlide = nextQuestion?.type.lowercased() == "multiple-choice" && (nextQuestion?.options.count ?? 0) > 4
+                let slideEnd = shouldTakeFullSlide || nextShouldTakeFullSlide ? startIndex + 1 : min(startIndex + 2, questions.count)
+                let slideQuestions = questions[startIndex..<slideEnd]
                 let items = slideQuestions.enumerated().map { offset, question in
                     QuestionCardItem(
                         title: "\(startIndex + offset + 1) of \(questions.count): \(question.question)",
                         detail: question.followUp.map { "Follow-up: \($0)" },
-                        answerType: answerTypeLabel(for: question)
+                        answerType: answerTypeLabel(for: question),
+                        options: question.options
                     )
                 }
                 let card = makeQuestionCard(items: items)
                 stack.addArrangedSubview(card)
                 questionCards.append(card)
+                startIndex = slideEnd
             }
         }
 
@@ -3785,6 +3893,7 @@ private final class RecordingMonitorViewController: UIViewController {
         let title: String
         let detail: String?
         let answerType: String
+        let options: [QuestionOption]
     }
 
     private func makeQuestionCard(items: [QuestionCardItem]) -> UIView {
@@ -3832,18 +3941,26 @@ private final class RecordingMonitorViewController: UIViewController {
         let questionLabel = UILabel()
         questionLabel.translatesAutoresizingMaskIntoConstraints = false
         questionLabel.text = item.title
-        questionLabel.font = UIFont.systemFont(ofSize: 27, weight: .semibold)
+        questionLabel.font = UIFont.systemFont(ofSize: item.options.isEmpty ? 27 : 23, weight: .semibold)
         questionLabel.textColor = .label
         questionLabel.numberOfLines = 0
         questionLabel.adjustsFontSizeToFitWidth = true
         questionLabel.minimumScaleFactor = 0.75
+        questionLabel.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
 
         let detailLabel = UILabel()
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
-        detailLabel.text = item.detail ?? "Expected answer: \(item.answerType)"
-        detailLabel.font = UIFont.systemFont(ofSize: 18)
+        if !item.options.isEmpty {
+            let choices = item.options.map { "\($0.code.uppercased()). \($0.text)" }.joined(separator: "\n")
+            let prefix = item.detail.map { "\($0)\n" } ?? ""
+            detailLabel.text = "\(prefix)\(choices)"
+        } else {
+            detailLabel.text = item.detail ?? "Expected answer: \(item.answerType)"
+        }
+        detailLabel.font = UIFont.systemFont(ofSize: item.options.isEmpty ? 18 : 17)
         detailLabel.textColor = .secondaryLabel
         detailLabel.numberOfLines = 0
+        detailLabel.setContentCompressionResistancePriority(.required, for: .vertical)
 
         block.addSubview(answerBadge)
         block.addSubview(questionLabel)
