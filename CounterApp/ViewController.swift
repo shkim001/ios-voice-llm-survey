@@ -4128,12 +4128,6 @@ private final class RecordingMonitorViewController: UIViewController {
     }
 
     private func buildUI() {
-        let titleLabel = UILabel()
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.text = "Recording Interview"
-        titleLabel.font = UIFont.systemFont(ofSize: 28, weight: .bold)
-        titleLabel.textAlignment = .center
-
         timerLabel.translatesAutoresizingMaskIntoConstraints = false
         timerLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 34, weight: .semibold)
         timerLabel.textAlignment = .center
@@ -4173,18 +4167,13 @@ private final class RecordingMonitorViewController: UIViewController {
         buttonStack.spacing = 12
         buttonStack.distribution = .fillEqually
 
-        view.addSubview(titleLabel)
         view.addSubview(timerLabel)
         view.addSubview(qualityLabel)
         view.addSubview(monitorPage)
         view.addSubview(buttonStack)
 
         NSLayoutConstraint.activate([
-            titleLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 24),
-            titleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
-            titleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
-
-            timerLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
+            timerLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 18),
             timerLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
             timerLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
 
@@ -4213,18 +4202,9 @@ private final class RecordingMonitorViewController: UIViewController {
         waveformView.layer.cornerRadius = 8
         waveformView.clipsToBounds = true
 
-        let caption = UILabel()
-        caption.translatesAutoresizingMaskIntoConstraints = false
-        caption.text = "The bars should move while the respondent speaks. If they stay flat, move closer or check the microphone."
-        caption.font = UIFont.systemFont(ofSize: 16)
-        caption.textColor = .secondaryLabel
-        caption.textAlignment = .center
-        caption.numberOfLines = 0
-
         let questionsBox = makeQuestionsBox()
 
         page.addSubview(waveformView)
-        page.addSubview(caption)
         page.addSubview(questionsBox)
 
         NSLayoutConstraint.activate([
@@ -4233,11 +4213,7 @@ private final class RecordingMonitorViewController: UIViewController {
             waveformView.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -24),
             waveformView.heightAnchor.constraint(equalToConstant: 76),
 
-            caption.topAnchor.constraint(equalTo: waveformView.bottomAnchor, constant: 10),
-            caption.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 32),
-            caption.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -32),
-
-            questionsBox.topAnchor.constraint(equalTo: caption.bottomAnchor, constant: 14),
+            questionsBox.topAnchor.constraint(equalTo: waveformView.bottomAnchor, constant: 10),
             questionsBox.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 24),
             questionsBox.trailingAnchor.constraint(equalTo: page.trailingAnchor, constant: -24),
             questionsBox.bottomAnchor.constraint(equalTo: page.bottomAnchor, constant: -8)
@@ -4252,12 +4228,6 @@ private final class RecordingMonitorViewController: UIViewController {
         container.backgroundColor = .secondarySystemBackground
         container.layer.cornerRadius = 8
         container.clipsToBounds = true
-
-        let title = UILabel()
-        title.translatesAutoresizingMaskIntoConstraints = false
-        title.text = "Survey Questions"
-        title.font = UIFont.systemFont(ofSize: 28, weight: .bold)
-        title.textColor = .label
 
         let questionScrollView = UIScrollView()
         questionScrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -4289,11 +4259,7 @@ private final class RecordingMonitorViewController: UIViewController {
         } else {
             var startIndex = 0
             while startIndex < questions.count {
-                let currentQuestion = questions[startIndex]
-                let shouldTakeFullSlide = currentQuestion.type.lowercased() == "multiple-choice" && currentQuestion.options.count > 4
-                let nextQuestion = startIndex + 1 < questions.count ? questions[startIndex + 1] : nil
-                let nextShouldTakeFullSlide = nextQuestion?.type.lowercased() == "multiple-choice" && (nextQuestion?.options.count ?? 0) > 4
-                let slideEnd = shouldTakeFullSlide || nextShouldTakeFullSlide ? startIndex + 1 : min(startIndex + 2, questions.count)
+                let slideEnd = startIndex + 1
                 let slideQuestions = questions[startIndex..<slideEnd]
                 let items = slideQuestions.enumerated().map { offset, question in
                     QuestionCardItem(
@@ -4312,31 +4278,14 @@ private final class RecordingMonitorViewController: UIViewController {
             }
         }
 
-        let hintLabel = UILabel()
-        hintLabel.translatesAutoresizingMaskIntoConstraints = false
-        hintLabel.text = "Swipe left or right for more questions"
-        hintLabel.font = UIFont.systemFont(ofSize: 18)
-        hintLabel.textColor = .secondaryLabel
-        hintLabel.textAlignment = .center
-
-        container.addSubview(title)
         container.addSubview(questionScrollView)
-        container.addSubview(hintLabel)
         questionScrollView.addSubview(stack)
 
         var constraints: [NSLayoutConstraint] = [
-            title.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
-            title.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            title.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-
-            questionScrollView.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 10),
-            questionScrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            questionScrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            questionScrollView.bottomAnchor.constraint(equalTo: hintLabel.topAnchor, constant: -8),
-
-            hintLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            hintLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            hintLabel.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+            questionScrollView.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            questionScrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            questionScrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+            questionScrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10),
 
             stack.topAnchor.constraint(equalTo: questionScrollView.contentLayoutGuide.topAnchor),
             stack.leadingAnchor.constraint(equalTo: questionScrollView.contentLayoutGuide.leadingAnchor),
@@ -4381,9 +4330,9 @@ private final class RecordingMonitorViewController: UIViewController {
         card.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
-            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
-            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14)
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12)
         ])
 
         return card
@@ -4396,30 +4345,32 @@ private final class RecordingMonitorViewController: UIViewController {
         let answerBadge = UILabel()
         answerBadge.translatesAutoresizingMaskIntoConstraints = false
         answerBadge.text = item.answerType
-        answerBadge.font = UIFont.systemFont(ofSize: 21, weight: .semibold)
+        answerBadge.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
         answerBadge.textColor = .white
         answerBadge.backgroundColor = .systemBlue
         answerBadge.textAlignment = .center
-        answerBadge.layer.cornerRadius = 6
+        answerBadge.adjustsFontSizeToFitWidth = true
+        answerBadge.minimumScaleFactor = 0.75
+        answerBadge.layer.cornerRadius = 5
         answerBadge.clipsToBounds = true
 
         let questionLabel = UILabel()
         questionLabel.translatesAutoresizingMaskIntoConstraints = false
         questionLabel.text = item.title
-        questionLabel.font = UIFont.systemFont(ofSize: item.options.isEmpty ? 38 : 34, weight: .semibold)
+        questionLabel.font = UIFont.systemFont(ofSize: item.options.isEmpty ? 34 : 30, weight: .semibold)
         questionLabel.textColor = .label
         questionLabel.numberOfLines = 0
         questionLabel.adjustsFontSizeToFitWidth = true
         questionLabel.minimumScaleFactor = 0.68
         questionLabel.setContentCompressionResistancePriority(.required, for: .vertical)
 
-        let detailLabel = UILabel()
-        detailLabel.translatesAutoresizingMaskIntoConstraints = false
-        detailLabel.text = item.detail ?? "Expected answer: \(item.answerType)"
-        detailLabel.font = UIFont.systemFont(ofSize: 24)
-        detailLabel.textColor = .secondaryLabel
-        detailLabel.numberOfLines = 0
-        detailLabel.setContentCompressionResistancePriority(item.options.isEmpty ? .required : .defaultLow, for: .vertical)
+        let followUpLabel = UILabel()
+        followUpLabel.translatesAutoresizingMaskIntoConstraints = false
+        followUpLabel.text = item.detail
+        followUpLabel.font = UIFont.systemFont(ofSize: 21, weight: .medium)
+        followUpLabel.textColor = .secondaryLabel
+        followUpLabel.numberOfLines = 0
+        followUpLabel.setContentCompressionResistancePriority(.required, for: .vertical)
 
         block.addSubview(answerBadge)
         block.addSubview(questionLabel)
@@ -4427,23 +4378,28 @@ private final class RecordingMonitorViewController: UIViewController {
         var constraints: [NSLayoutConstraint] = [
             answerBadge.topAnchor.constraint(equalTo: block.topAnchor),
             answerBadge.leadingAnchor.constraint(equalTo: block.leadingAnchor),
-            answerBadge.heightAnchor.constraint(equalToConstant: 44),
-            answerBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 150),
+            answerBadge.heightAnchor.constraint(equalToConstant: 30),
+            answerBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 112),
 
-            questionLabel.topAnchor.constraint(equalTo: answerBadge.bottomAnchor, constant: 8),
+            questionLabel.topAnchor.constraint(equalTo: answerBadge.bottomAnchor, constant: 6),
             questionLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
             questionLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor)
         ]
 
-        if !item.options.isEmpty {
-            let instructionLabel = UILabel()
-            instructionLabel.translatesAutoresizingMaskIntoConstraints = false
-            instructionLabel.text = "Please say the number, e.g. \"Number 3.\""
-            instructionLabel.font = UIFont.systemFont(ofSize: 19, weight: .semibold)
-            instructionLabel.textColor = .systemOrange
-            instructionLabel.numberOfLines = 0
-            instructionLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+        let contentTopAnchor: NSLayoutYAxisAnchor
+        if item.detail != nil {
+            block.addSubview(followUpLabel)
+            constraints.append(contentsOf: [
+                followUpLabel.topAnchor.constraint(equalTo: questionLabel.bottomAnchor, constant: 8),
+                followUpLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
+                followUpLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor)
+            ])
+            contentTopAnchor = followUpLabel.bottomAnchor
+        } else {
+            contentTopAnchor = questionLabel.bottomAnchor
+        }
 
+        if !item.options.isEmpty {
             let optionsScrollView = UIScrollView()
             optionsScrollView.translatesAutoresizingMaskIntoConstraints = false
             optionsScrollView.alwaysBounceVertical = true
@@ -4454,19 +4410,7 @@ private final class RecordingMonitorViewController: UIViewController {
             optionStack.axis = .vertical
             optionStack.spacing = 10
 
-            let moreChoicesLabel = UILabel()
-            moreChoicesLabel.translatesAutoresizingMaskIntoConstraints = false
-            moreChoicesLabel.text = "More choices below - scroll down"
-            moreChoicesLabel.font = UIFont.systemFont(ofSize: 18, weight: .semibold)
-            moreChoicesLabel.textColor = .systemBlue
-            moreChoicesLabel.textAlignment = .center
-            moreChoicesLabel.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.10)
-            moreChoicesLabel.layer.cornerRadius = 6
-            moreChoicesLabel.clipsToBounds = true
-
-            block.addSubview(instructionLabel)
             block.addSubview(optionsScrollView)
-            block.addSubview(moreChoicesLabel)
             optionsScrollView.addSubview(optionStack)
 
             optionButtonsByQuestionId[item.questionId] = [:]
@@ -4483,23 +4427,11 @@ private final class RecordingMonitorViewController: UIViewController {
                 optionButtonsByQuestionId[item.questionId]?[code] = optionButton
             }
 
-            let optionsToIndicatorConstraint = optionsScrollView.bottomAnchor.constraint(equalTo: moreChoicesLabel.topAnchor, constant: -8)
-            let moreChoicesHeightConstraint = moreChoicesLabel.heightAnchor.constraint(equalToConstant: 32)
-
             constraints.append(contentsOf: [
-                instructionLabel.topAnchor.constraint(equalTo: questionLabel.bottomAnchor, constant: 8),
-                instructionLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
-                instructionLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor),
-
-                optionsScrollView.topAnchor.constraint(equalTo: instructionLabel.bottomAnchor, constant: 10),
+                optionsScrollView.topAnchor.constraint(equalTo: contentTopAnchor, constant: 10),
                 optionsScrollView.leadingAnchor.constraint(equalTo: block.leadingAnchor),
                 optionsScrollView.trailingAnchor.constraint(equalTo: block.trailingAnchor),
-                optionsToIndicatorConstraint,
-
-                moreChoicesLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
-                moreChoicesLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor),
-                moreChoicesLabel.bottomAnchor.constraint(equalTo: block.bottomAnchor),
-                moreChoicesHeightConstraint,
+                optionsScrollView.bottomAnchor.constraint(equalTo: block.bottomAnchor),
 
                 optionStack.topAnchor.constraint(equalTo: optionsScrollView.contentLayoutGuide.topAnchor),
                 optionStack.leadingAnchor.constraint(equalTo: optionsScrollView.contentLayoutGuide.leadingAnchor),
@@ -4507,23 +4439,8 @@ private final class RecordingMonitorViewController: UIViewController {
                 optionStack.bottomAnchor.constraint(equalTo: optionsScrollView.contentLayoutGuide.bottomAnchor),
                 optionStack.widthAnchor.constraint(equalTo: optionsScrollView.frameLayoutGuide.widthAnchor)
             ])
-
-            DispatchQueue.main.async { [weak optionsScrollView, weak moreChoicesLabel] in
-                guard let optionsScrollView, let moreChoicesLabel else { return }
-                optionsScrollView.layoutIfNeeded()
-                let hasHiddenChoices = optionsScrollView.contentSize.height > optionsScrollView.bounds.height + 4
-                moreChoicesLabel.isHidden = !hasHiddenChoices
-                moreChoicesHeightConstraint.constant = hasHiddenChoices ? 32 : 0
-                optionsToIndicatorConstraint.constant = hasHiddenChoices ? -8 : 0
-            }
         } else {
-            block.addSubview(detailLabel)
-            constraints.append(contentsOf: [
-                detailLabel.topAnchor.constraint(equalTo: questionLabel.bottomAnchor, constant: 6),
-                detailLabel.leadingAnchor.constraint(equalTo: block.leadingAnchor),
-                detailLabel.trailingAnchor.constraint(equalTo: block.trailingAnchor),
-                detailLabel.bottomAnchor.constraint(lessThanOrEqualTo: block.bottomAnchor)
-            ])
+            constraints.append(contentTopAnchor.constraint(lessThanOrEqualTo: block.bottomAnchor))
         }
 
         NSLayoutConstraint.activate(constraints)
