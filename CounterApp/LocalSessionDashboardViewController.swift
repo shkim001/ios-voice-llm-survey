@@ -14,6 +14,22 @@ struct LocalSessionDashboardSession {
         let capturedAt: String?
     }
 
+    struct ResolvedLocation {
+        let status: String
+        let source: String
+        let quality: String?
+        let label: String?
+        let formattedAddress: String?
+        let latitude: Double?
+        let longitude: Double?
+
+        var coordinate: CLLocationCoordinate2D? {
+            guard let latitude, let longitude else { return nil }
+            let value = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+            return CLLocationCoordinate2DIsValid(value) ? value : nil
+        }
+    }
+
     struct MatchedAnswer {
         let questionId: Int?
         let question: String
@@ -26,6 +42,7 @@ struct LocalSessionDashboardSession {
     let directoryURL: URL
     let createdAt: Date
     let locationLabel: String
+    let resolvedLocation: ResolvedLocation?
     let respondentName: String?
     let interviewerId: String?
     let interviewerName: String?
@@ -172,6 +189,7 @@ enum LocalSessionDashboardLibrary {
         let interviewer = json["interviewer_info"] as? [String: Any]
         let respondent = json["respondent_info"] as? [String: Any]
         let audio = json["audio"] as? [String: Any]
+        let location = json["location"] as? [String: Any]
         let rawAnswers = json["matched_questions"] as? [[String: Any]] ?? []
         let rawTrajectory = json["trajectory_points"] as? [[String: Any]] ?? []
 
@@ -185,9 +203,21 @@ enum LocalSessionDashboardLibrary {
             ?? resourceDate(for: directoryURL)
             ?? .distantPast
 
-        let locationLabel = nonEmptyString(json["location_label"])
+        let locationLabel = nonEmptyString(location?["label"])
+            ?? nonEmptyString(json["location_label"])
             ?? nonEmptyString(respondent?["location"])
             ?? "Unknown Location"
+        let resolvedLocation = location.map {
+            LocalSessionDashboardSession.ResolvedLocation(
+                status: nonEmptyString($0["status"]) ?? "pending",
+                source: nonEmptyString($0["source"]) ?? "none",
+                quality: nonEmptyString($0["quality"]),
+                label: nonEmptyString($0["label"]),
+                formattedAddress: nonEmptyString($0["formatted_address"]),
+                latitude: doubleValue($0["latitude"]),
+                longitude: doubleValue($0["longitude"])
+            )
+        }
         let respondentName = nonEmptyString(respondent?["name"])
         let interviewerId = nonEmptyString(interviewer?["interviewer_id"])
             ?? nonEmptyString(interviewer?["email"])
@@ -195,7 +225,12 @@ enum LocalSessionDashboardLibrary {
         let interviewerEmail = nonEmptyString(interviewer?["email"])
         let audioFileName = nonEmptyString(audio?["file_name"])
         let transcription = nonEmptyString(json["transcription"]) ?? ""
-        let isUploaded = recordingMetadata(in: directoryURL, audioFileName: audioFileName)?["session_package_uploaded_at_epoch"] != nil
+        let manifestUploadConfirmed = (try? LocalSessionManifestStore.load(from: directoryURL).uploadStatus) == .uploaded
+        let legacyUploadConfirmed = recordingMetadata(
+            in: directoryURL,
+            audioFileName: audioFileName
+        )?["session_package_uploaded_at_epoch"] != nil
+        let isUploaded = source == .cachedServer || manifestUploadConfirmed || legacyUploadConfirmed
 
         let answers = rawAnswers.map { raw in
             LocalSessionDashboardSession.MatchedAnswer(
@@ -227,6 +262,7 @@ enum LocalSessionDashboardLibrary {
             directoryURL: directoryURL,
             createdAt: createdAt,
             locationLabel: locationLabel,
+            resolvedLocation: resolvedLocation,
             respondentName: respondentName,
             interviewerId: interviewerId,
             interviewerName: interviewerName,
@@ -607,7 +643,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
         ].compactMap { $0 }.joined(separator: " and ")
         let alert = UIAlertController(
             title: "Delete Selected Sessions?",
-            message: "This removes \(pieces) session copy/copies from this iPad. Uploaded server packages are not deleted.",
+            message: "This permanently removes \(pieces) folder copy/copies from this iPad, including any original audio, manifest, and JSON inside them. Local-only sessions may have no other copy. Uploaded server packages are not deleted.",
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
@@ -904,9 +940,14 @@ final class LocalSessionDetailViewController: UITableViewController {
         case .actions:
             if indexPath.row == 0 {
                 content.text = "View Map"
-                content.secondaryText = "\(session.trajectoryPoints.count) GPS point(s)"
-                cell.accessoryType = session.trajectoryPoints.isEmpty ? .none : .disclosureIndicator
-                cell.selectionStyle = session.trajectoryPoints.isEmpty ? .none : .default
+                let hasMapLocation = !session.trajectoryPoints.isEmpty || session.resolvedLocation?.coordinate != nil
+                if session.resolvedLocation?.source == "place_search" {
+                    content.secondaryText = "Searched place (not device GPS); \(session.trajectoryPoints.count) GPS point(s)"
+                } else {
+                    content.secondaryText = "\(session.trajectoryPoints.count) device GPS point(s)"
+                }
+                cell.accessoryType = hasMapLocation ? .disclosureIndicator : .none
+                cell.selectionStyle = hasMapLocation ? .default : .none
             } else {
                 if indexPath.row == 1 {
                     content.text = "Share session.json"
@@ -949,7 +990,7 @@ final class LocalSessionDetailViewController: UITableViewController {
         guard Section(rawValue: indexPath.section) == .actions else { return }
 
         if indexPath.row == 0 {
-            guard !session.trajectoryPoints.isEmpty else { return }
+            guard !session.trajectoryPoints.isEmpty || session.resolvedLocation?.coordinate != nil else { return }
             navigationController?.pushViewController(
                 LocalSessionMapViewController(session: session),
                 animated: true
@@ -967,11 +1008,20 @@ final class LocalSessionDetailViewController: UITableViewController {
             ("Interviewer", session.interviewerName ?? "Unknown"),
             ("Interviewer Email", session.interviewerEmail ?? session.interviewerId ?? "Unknown"),
             ("Date", Self.dateFormatter.string(from: session.createdAt)),
-            ("Location", session.locationLabel),
+            ("Location", locationOverviewText()),
             ("Status", session.isUploaded ? "Uploaded" : "Local only"),
             ("Audio", session.audioFileName ?? "No audio listed"),
             ("Local ID", session.localSessionId)
         ]
+    }
+
+    private func locationOverviewText() -> String {
+        guard let location = session.resolvedLocation else { return session.locationLabel }
+        let source = location.source == "place_search" ? "Place search (not GPS)"
+            : (location.source == "device_gps" ? "Device GPS" : "No GPS")
+        return [location.label ?? session.locationLabel, location.formattedAddress, source, location.quality]
+            .compactMap { $0 }
+            .joined(separator: "\n")
     }
 
     private func shareSessionJSON(sourceView: UIView) {
@@ -996,8 +1046,8 @@ final class LocalSessionDetailViewController: UITableViewController {
         switch session.source {
         case .local:
             return session.isUploaded
-                ? "Removes this iPad copy only. Server copy can be refreshed again."
-                : "Removes this local-only session from this iPad."
+                ? "Permanently removes this iPad folder, including its audio, manifest, and JSON. The uploaded server copy can be refreshed again."
+                : "Permanently removes this local-only folder, including the original audio, manifest, and JSON. This may be the only copy and cannot be undone."
         case .cachedServer:
             return "Removes the downloaded dashboard cache. Opening the server row downloads it again."
         }
@@ -1069,7 +1119,10 @@ final class LocalSessionMapViewController: UIViewController {
         statusLabel.textColor = .secondaryLabel
         statusLabel.textAlignment = .center
         statusLabel.numberOfLines = 0
-        statusLabel.text = "\(session.locationLabel)  |  \(session.trajectoryPoints.count) GPS point(s)"
+        let sourceText = session.resolvedLocation?.source == "place_search"
+            ? "Searched place (not device GPS)"
+            : "Device GPS trajectory"
+        statusLabel.text = "\(session.locationLabel)  |  \(sourceText)  |  \(session.trajectoryPoints.count) GPS point(s)"
 
         view.addSubview(mapView)
         view.addSubview(statusLabel)
@@ -1093,17 +1146,22 @@ final class LocalSessionMapViewController: UIViewController {
         let coordinates = session.trajectoryPoints.map {
             CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude)
         }
-        guard !coordinates.isEmpty else { return }
-
         if coordinates.count > 1 {
             let route = MKPolyline(coordinates: coordinates, count: coordinates.count)
             polyline = route
             mapView.addOverlay(route)
         }
 
-        addAnnotation(title: "Start", coordinate: coordinates[0])
-        if let last = coordinates.last, coordinates.count > 1 {
-            addAnnotation(title: "End", coordinate: last)
+        if let first = coordinates.first {
+            addAnnotation(title: "Device GPS start", coordinate: first)
+            if let last = coordinates.last, coordinates.count > 1 {
+                addAnnotation(title: "Device GPS end", coordinate: last)
+            }
+        }
+        if let resolved = session.resolvedLocation,
+           let coordinate = resolved.coordinate,
+           resolved.source == "place_search" {
+            addAnnotation(title: "Searched place (not GPS)", coordinate: coordinate)
         }
 
         fitRoute()
@@ -1126,9 +1184,12 @@ final class LocalSessionMapViewController: UIViewController {
             return
         }
 
-        guard let first = session.trajectoryPoints.first else { return }
+        let center = session.trajectoryPoints.first.map {
+            CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude)
+        } ?? session.resolvedLocation?.coordinate
+        guard let center else { return }
         let region = MKCoordinateRegion(
-            center: CLLocationCoordinate2D(latitude: first.latitude, longitude: first.longitude),
+            center: center,
             latitudinalMeters: 400,
             longitudinalMeters: 400
         )

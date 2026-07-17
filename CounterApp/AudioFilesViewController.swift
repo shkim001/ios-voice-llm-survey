@@ -192,7 +192,7 @@ final class AudioFilesViewController: UITableViewController, AVAudioPlayerDelega
     private func confirmDelete(_ item: AudioRecordingItem) {
         let alert = UIAlertController(
             title: "Delete Audio File?",
-            message: "This will permanently delete \(item.displayName). Survey JSON files will not be deleted.",
+            message: "This permanently deletes \(item.displayName) and its recording sidecar from this iPad. The session manifest and survey JSON remain, but the original audio cannot be recovered or uploaded. This cannot be undone.",
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))

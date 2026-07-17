@@ -1196,6 +1196,12 @@ class SessionCreate(BaseModel):
         default=None,
         description="Optional UUID hex; if omitted a new respondent is created.",
     )
+    local_session_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="Optional durable client session ID used to make creation idempotent.",
+    )
 
 
 class SessionCreateResponse(BaseModel):
@@ -1207,6 +1213,26 @@ class SessionCreateResponse(BaseModel):
 
 @app.post("/sessions", response_model=SessionCreateResponse)
 def create_session(body: SessionCreate, _: None = Depends(verify_api_key)):
+    if body.local_session_id:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT respondent_id, session_id
+                    FROM session_creation_keys
+                    WHERE local_session_id = %s
+                    """,
+                    (body.local_session_id,),
+                )
+                existing = cur.fetchone()
+        if existing:
+            return SessionCreateResponse(
+                respondent_id=bytes_to_uuid_hex(existing["respondent_id"]),
+                session_id=bytes_to_uuid_hex(existing["session_id"]),
+                questionnaire_version=body.questionnaire_version,
+                questionnaire_id=body.questionnaire_id,
+            )
+
     if body.respondent_id:
         try:
             rid = UUID(hex=body.respondent_id)
@@ -1221,6 +1247,29 @@ def create_session(body: SessionCreate, _: None = Depends(verify_api_key)):
 
     with get_conn() as conn:
         with conn.cursor() as cur:
+            if body.local_session_id:
+                cur.execute(
+                    "SELECT GET_LOCK(SHA2(%s, 256), 10) AS acquired",
+                    (body.local_session_id,),
+                )
+                if cur.fetchone()["acquired"] != 1:
+                    raise HTTPException(status_code=503, detail="session creation is busy; retry safely")
+                cur.execute(
+                    """
+                    SELECT respondent_id, session_id
+                    FROM session_creation_keys
+                    WHERE local_session_id = %s
+                    """,
+                    (body.local_session_id,),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    return SessionCreateResponse(
+                        respondent_id=bytes_to_uuid_hex(existing["respondent_id"]),
+                        session_id=bytes_to_uuid_hex(existing["session_id"]),
+                        questionnaire_version=body.questionnaire_version,
+                        questionnaire_id=body.questionnaire_id,
+                    )
             if not body.respondent_id:
                 cur.execute(
                     """
@@ -1244,6 +1293,15 @@ def create_session(body: SessionCreate, _: None = Depends(verify_api_key)):
                 """,
                 (session_bytes, respondent_bytes, body.questionnaire_version),
             )
+            if body.local_session_id:
+                cur.execute(
+                    """
+                    INSERT INTO session_creation_keys (
+                        local_session_id, session_id, respondent_id
+                    ) VALUES (%s, %s, %s)
+                    """,
+                    (body.local_session_id, session_bytes, respondent_bytes),
+                )
 
     return SessionCreateResponse(
         respondent_id=bytes_to_uuid_hex(respondent_bytes),

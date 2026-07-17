@@ -1,6 +1,6 @@
 # Questionnaire LLM iOS App
 
-A Swift iOS app for field researchers to collect location-based street assessments. Participants record spoken responses; the app captures a required GPS point at recording start, transcribes audio, matches answers to survey questions with an LLM, and optionally uploads one complete interview package to a backend (FastAPI + MySQL / Cloud SQL).
+A Swift iOS app for field researchers to collect location-based street assessments. Participants record spoken responses; the app attempts a fresh GPS point but can use a searched place or no location, transcribes audio, matches answers to survey questions with an LLM, and durably uploads one complete interview package to a backend (FastAPI + MySQL / Cloud SQL).
 
 ## Architecture
 
@@ -19,7 +19,7 @@ flowchart LR
 
 | Component | Role |
 |-----------|------|
-| **iOS app** | Required recording-start GPS capture, audio recording, speech-to-text, LLM matching, local JSON export, optional cloud upload |
+| **iOS app** | Durable local recording, GPS/place/no-location resolution, speech-to-text, LLM matching, local JSON export, and deferred cloud upload |
 | **LLM** | OpenAI, Gemini, or a **self-hosted OpenAI-compatible** endpoint on a VM |
 | **Survey API** (`server/`) | Creates respondent/session IDs, stores each interview folder on the VM, and writes a lightweight MySQL index |
 | **MySQL** | Cloud SQL or any MySQL 8+ instance used as an index for session package paths and searchable metadata |
@@ -74,7 +74,7 @@ You can run in **local-only** mode (export JSON on device, no server) or **full 
 6. **Grant permissions** when prompted:
    - Microphone — recording
    - Speech recognition — transcription
-   - Location — required one-time GPS capture before each recording starts
+   - Location — fresh GPS is attempted before recording; fallback choices permit searched-place or no-location recording
 
 ---
 
@@ -110,14 +110,15 @@ Open **Settings** (gear) from the main screen.
 
 When the Survey API is configured:
 
-- Recording creates a local `SurveySessions/<local-session-id>/` folder only when audio is about to be saved; metadata-only empty folders are cleaned up automatically.
+- Recording creates a local `SurveySessions/<local-session-id>/` folder and atomic `session_state.json` when audio is about to be saved; unuploaded audio and pending work are protected from automatic retention cleanup.
 - Before recording, the app requires an interviewer profile. If the Survey API is configured, the app resolves/registers the interviewer with `POST /interviewers/resolve`; otherwise it stores the profile locally.
 - After **Analyze Answers** from the recording review flow, the app writes `session.json` into that local session folder.
 - Each `session.json` includes `interviewer_info` with `interviewer_id`, `name`, `email`, and `identity_scope`.
 - If any matched answer has medium/low confidence or needs clarification, the interviewer can select or type a final answer before the package is saved.
-- If the Survey API is configured, the app uploads `session.json` and the `.m4a` recording together to `POST /sessions/{id}/package`.
+- If the Survey API is configured, the app uploads `session.json` and the original `.m4a` together to `POST /sessions/{id}/package`. Failed work is discovered from session-folder manifests on launch, foreground activation, a satisfied network-path hint, or manual **Retry Pending Sessions Now**.
 - The server stores both files under one VM folder, writes a package index row to MySQL, indexes interviewer fields, and extracts matched answers into `analysis_answers` for easier counting/filtering.
-- Recording is blocked if the app cannot retrieve a current GPS coordinate, then the app samples the latest available location about every 15 seconds while recording.
+- GPS failure no longer blocks recording: the interviewer can retry, accept a disclosed low-accuracy point, record without GPS, search with native MapKit, or cancel. Device-GPS trajectory sampling continues about every 15 seconds when GPS is available.
+- `NWPathMonitor` only triggers retry attempts; actual Speech, LLM, HTTP, and server responses determine success. iOS does not guarantee retry while the app is suspended or terminated because this phase does not add a background-task mechanism.
 
 ---
 
@@ -214,6 +215,14 @@ For an existing database that already has `session_packages` and `analysis_answe
 python3 scripts/add_questionnaire_schema.py
 ```
 
+For durable idempotent cloud-session creation, run the additive local-session mapping migration:
+
+```bash
+python3 scripts/add_session_idempotency_schema.py
+```
+
+New clients send optional `local_session_id` to `POST /sessions`. Repeating the same request returns the original respondent/session identity. Older clients may omit the field.
+
 ### 4. Questionnaire rows
 
 The admin dashboard is the intended place to create, edit, publish, archive, and delete test questionnaire versions. The iOS app downloads published questionnaire versions, caches them for field use, and stores only compact questionnaire identity metadata in each `session.json`.
@@ -305,16 +314,16 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 
 ## Usage workflow
 
-1. **Start Interview** — configure the current interviewer if needed, submit respondent info, wait for the required GPS point, then record from the full-screen monitor with a timer, voice-level bars, a swipeable survey-question box showing two questions per slide with answer-type hints, and discard control. If GPS is unavailable, recording does not start.
+1. **Start Interview** — configure the current interviewer if needed, submit respondent info, and attempt fresh GPS. If GPS is unavailable or insufficient, retry, accept the disclosed low accuracy, search for a place, record without GPS, or cancel; recording is not unconditionally blocked.
 2. **Review Recording** — after Stop & Review, play the audio without closing the review popup, then analyze or discard the recording.
 3. **Analyze Answers** — from the review popup, transcribes the recording (English locale), sends the transcript to the configured LLM, and shows matched questions and extracted answers.
 4. **Clarify Answers** — for medium/low-confidence answers or answers marked as needing clarification, select or type the final answer and optionally add a note. The JSON keeps both the original LLM answer and the manual correction.
-5. **Automatic reset** — after analysis/clarification saves the package and finishes the upload attempt if configured, the main screen returns to a fresh **Start Interview** state.
-6. **Session Tools / Dashboard** — optional utilities for exporting or sharing saved `session.json` packages.
+5. **Durable save and retry** — after analysis/clarification atomically saves `session.json`, the main screen returns to **Start Interview**. Immediate upload is attempted when configured; failures remain pending with bounded backoff and can be retried from Session Tools.
+6. **Session Tools / Dashboard** — export or share saved packages, resume processing, or choose **Retry Pending Sessions Now**.
 7. **Dashboard** — reviews local/cached sessions, refreshes the lightweight server session list on demand, and downloads a full server `session.json` only when a server row is opened.
 8. **Aggregate** — summarizes analyzed local `SurveySessions/*/session.json` packages on device, with older `SurveyExports/*.json` files included for compatibility.
 
-If Survey API is configured, step 3 uploads the complete session package after any required clarification is resolved. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, including interviewer and questionnaire identity fields, and `analysis_answers` stores one extracted row per matched question for SQL summaries.
+If Survey API is configured, the outbox uploads the complete session package after any required clarification is resolved. It creates/reuses a cloud session keyed by the local session ID, persists those IDs, and marks upload complete only after validating the server response. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, and `analysis_answers` stores one extracted row per matched question.
 
 The generated `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. Coordinate objects always place `lat` and `lon` next to each other. Interview paths are saved in `trajectory_points`; each point includes both `ts_ms` and readable UTC `captured_at`.
 
@@ -329,9 +338,10 @@ ios-voice-llm-survey/
 │   ├── ViewController.swift           # Main voice survey UI
 │   ├── LLMService.swift               # OpenAI / Gemini / custom base URL
 │   ├── SurveyAPIClient.swift          # FastAPI client
-│   ├── TrajectoryTracker.swift        # Required GPS start point + interview trajectory sampling
+│   ├── DeferredSessionOutbox.swift     # Folder scanner, backoff, cloud identity + package retry
+│   ├── LocalSessionManifest.swift      # Atomic session_state.json recovery model
+│   ├── TrajectoryTracker.swift        # Fresh GPS attempt, quality mapping, and trajectory sampling
 │   ├── SessionManager.swift           # Local session folders
-│   ├── PendingSurveyUploadStore.swift # Legacy offline answer queue
 │   ├── MapViewController.swift        # Map-first entry (optional)
 │   ├── LocalSessionDashboardViewController.swift # Local/server session dashboard + MapKit route viewer
 │   ├── questionnaire.json
@@ -343,6 +353,7 @@ ios-voice-llm-survey/
 │   ├── schema.sql                     # package index + legacy trajectory/audio tables
 │   ├── scripts/seed_questions.py
 │   ├── scripts/add_questionnaire_schema.py
+│   ├── scripts/add_session_idempotency_schema.py
 │   ├── requirements.txt
 │   ├── .env.example
 │   ├── survey_session_packages/       # runtime only: uploaded session packages, ignored by Git

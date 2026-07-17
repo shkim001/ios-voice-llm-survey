@@ -2,12 +2,54 @@ import Foundation
 import CoreLocation
 import UIKit
 
+enum RecordingStartLocationFailure: Equatable {
+    case permissionDenied
+    case restricted
+    case timedOut
+    case unavailable
+    case stale
+    case lowAccuracy
+}
+
+struct RecordingStartLocationCandidate {
+    let point: PendingTrajectoryStore.Point
+    let horizontalAccuracyM: Double
+    let quality: LocalSessionLocationQuality
+}
+
+enum RecordingStartLocationOutcome {
+    case acceptable(RecordingStartLocationCandidate)
+    case lowAccuracy(RecordingStartLocationCandidate)
+    case failure(RecordingStartLocationFailure)
+}
+
+enum RecordingStartLocationFallbackDecision: Equatable {
+    case retryGPS
+    case useLowAccuracyGPS
+    case recordWithoutGPS
+    case searchForPlace
+    case cancelInterview
+}
+
+enum RecordingStartLocationStateMapping {
+    static func manifestStatus(for failure: RecordingStartLocationFailure) -> LocalSessionLocationStatus {
+        switch failure {
+        case .permissionDenied, .restricted: return .permissionDenied
+        case .timedOut: return .timedOut
+        case .lowAccuracy: return .lowAccuracy
+        case .unavailable, .stale: return .unavailable
+        }
+    }
+}
+
 /// Interview trajectory tracking:
-/// - captures a required GPS point before recording starts
+/// - attempts a fresh GPS point before recording starts
 /// - samples the latest available GPS location while recording
 /// - uploads the saved recording-start point when a cloud identity exists
 final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
     static let shared = TrajectoryTracker()
+    static let recordingStartAccuracyThresholdM: CLLocationAccuracy = 50
+    static let recordingStartMaximumAge: TimeInterval = 60
 
     private let manager = CLLocationManager()
     private let samplingInterval: TimeInterval = 15.0
@@ -40,26 +82,74 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
         stop()
     }
 
-    func captureRequiredRecordingStartPoint() async throws -> PendingTrajectoryStore.Point {
-        let loc = try await OneShotLocationRequester.currentLocation()
-        guard isUsable(loc, maxAgeSeconds: 60) else {
-            throw OneShotLocationError.unavailable
+    func captureRecordingStartLocation() async -> RecordingStartLocationOutcome {
+        do {
+            let location = try await OneShotLocationRequester.currentLocation()
+            let isBackground = await MainActor.run { UIApplication.shared.applicationState != .active }
+            let classification = Self.classifyRecordingStartLocation(
+                location,
+                sessionId: currentSessionId(),
+                isBackground: isBackground
+            )
+            switch classification {
+            case .acceptable, .lowAccuracy:
+                lastKnownLocation = location
+            case .failure:
+                break
+            }
+            return classification
+        } catch let error as OneShotLocationError {
+            switch error {
+            case .permissionDenied: return .failure(.permissionDenied)
+            case .restricted: return .failure(.restricted)
+            case .timedOut: return .failure(.timedOut)
+            case .unavailable: return .failure(.unavailable)
+            }
+        } catch {
+            return .failure(.unavailable)
         }
-
-        lastKnownLocation = loc
-        return makePoint(
-            from: loc,
-            timestamp: Date(),
-            provider: "recording-start",
-            isBackground: await MainActor.run { UIApplication.shared.applicationState != .active },
-            sessionId: currentSessionId()
-        )
     }
 
-    func startInterviewTracking(with startPoint: PendingTrajectoryStore.Point) {
+    static func classifyRecordingStartLocation(
+        _ location: CLLocation,
+        now: Date = Date(),
+        sessionId: String? = nil,
+        isBackground: Bool = false
+    ) -> RecordingStartLocationOutcome {
+        guard CLLocationCoordinate2DIsValid(location.coordinate), location.horizontalAccuracy >= 0 else {
+            return .failure(.unavailable)
+        }
+        guard abs(location.timestamp.timeIntervalSince(now)) <= recordingStartMaximumAge else {
+            return .failure(.stale)
+        }
+
+        let accuracy = Double(location.horizontalAccuracy)
+        let quality: LocalSessionLocationQuality = accuracy <= 10 ? .high
+            : (accuracy <= Double(recordingStartAccuracyThresholdM) ? .acceptable : .low)
+        let point = PendingTrajectoryStore.Point(
+            tsMs: Int64(now.timeIntervalSince1970 * 1000.0),
+            lat: location.coordinate.latitude,
+            lon: location.coordinate.longitude,
+            accuracyM: accuracy,
+            speedMps: location.speed >= 0 ? Double(location.speed) : nil,
+            courseDeg: location.course >= 0 ? Double(location.course) : nil,
+            provider: "recording-start",
+            isBackground: isBackground,
+            sessionId: sessionId
+        )
+        let candidate = RecordingStartLocationCandidate(
+            point: point,
+            horizontalAccuracyM: accuracy,
+            quality: quality
+        )
+        return quality == .low ? .lowAccuracy(candidate) : .acceptable(candidate)
+    }
+
+    func startInterviewTracking(with startPoint: PendingTrajectoryStore.Point?) {
         stopInterviewTracking()
 
-        interviewPoints = [startPoint]
+        interviewPoints = startPoint.map { [$0] } ?? []
+        guard let startPoint else { return }
         activeInterviewSessionId = startPoint.sessionId ?? currentSessionId()
 
         manager.desiredAccuracy = kCLLocationAccuracyBest
@@ -88,7 +178,9 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
 
     @discardableResult
     func stopInterviewTracking() -> [PendingTrajectoryStore.Point] {
-        sampleLatestInterviewLocation()
+        if samplingTimer != nil {
+            sampleLatestInterviewLocation()
+        }
         samplingTimer?.invalidate()
         samplingTimer = nil
         manager.stopUpdatingLocation()
@@ -207,13 +299,16 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
 
 private enum OneShotLocationError: LocalizedError {
     case permissionDenied
+    case restricted
     case unavailable
     case timedOut
 
     var errorDescription: String? {
         switch self {
         case .permissionDenied:
-            return "Location permission is not available."
+            return "Location permission was denied."
+        case .restricted:
+            return "Location access is restricted on this device."
         case .unavailable:
             return "Unable to get a current location."
         case .timedOut:
@@ -263,8 +358,10 @@ private final class OneShotLocationRequester: NSObject, CLLocationManagerDelegat
             manager.requestLocation()
         case .notDetermined:
             manager.requestWhenInUseAuthorization()
-        case .denied, .restricted:
+        case .denied:
             finish(with: .failure(OneShotLocationError.permissionDenied))
+        case .restricted:
+            finish(with: .failure(OneShotLocationError.restricted))
         @unknown default:
             finish(with: .failure(OneShotLocationError.unavailable))
         }
@@ -283,7 +380,17 @@ private final class OneShotLocationRequester: NSObject, CLLocationManagerDelegat
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        finish(with: .failure(error))
+        let locationError = error as? CLError
+        if locationError?.code == .denied {
+            switch manager.authorizationStatus {
+            case .restricted:
+                finish(with: .failure(OneShotLocationError.restricted))
+            default:
+                finish(with: .failure(OneShotLocationError.permissionDenied))
+            }
+        } else {
+            finish(with: .failure(OneShotLocationError.unavailable))
+        }
     }
 
     private func finish(with result: Result<CLLocation, Error>) {

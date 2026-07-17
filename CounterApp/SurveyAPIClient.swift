@@ -39,6 +39,7 @@ final class SurveyAPIClient {
         let appVersion: String?
         let locale: String?
         let respondentId: String?
+        let localSessionId: String?
         
         enum CodingKeys: String, CodingKey {
             case questionnaireVersion = "questionnaire_version"
@@ -46,6 +47,7 @@ final class SurveyAPIClient {
             case appVersion = "app_version"
             case locale
             case respondentId = "respondent_id"
+            case localSessionId = "local_session_id"
         }
     }
     
@@ -111,14 +113,16 @@ final class SurveyAPIClient {
         questionnaireId: String?,
         questionnaireVersion: String,
         appVersion: String?,
-        locale: String?
+        locale: String?,
+        localSessionId: String? = nil
     ) async throws -> SessionCreateResponse {
         let body = SessionCreateRequest(
             questionnaireVersion: questionnaireVersion,
             questionnaireId: questionnaireId,
             appVersion: appVersion,
             locale: locale,
-            respondentId: nil
+            respondentId: nil,
+            localSessionId: localSessionId
         )
         return try await requestJSON(
             method: "POST",

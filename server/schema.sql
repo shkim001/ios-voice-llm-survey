@@ -177,6 +177,25 @@ CREATE TABLE IF NOT EXISTS session_packages (
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Idempotency mapping for POST /sessions. Existing clients may omit the key.
+CREATE TABLE IF NOT EXISTS session_creation_keys (
+  local_session_id VARCHAR(64) NOT NULL,
+  session_id BINARY(16) NOT NULL,
+  respondent_id BINARY(16) NOT NULL,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+
+  PRIMARY KEY (local_session_id),
+  UNIQUE KEY uq_session_creation_keys_session (session_id),
+
+  CONSTRAINT fk_session_creation_keys_session
+    FOREIGN KEY (session_id) REFERENCES survey_sessions(id)
+    ON DELETE CASCADE,
+
+  CONSTRAINT fk_session_creation_keys_respondent
+    FOREIGN KEY (respondent_id) REFERENCES respondents(id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS analysis_answers (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   session_id BINARY(16) NOT NULL,

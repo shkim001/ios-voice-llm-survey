@@ -43,6 +43,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private var matchedQuestions: [MatchedQuestion] = []
     private var interviewerCheckedOptionCodesByQuestionId: [Int: [String]] = [:]
     private var respondentInfo: RespondentInfo?
+    private var didOfferRecoveryThisAppearance = false
     /// Set when pushing from `MapViewController`; passed into the respondent form until a successful submit.
     var mapLocationPrefill: MapLocationPayload?
 
@@ -55,15 +56,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         initializeSessionAndPurge()
         resetInactivityTimer()
 
-        // Legacy answer-row retries are intentionally disabled under package-based storage.
-        Task { [weak self] in
-            await self?.flushPendingSurveyUploads()
-        }
+        DeferredSessionOutbox.shared.start()
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         resetInactivityTimer()
+        offerRecoverableInterviewIfNeeded()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -242,11 +241,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     guard let self = self else { return }
                     self.respondentInfo = info
 
-                    // Create a Cloud session up-front (best-effort). If it fails, we can still enqueue answers later.
-                    Task { [weak self] in
-                        await self?.ensureCloudSessionCreated()
-                    }
-
                     // Start recording only after a fresh GPS point is captured.
                     self.prepareAndStartRecording()
                     self.resetInactivityTimer()
@@ -305,88 +299,131 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func runLLMRecognition() {
-        guard let recordingURL = recordingURL else {
+        guard let recordingURL, let sessionDirectoryURL else {
             showMessage("No recording available. Please record first.")
             return
         }
-
-        // Disable button to prevent duplicate clicks
+        invalidateInactivityTimer()
         llmButton.isEnabled = false
         llmButton.alpha = 0.5
-        statusLabel.text = "Transcribing audio...\nPlease wait"
+        statusLabel.text = "Resuming saved interview processing...\nPlease wait"
         statusLabel.textColor = .systemBlue
-
-        // Step 1: Transcribe audio
-        transcribeAudio(url: recordingURL) { [weak self] transcription in
-            guard let self = self else { return }
-
-            guard let transcription = transcription, !transcription.isEmpty else {
-                DispatchQueue.main.async {
-                    self.statusLabel.text = "Transcription failed"
-                    self.statusLabel.textColor = .systemRed
-                    self.llmButton.isEnabled = true
-                    self.llmButton.alpha = 1.0
-                    self.showMessage("Failed to transcribe audio. Please try again.")
-                }
-                return
-            }
-
-            self.transcription = transcription
-
-            DispatchQueue.main.async {
-                self.statusLabel.text = "Analyzing with LLM...\nPlease wait"
-                self.statusLabel.textColor = .systemBlue
-            }
-
-            // Step 2: Analyze with POE API
-            guard let questions = self.questionnaireData?.questionnaire.questions else {
-                DispatchQueue.main.async {
-                    self.statusLabel.text = "Questionnaire not loaded"
-                    self.statusLabel.textColor = .systemRed
-                    self.llmButton.isEnabled = true
-                    self.llmButton.alpha = 1.0
-                }
-                return
-            }
-
-            Task {
-                do {
-                    let matchedQuestions = try await LLMService.shared.analyzeTranscription(transcription, questions: questions)
-                    let assistedMatches = self.applyInterviewerCheckedOptions(
-                        to: matchedQuestions,
-                        questions: questions
-                    )
-
-                    await MainActor.run {
-                        self.resolveClarificationsIfNeeded(
-                            transcription: transcription,
-                            matchedQuestions: assistedMatches,
-                            recordingURL: recordingURL
-                        )
-                    }
-                } catch {
-                    DispatchQueue.main.async {
-                        let errorMessage = error.localizedDescription
-                        self.statusLabel.text = "LLM analysis failed\nCheck error details"
-                        self.statusLabel.textColor = .systemRed
-                        self.llmButton.isEnabled = true
-                        self.llmButton.alpha = 1.0
-
-                        // Show detailed error in alert
-                        let alert = UIAlertController(
-                            title: "API Call Failed",
-                            message: errorMessage,
-                            preferredStyle: .alert
-                        )
-                        alert.addAction(UIAlertAction(title: "OK", style: .default))
-                        self.present(alert, animated: true)
-
-                        // Also log to console
-                        print("LLM API Error: \(errorMessage)")
-                    }
-                }
-            }
+        Task { [weak self] in
+            guard let self else { return }
+            let outcome = await DurableInterviewProcessingCoordinator.shared.resume(
+                sessionDirectoryURL: sessionDirectoryURL,
+                audioURL: recordingURL
+            )
+            self.handleDurableProcessingOutcome(outcome, recordingURL: recordingURL)
         }
+    }
+
+    private func handleDurableProcessingOutcome(
+        _ outcome: DurableProcessingOutcome,
+        recordingURL: URL
+    ) {
+        resetInactivityTimer()
+        llmButton.isEnabled = true
+        llmButton.alpha = 1
+
+        switch outcome {
+        case .needsClarification(let transcript, let matches),
+             .analysisCompleted(let transcript, let matches):
+            self.transcription = transcript
+            let questions = questionnaireData?.questionnaire.questions ?? []
+            let assistedMatches = applyInterviewerCheckedOptions(to: matches, questions: questions)
+            let needsClarification = assistedMatches.contains { requiresClarification($0) }
+            do {
+                try updateCurrentManifest { manifest in
+                    manifest.analysisStatus = .completed
+                    manifest.matchedQuestions = assistedMatches
+                    manifest.clarificationStatus = needsClarification ? .pending : .notRequired
+                    manifest.analysisErrorCategory = nil
+                    manifest.retry.lastError = nil
+                }
+            } catch {
+                presentProcessingRecoveryAlert(
+                    title: "Analysis Save Failed",
+                    message: error.localizedDescription,
+                    stage: .analysis
+                )
+                return
+            }
+            statusLabel.text = needsClarification ? "Analysis saved; clarification required" : "Analysis saved locally"
+            statusLabel.textColor = .systemGreen
+            resolveClarificationsIfNeeded(
+                transcription: transcript,
+                matchedQuestions: assistedMatches,
+                recordingURL: recordingURL
+            )
+        case .readyToUpload:
+            statusLabel.text = "Interview is ready to upload"
+            statusLabel.textColor = .systemGreen
+        case .deferred(let stage, _, let message):
+            statusLabel.text = "Processing saved for later"
+            statusLabel.textColor = .systemOrange
+            presentProcessingRecoveryAlert(
+                title: stage == .transcription ? "Transcription Requires Connectivity" : "Processing Deferred",
+                message: message,
+                stage: stage
+            )
+        case .failed(let stage, _, let message):
+            statusLabel.text = stage == .transcription ? "Transcription needs retry" : "LLM analysis needs retry"
+            statusLabel.textColor = .systemRed
+            presentProcessingRecoveryAlert(
+                title: stage == .transcription ? "Transcription Failed" : "LLM Analysis Failed",
+                message: message,
+                stage: stage
+            )
+        case .alreadyRunning:
+            statusLabel.text = "Processing is already running for this interview"
+            statusLabel.textColor = .systemOrange
+        }
+    }
+
+    private func presentProcessingRecoveryAlert(
+        title: String,
+        message: String,
+        stage: DurableProcessingStage
+    ) {
+        let alert = UIAlertController(
+            title: title,
+            message: "\(message)\n\nThe original audio and saved progress remain on this iPad.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Try Again", style: .default) { [weak self] _ in
+            self?.runLLMRecognition()
+        })
+        alert.addAction(UIAlertAction(title: "Process Later", style: .cancel) { [weak self] _ in
+            self?.finishAndProcessLater(stage: stage)
+        })
+        present(alert, animated: true)
+    }
+
+    private func finishAndProcessLater(stage: DurableProcessingStage) {
+        guard let sessionDirectoryURL, let recordingURL else {
+            showBlockingRecordingError(
+                title: "Draft Verification Failed",
+                message: "The active interview was not cleared because its saved audio manifest could not be verified."
+            )
+            return
+        }
+        do {
+            let manifest = try LocalSessionManifestStore.load(from: sessionDirectoryURL)
+            guard manifest.audioStatus == .recordedLocally else { throw CocoaError(.fileReadCorruptFile) }
+            try verifyRecordedAudio(at: recordingURL)
+        } catch {
+            showBlockingRecordingError(
+                title: "Draft Verification Failed",
+                message: "The active interview was not cleared because its saved audio or manifest could not be verified. \(error.localizedDescription)"
+            )
+            return
+        }
+        startNextParticipant()
+        statusLabel.text = stage == .transcription
+            ? "Audio saved; transcription pending"
+            : "Audio and transcript saved; analysis pending"
+        statusLabel.textColor = .systemOrange
     }
 
     @IBAction func exportButtonTapped(_ sender: UIButton) {
@@ -410,6 +447,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         alert.addAction(UIAlertAction(title: "Dashboard", style: .default) { [weak self] _ in
             self?.showDashboard()
         })
+        alert.addAction(UIAlertAction(title: "Resume Saved Interview", style: .default) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                self?.offerRecoverableInterviewIfNeeded(force: true)
+            }
+        })
+        alert.addAction(UIAlertAction(title: "Retry Pending Sessions Now", style: .default) { [weak self] _ in
+            self?.retryPendingSessionsNow()
+        })
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
 
         if let popover = alert.popoverPresentationController {
@@ -417,6 +462,117 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
 
         present(alert, animated: true)
+    }
+
+    private func retryPendingSessionsNow() {
+        statusLabel.text = "Retrying saved sessions..."
+        statusLabel.textColor = .systemOrange
+        Task { [weak self] in
+            let summary = await DeferredSessionOutbox.shared.retryNow()
+            guard let self else { return }
+            if summary.duplicateRunSuppressed {
+                showMessage("Deferred processing is already running.")
+            } else if !summary.uploadedSessionIds.isEmpty {
+                showMessage("Uploaded \(summary.uploadedSessionIds.count) saved session(s).")
+            } else if !summary.failedSessionIds.isEmpty {
+                showMessage("Retry finished. Saved sessions remain protected and will be retried later.")
+            } else if !summary.deferredSessionIds.isEmpty {
+                showMessage("Some saved sessions still need transcription, analysis, clarification, configuration, or a later retry.")
+            } else {
+                showMessage("No saved session is currently ready to retry.")
+            }
+        }
+    }
+
+    private func offerRecoverableInterviewIfNeeded(force: Bool = false) {
+        guard !isRecording, respondentInfo == nil, recordingURL == nil else { return }
+        guard force || !didOfferRecoveryThisAppearance else { return }
+        guard presentedViewController == nil else { return }
+        didOfferRecoveryThisAppearance = true
+
+        guard let directoryURL = recoverableSessionDirectories().first,
+              let manifest = try? LocalSessionManifestStore.load(from: directoryURL) else {
+            if force { showMessage("No saved interview currently needs processing.") }
+            return
+        }
+
+        let stage: String
+        if manifest.transcriptionStatus != .completed {
+            stage = "transcription"
+        } else if manifest.analysisStatus != .completed {
+            stage = "LLM analysis"
+        } else if manifest.clarificationStatus == .pending {
+            stage = "clarification"
+        } else {
+            stage = "upload"
+        }
+        let alert = UIAlertController(
+            title: "Resume Saved Interview?",
+            message: "A recoverable interview is waiting for \(stage). Its original audio remains saved.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Resume Processing", style: .default) { [weak self] _ in
+            self?.resumeRecoverableInterview(in: directoryURL)
+        })
+        alert.addAction(UIAlertAction(title: "Later", style: .cancel))
+        present(alert, animated: true)
+    }
+
+    private func recoverableSessionDirectories() -> [URL] {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let root = documents.appendingPathComponent("SurveySessions", isDirectory: true)
+        let directories = (try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return directories.compactMap { directory -> (URL, TimeInterval)? in
+            guard let manifest = try? LocalSessionManifestStore.load(from: directory),
+                  manifest.audioStatus == .recordedLocally,
+                  manifest.uploadStatus != .uploaded,
+                  manifest.audioFileName != nil else { return nil }
+            let requiresWork = manifest.transcriptionStatus != .completed
+                || manifest.analysisStatus != .completed
+                || manifest.clarificationStatus == .pending
+                || manifest.uploadStatus != .uploaded
+            return requiresWork ? (directory, manifest.updatedAt) : nil
+        }
+        .sorted { $0.1 > $1.1 }
+        .map(\.0)
+    }
+
+    private func resumeRecoverableInterview(in directoryURL: URL) {
+        do {
+            let session = try SessionManager.shared.resumeSession(at: directoryURL)
+            let manifest = try LocalSessionManifestStore.load(from: directoryURL)
+            guard let audioFileName = manifest.audioFileName else { throw CocoaError(.fileNoSuchFile) }
+            let audioURL = directoryURL.appendingPathComponent(audioFileName)
+            try verifyRecordedAudio(at: audioURL)
+
+            sessionId = session.id
+            sessionDirectoryURL = directoryURL
+            recordingURL = audioURL
+            respondentInfo = manifest.respondentSnapshot
+            questionnaireData = manifest.questionnaireSnapshot.map { QuestionnaireData(questionnaire: $0) }
+            transcription = manifest.transcription
+            matchedQuestions = manifest.matchedQuestions
+            cloudRespondentId = manifest.cloudRespondentId
+            cloudSessionId = manifest.cloudSessionId
+            recordingStartTrajectoryPoint = manifest.locationPoint
+            interviewTrajectoryPoints = manifest.trajectoryPoints
+            interviewerCheckedOptionCodesByQuestionId = Dictionary(uniqueKeysWithValues:
+                manifest.interviewerCheckedOptionCodesByQuestionId.compactMap { key, value in
+                    Int(key).map { ($0, value) }
+                }
+            )
+            updateNextParticipantButtonState()
+            runLLMRecognition()
+        } catch {
+            showBlockingRecordingError(
+                title: "Saved Interview Could Not Be Resumed",
+                message: error.localizedDescription
+            )
+        }
     }
 
     private func exportCurrentSessionJSON() {
@@ -1095,9 +1251,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func selectQuestionnaireIfNeeded(completion: @escaping () -> Void) {
-        let cached = QuestionnaireStore.shared.cachedQuestionnaires()
-        guard cached.count > 1 || SurveyAPIClient.shared.isConfigured() else {
-            if let only = cached.first {
+        let candidates = questionnaireSelectionCandidates()
+        guard candidates.count > 1 || SurveyAPIClient.shared.isConfigured() else {
+            if let only = candidates.first {
                 QuestionnaireStore.shared.saveSelectedQuestionnaire(only)
                 questionnaireData = QuestionnaireData(questionnaire: only)
             }
@@ -1105,7 +1261,16 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             return
         }
 
-        presentQuestionnaireSelection(cached: cached, completion: completion)
+        presentQuestionnaireSelection(cached: candidates, completion: completion)
+    }
+
+    private func questionnaireSelectionCandidates(_ remoteOrCached: [Questionnaire]? = nil) -> [Questionnaire] {
+        var candidates = remoteOrCached ?? QuestionnaireStore.shared.cachedQuestionnaires()
+        if let current = questionnaireData?.questionnaire,
+           !candidates.contains(where: { $0.id == current.id && $0.version == current.version }) {
+            candidates.insert(current, at: 0)
+        }
+        return candidates
     }
 
     private func presentQuestionnaireSelection(cached: [Questionnaire], completion: @escaping () -> Void) {
@@ -1146,7 +1311,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         self.statusLabel.textColor = .systemOrange
                         self.showMessage("No published questionnaires were returned by the server.")
                         self.presentQuestionnaireSelection(
-                            cached: QuestionnaireStore.shared.cachedQuestionnaires(),
+                            cached: self.questionnaireSelectionCandidates(),
                             completion: completion
                         )
                         return
@@ -1161,7 +1326,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     self.questionnaireData = QuestionnaireData(questionnaire: selected)
                     self.statusLabel.text = "Questionnaire list refreshed"
                     self.statusLabel.textColor = .systemGreen
-                    self.presentQuestionnaireSelection(cached: active, completion: completion)
+                    self.presentQuestionnaireSelection(
+                        cached: self.questionnaireSelectionCandidates(active),
+                        completion: completion
+                    )
                 }
             } catch {
                 await MainActor.run {
@@ -1170,7 +1338,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     self.statusLabel.textColor = .systemRed
                     self.showMessage("Failed to refresh questionnaires: \(error.localizedDescription)")
                     self.presentQuestionnaireSelection(
-                        cached: QuestionnaireStore.shared.cachedQuestionnaires(),
+                        cached: self.questionnaireSelectionCandidates(),
                         completion: completion
                     )
                 }
@@ -1218,38 +1386,290 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func prepareAndStartRecording() {
         guard !isRecording else { return }
 
+        do {
+            let session = try SessionManager.shared.ensureCurrentSession()
+            sessionId = session.id
+            sessionDirectoryURL = session.directoryURL
+            let manifest = LocalSessionManifest(
+                localSessionId: session.id,
+                createdAt: session.createdAt.timeIntervalSince1970,
+                interviewerSnapshot: InterviewerProfileStore.shared.currentProfile,
+                respondentSnapshot: respondentInfo,
+                questionnaireSnapshot: questionnaireData?.questionnaire,
+                locationStatus: .acquiring,
+                locationSource: .none,
+                locationLabel: respondentInfo?.location
+            )
+            try LocalSessionManifestStore.save(manifest, to: session.directoryURL)
+        } catch {
+            showBlockingRecordingError(
+                title: "Interview Draft Could Not Be Saved",
+                message: "Recording was not started. (error.localizedDescription)"
+            )
+            return
+        }
+
         recordButton.isEnabled = false
         recordButton.alpha = 0.5
         statusLabel.text = "Checking GPS location...\nPlease wait"
         statusLabel.textColor = .systemBlue
 
         Task { [weak self] in
-            do {
-                let point = try await TrajectoryTracker.shared.captureRequiredRecordingStartPoint()
-                await MainActor.run {
-                    guard let self = self else { return }
-                    self.recordingStartTrajectoryPoint = point
-                    self.recordButton.isEnabled = true
-                    self.recordButton.alpha = 1.0
-                    self.isRecording = true
-                    self.startRecording(with: point)
-                }
-            } catch {
-                await MainActor.run {
-                    guard let self = self else { return }
-                    self.recordingStartTrajectoryPoint = nil
-                    self.isRecording = false
-                    self.recordButton.isEnabled = true
-                    self.recordButton.alpha = 1.0
-                    self.statusLabel.text = "GPS location unavailable"
-                    self.statusLabel.textColor = .systemRed
-                    self.showMessage("Could not get a current GPS location, so recording was not started. Please make sure Location Services are enabled and try again.")
-                }
+            let outcome = await TrajectoryTracker.shared.captureRecordingStartLocation()
+            await MainActor.run {
+                guard let self else { return }
+                self.handleRecordingStartLocation(outcome)
             }
         }
     }
 
-    private func startRecording(with recordingStartPoint: PendingTrajectoryStore.Point) {
+    private func handleRecordingStartLocation(_ outcome: RecordingStartLocationOutcome) {
+        switch outcome {
+        case .acceptable(let candidate):
+            do {
+                try persistLocationDecision(
+                    status: .available,
+                    source: .deviceGPS,
+                    quality: candidate.quality,
+                    horizontalAccuracyM: candidate.horizontalAccuracyM,
+                    point: candidate.point,
+                    place: nil,
+                    error: nil
+                )
+                beginRecording(with: candidate.point)
+            } catch {
+                showLocationPersistenceFailure(error)
+            }
+        case .lowAccuracy(let candidate):
+            do {
+                try persistLocationDecision(
+                    status: .lowAccuracy,
+                    source: .deviceGPS,
+                    quality: .low,
+                    horizontalAccuracyM: candidate.horizontalAccuracyM,
+                    point: candidate.point,
+                    place: nil,
+                    error: "GPS accuracy was (Int(candidate.horizontalAccuracyM.rounded())) meters."
+                )
+                presentLocationFallback(for: .lowAccuracy, lowAccuracyCandidate: candidate)
+            } catch {
+                showLocationPersistenceFailure(error)
+            }
+        case .failure(let failure):
+            do {
+                try persistLocationDecision(
+                    status: RecordingStartLocationStateMapping.manifestStatus(for: failure),
+                    source: .none,
+                    quality: .unknown,
+                    horizontalAccuracyM: nil,
+                    point: nil,
+                    place: nil,
+                    error: locationFailureMessage(failure)
+                )
+                presentLocationFallback(for: failure, lowAccuracyCandidate: nil)
+            } catch {
+                showLocationPersistenceFailure(error)
+            }
+        }
+    }
+
+    private func beginRecording(with point: PendingTrajectoryStore.Point?) {
+        recordingStartTrajectoryPoint = point
+        recordButton.isEnabled = true
+        recordButton.alpha = 1.0
+        isRecording = true
+        startRecording(with: point)
+    }
+
+    private func persistLocationDecision(
+        status: LocalSessionLocationStatus,
+        source: LocalSessionLocationSource,
+        quality: LocalSessionLocationQuality,
+        horizontalAccuracyM: Double?,
+        point: PendingTrajectoryStore.Point?,
+        place: LocalSessionPlaceSnapshot?,
+        error: String?
+    ) throws {
+        guard let sessionDirectoryURL else { throw CocoaError(.fileNoSuchFile) }
+        try LocalSessionManifestStore.update(in: sessionDirectoryURL) { manifest in
+            manifest.locationStatus = status
+            manifest.locationSource = source
+            manifest.locationQuality = quality
+            manifest.locationHorizontalAccuracyM = horizontalAccuracyM
+            manifest.locationCoordinates = LocalSessionCoordinateSnapshot(
+                latitude: place?.latitude ?? point?.lat,
+                longitude: place?.longitude ?? point?.lon
+            )
+            manifest.locationPoint = point
+            manifest.placeSnapshot = place
+            manifest.locationLabel = place?.displayLabel ?? self.respondentInfo?.location
+            manifest.trajectoryPoints = point.map { [$0] } ?? []
+            manifest.retry.lastError = error
+        }
+    }
+
+    private func presentLocationFallback(
+        for failure: RecordingStartLocationFailure,
+        lowAccuracyCandidate: RecordingStartLocationCandidate?
+    ) {
+        recordButton.isEnabled = true
+        recordButton.alpha = 1
+        isRecording = false
+        statusLabel.text = "Choose how to set interview location"
+        statusLabel.textColor = .systemOrange
+
+        let alert = UIAlertController(
+            title: lowAccuracyCandidate == nil ? "GPS Location Unavailable" : "GPS Accuracy Is Low",
+            message: locationFailureMessage(failure) + "\n\nYou can retry, search for a place, or record without GPS.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Try GPS Again", style: .default) { [weak self] _ in
+            self?.retryRecordingStartGPS()
+        })
+        if let candidate = lowAccuracyCandidate {
+            alert.addAction(UIAlertAction(title: "Use Low-Accuracy GPS", style: .default) { [weak self] _ in
+                guard let self else { return }
+                do {
+                    try self.persistLocationDecision(
+                        status: .lowAccuracy,
+                        source: .deviceGPS,
+                        quality: .low,
+                        horizontalAccuracyM: candidate.horizontalAccuracyM,
+                        point: candidate.point,
+                        place: nil,
+                        error: nil
+                    )
+                    self.beginRecording(with: candidate.point)
+                } catch {
+                    self.showLocationPersistenceFailure(error)
+                }
+            })
+        }
+        alert.addAction(UIAlertAction(title: "Record Without GPS", style: .default) { [weak self] _ in
+            guard let self else { return }
+            do {
+                try self.persistLocationDecision(
+                    status: .unavailable,
+                    source: .none,
+                    quality: .unknown,
+                    horizontalAccuracyM: nil,
+                    point: nil,
+                    place: nil,
+                    error: nil
+                )
+                self.beginRecording(with: nil)
+            } catch {
+                self.showLocationPersistenceFailure(error)
+            }
+        })
+        alert.addAction(UIAlertAction(title: "Search for an Address or Place", style: .default) { [weak self] _ in
+            self?.presentPlaceSearch()
+        })
+        alert.addAction(UIAlertAction(title: "Cancel Interview", style: .cancel) { [weak self] _ in
+            self?.cancelInterviewBeforeRecording()
+        })
+        present(alert, animated: true)
+    }
+
+    private func retryRecordingStartGPS() {
+        do {
+            try persistLocationDecision(
+                status: .acquiring,
+                source: .none,
+                quality: .unknown,
+                horizontalAccuracyM: nil,
+                point: nil,
+                place: nil,
+                error: nil
+            )
+        } catch {
+            showLocationPersistenceFailure(error)
+            return
+        }
+        prepareAndStartRecordingFromExistingDraft()
+    }
+
+    private func prepareAndStartRecordingFromExistingDraft() {
+        recordButton.isEnabled = false
+        recordButton.alpha = 0.5
+        statusLabel.text = "Checking GPS location...\nPlease wait"
+        statusLabel.textColor = .systemBlue
+        Task { [weak self] in
+            let outcome = await TrajectoryTracker.shared.captureRecordingStartLocation()
+            await MainActor.run { self?.handleRecordingStartLocation(outcome) }
+        }
+    }
+
+    private func presentPlaceSearch() {
+        let search = PlaceSearchViewController(
+            onSelect: { [weak self] place in
+                guard let self else { return }
+                do {
+                    try self.persistLocationDecision(
+                        status: .available,
+                        source: .placeSearch,
+                        quality: .unknown,
+                        horizontalAccuracyM: nil,
+                        point: nil,
+                        place: place,
+                        error: nil
+                    )
+                    self.beginRecording(with: nil)
+                } catch {
+                    self.showLocationPersistenceFailure(error)
+                }
+            },
+            onCancel: { [weak self] in
+                self?.presentLocationFallback(for: .unavailable, lowAccuracyCandidate: nil)
+            },
+            onFailure: { [weak self] error in
+                guard let self else { return }
+                let alert = UIAlertController(
+                    title: "Place Search Failed",
+                    message: "\(error.localizedDescription)\n\nReturn to the location choices to retry GPS, record without GPS, or search again.",
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: "Location Choices", style: .default) { [weak self] _ in
+                    self?.presentLocationFallback(for: .unavailable, lowAccuracyCandidate: nil)
+                })
+                self.present(alert, animated: true)
+            }
+        )
+        let navigation = UINavigationController(rootViewController: search)
+        navigation.modalPresentationStyle = .formSheet
+        present(navigation, animated: true)
+    }
+
+    private func cancelInterviewBeforeRecording() {
+        if let sessionDirectoryURL {
+            try? LocalSessionManifestStore.remove(from: sessionDirectoryURL)
+        }
+        startNextParticipant()
+        statusLabel.text = "Interview cancelled"
+    }
+
+    private func showLocationPersistenceFailure(_ error: Error) {
+        recordButton.isEnabled = true
+        recordButton.alpha = 1
+        isRecording = false
+        showBlockingRecordingError(
+            title: "Location Choice Could Not Be Saved",
+            message: "Recording was not started. \(error.localizedDescription)"
+        )
+    }
+
+    private func locationFailureMessage(_ failure: RecordingStartLocationFailure) -> String {
+        switch failure {
+        case .permissionDenied: return "Location permission is denied."
+        case .restricted: return "Location access is restricted on this device."
+        case .timedOut: return "The GPS request timed out."
+        case .unavailable: return "A current device GPS location is unavailable."
+        case .stale: return "The available GPS location is older than 60 seconds."
+        case .lowAccuracy: return "The device GPS estimate is less accurate than the 50-meter threshold."
+        }
+    }
+
+    private func startRecording(with recordingStartPoint: PendingTrajectoryStore.Point?) {
         resetInactivityTimer()
         let audioSession = AVAudioSession.sharedInstance()
 
@@ -1265,13 +1685,17 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         let url: URL
         do {
-            // Create/ensure per-participant session folder and store recording inside it
+            // The recoverable session manifest already exists before this path is created.
             let session = try SessionManager.shared.ensureCurrentSession()
             sessionId = session.id
             sessionDirectoryURL = session.directoryURL
 
             url = try SessionManager.shared.makeRecordingURL()
             recordingURL = url
+            try LocalSessionManifestStore.update(in: session.directoryURL) { manifest in
+                manifest.audioFileName = url.lastPathComponent
+                manifest.audioStatus = .preparing
+            }
             writeRecordingMetadata(for: url, recordingStartPoint: recordingStartPoint)
         } catch {
             showMessage("Failed to create session/recording path: \(error.localizedDescription)")
@@ -1290,9 +1714,22 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         do {
             audioRecorder = try AVAudioRecorder(url: url, settings: settings)
             audioRecorder?.isMeteringEnabled = true
-            audioRecorder?.record()
+            guard audioRecorder?.record() == true else {
+                throw NSError(
+                    domain: "VoiceSurveyRecording",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "The audio recorder did not start."]
+                )
+            }
+            if let sessionDirectoryURL {
+                try LocalSessionManifestStore.update(in: sessionDirectoryURL) { manifest in
+                    manifest.audioStatus = .recording
+                    manifest.recordingStartedAt = Date().timeIntervalSince1970
+                    manifest.retry.lastError = nil
+                }
+            }
             TrajectoryTracker.shared.startInterviewTracking(with: recordingStartPoint)
-            interviewTrajectoryPoints = [recordingStartPoint]
+            interviewTrajectoryPoints = recordingStartPoint.map { [$0] } ?? []
 
             updateButton(recordButton, title: "Stop Recording", backgroundColor: .systemOrange)
             statusLabel.text = "Recording...\nSpeak into microphone"
@@ -1304,7 +1741,17 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             updateNextParticipantButtonState()
             presentRecordingMonitor()
         } catch {
-            showMessage("Recording failed to start: \(error.localizedDescription)")
+            audioRecorder?.stop()
+            if let sessionDirectoryURL {
+                try? LocalSessionManifestStore.update(in: sessionDirectoryURL) { manifest in
+                    manifest.audioStatus = .failed
+                    manifest.retry.lastError = error.localizedDescription
+                }
+            }
+            showBlockingRecordingError(
+                title: "Recording Could Not Start",
+                message: "The local session draft was kept. \(error.localizedDescription)"
+            )
             isRecording = false
             updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
             dashboardButton?.isEnabled = true
@@ -1317,10 +1764,52 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     private func stopRecording(showReview: Bool = false) {
         resetInactivityTimer()
+        let stoppedAt = Date()
         audioRecorder?.stop()
         interviewTrajectoryPoints = TrajectoryTracker.shared.stopInterviewTracking()
+        let monitorViewController = recordingMonitorViewController
+        interviewerCheckedOptionCodesByQuestionId = monitorViewController?.selectedMultipleChoiceAnswers() ?? [:]
         if let recordingURL {
             updateRecordingTrajectoryMetadata(for: recordingURL, points: interviewTrajectoryPoints)
+        }
+
+        do {
+            guard let recordingURL else {
+                throw NSError(
+                    domain: "VoiceSurveyRecording",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "The recording path is missing."]
+                )
+            }
+            try verifyRecordedAudio(at: recordingURL)
+            guard let sessionDirectoryURL else {
+                throw NSError(
+                    domain: "VoiceSurveyRecording",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "The local session folder is missing."]
+                )
+            }
+            let checkedOptions = Dictionary(uniqueKeysWithValues: interviewerCheckedOptionCodesByQuestionId.map {
+                (String($0.key), $0.value)
+            })
+            try LocalSessionManifestStore.update(in: sessionDirectoryURL, now: stoppedAt) { manifest in
+                manifest.audioStatus = .recordedLocally
+                manifest.recordingStoppedAt = stoppedAt.timeIntervalSince1970
+                manifest.trajectoryPoints = interviewTrajectoryPoints
+                manifest.interviewerCheckedOptionCodesByQuestionId = checkedOptions
+                manifest.retry.lastError = nil
+            }
+        } catch {
+            if let sessionDirectoryURL {
+                try? LocalSessionManifestStore.update(in: sessionDirectoryURL) { manifest in
+                    manifest.audioStatus = .failed
+                    manifest.recordingStoppedAt = stoppedAt.timeIntervalSince1970
+                    manifest.trajectoryPoints = interviewTrajectoryPoints
+                    manifest.retry.lastError = error.localizedDescription
+                }
+            }
+            handleRecordingPersistenceFailure(error, monitorViewController: monitorViewController)
+            return
         }
 
         updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
@@ -1337,8 +1826,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         recordedData = "Recording data - Timestamp: \(Date().timeIntervalSince1970)"
         updateNextParticipantButtonState()
-        let monitorViewController = recordingMonitorViewController
-        interviewerCheckedOptionCodesByQuestionId = monitorViewController?.selectedMultipleChoiceAnswers() ?? [:]
         recordingMonitorViewController = nil
 
         if showReview {
@@ -1352,6 +1839,79 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         } else {
             monitorViewController?.dismiss(animated: true)
         }
+    }
+
+    private func verifyRecordedAudio(at url: URL) throws {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else {
+            throw NSError(
+                domain: "VoiceSurveyRecording",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "The recorded audio file does not exist."]
+            )
+        }
+        let attributes = try fm.attributesOfItem(atPath: url.path)
+        let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        guard fileSize > 0 else {
+            throw NSError(
+                domain: "VoiceSurveyRecording",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "The recorded audio file is empty."]
+            )
+        }
+        let handle = try FileHandle(forReadingFrom: url)
+        try handle.close()
+    }
+
+    private func handleRecordingPersistenceFailure(
+        _ error: Error,
+        monitorViewController: UIViewController?
+    ) {
+        isRecording = false
+        recordButton.isEnabled = false
+        recordButton.alpha = 0.5
+        dashboardButton?.isEnabled = true
+        audioFilesButton?.isEnabled = true
+        dashboardButton?.alpha = 1.0
+        audioFilesButton?.alpha = 1.0
+        statusLabel.text = "Local recording verification failed"
+        statusLabel.textColor = .systemRed
+        recordingMonitorViewController = nil
+
+        let presentError: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.showBlockingRecordingError(
+                title: "Recording Was Not Safely Finalized",
+                message: "The app could not verify both the local audio and session manifest. The current participant was not reset. Files already written were kept.\n\n\(error.localizedDescription)"
+            )
+        }
+        if let monitorViewController {
+            monitorViewController.dismiss(animated: true, completion: presentError)
+        } else {
+            presentError()
+        }
+    }
+
+    private func showBlockingRecordingError(title: String, message: String) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Keep Files", style: .default))
+        alert.addAction(UIAlertAction(title: "Discard Audio and Draft", style: .destructive) { [weak self] _ in
+            self?.discardCurrentRecording()
+        })
+        present(alert, animated: true)
+    }
+
+    private func updateCurrentManifest(
+        _ mutate: (inout LocalSessionManifest) -> Void
+    ) throws {
+        guard let sessionDirectoryURL else {
+            throw NSError(
+                domain: "LocalSessionManifest",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The current session directory is unavailable."]
+            )
+        }
+        try LocalSessionManifestStore.update(in: sessionDirectoryURL, mutate)
     }
 
     private func presentRecordingMonitor() {
@@ -1441,7 +2001,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func confirmDiscardCurrentRecording(from presenter: UIViewController? = nil) {
         let alert = UIAlertController(
             title: "Discard Recording?",
-            message: "This deletes the current audio file and its local recording metadata. This cannot be undone.",
+            message: "This permanently deletes the current audio file, recording sidecar, and recoverable session draft from this iPad. This cannot be undone.",
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
@@ -1472,6 +2032,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 }
                 if FileManager.default.fileExists(atPath: metadataURL.path) {
                     try FileManager.default.removeItem(at: metadataURL)
+                }
+                if let sessionDirectoryURL {
+                    try LocalSessionManifestStore.remove(from: sessionDirectoryURL)
                 }
             } catch {
                 showMessage("Failed to discard recording: \(error.localizedDescription)")
@@ -1514,16 +2077,32 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         updateNextParticipantButtonState()
     }
 
-    private func writeRecordingMetadata(for recordingURL: URL, recordingStartPoint: PendingTrajectoryStore.Point) {
+    private func writeRecordingMetadata(for recordingURL: URL, recordingStartPoint: PendingTrajectoryStore.Point?) {
         let metadataURL = recordingURL.deletingPathExtension().appendingPathExtension("json")
         var metadata: [String: Any] = [
             "recording_file": recordingURL.lastPathComponent,
             "recorded_at_epoch": Date().timeIntervalSince1970,
             "session_id": sessionId ?? "",
             "location": respondentInfo?.location ?? "",
-            "recording_start_trajectory_point": trajectoryPointDictionary(recordingStartPoint),
-            "trajectory_points": [trajectoryPointDictionary(recordingStartPoint)]
+            "trajectory_points": recordingStartPoint.map { [trajectoryPointDictionary($0)] } ?? []
         ]
+        if let recordingStartPoint {
+            metadata["recording_start_trajectory_point"] = trajectoryPointDictionary(recordingStartPoint)
+        }
+        if let sessionDirectoryURL,
+           let manifest = try? LocalSessionManifestStore.load(from: sessionDirectoryURL) {
+            var location: [String: Any] = [
+                "status": manifest.locationStatus.rawValue,
+                "source": manifest.locationSource.rawValue,
+                "quality": manifest.locationQuality.rawValue
+            ]
+            location["horizontal_accuracy_m"] = manifest.locationHorizontalAccuracyM
+            location["label"] = manifest.placeSnapshot?.displayLabel ?? manifest.locationLabel
+            location["formatted_address"] = manifest.placeSnapshot?.formattedAddress
+            location["latitude"] = (manifest.locationCoordinates.latitude as Any?) ?? NSNull()
+            location["longitude"] = (manifest.locationCoordinates.longitude as Any?) ?? NSNull()
+            metadata["resolved_location"] = location
+        }
 
         if let info = respondentInfo {
             var respondentMetadata: [String: Any] = [
@@ -1605,6 +2184,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let interviewerInfo: InterviewerProfile?
         let respondentInfo: RespondentInfo?
         let locationLabel: String?
+        let location: SessionPackageLocation
         let audio: SessionPackageAudio?
         let recordingStartTrajectoryPoint: SessionPackageTrajectoryPoint?
         let trajectoryPoints: [SessionPackageTrajectoryPoint]
@@ -1620,6 +2200,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             case interviewerInfo = "interviewer_info"
             case respondentInfo = "respondent_info"
             case locationLabel = "location_label"
+            case location
             case audio
             case recordingStartTrajectoryPoint = "recording_start_trajectory_point"
             case trajectoryPoints = "trajectory_points"
@@ -1637,6 +2218,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             try container.encodeIfPresent(interviewerInfo, forKey: .interviewerInfo)
             try container.encodeIfPresent(respondentInfo, forKey: .respondentInfo)
             try container.encodeIfPresent(locationLabel, forKey: .locationLabel)
+            try container.encode(location, forKey: .location)
             try container.encodeIfPresent(audio, forKey: .audio)
             try container.encodeIfPresent(recordingStartTrajectoryPoint, forKey: .recordingStartTrajectoryPoint)
             try container.encode(trajectoryPoints, forKey: .trajectoryPoints)
@@ -1740,6 +2322,28 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 
+    private struct SessionPackageLocation: Encodable {
+        let status: String
+        let source: String
+        let quality: String
+        let label: String?
+        let formattedAddress: String?
+        let latitude: Double?
+        let longitude: Double?
+        let horizontalAccuracyM: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case status
+            case source
+            case quality
+            case label
+            case formattedAddress = "formatted_address"
+            case latitude
+            case longitude
+            case horizontalAccuracyM = "horizontal_accuracy_m"
+        }
+    }
+
     private struct SessionPackageTrajectoryPoint: Encodable {
         let tsMs: Int64
         let capturedAt: String
@@ -1802,15 +2406,17 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         let timestampString = dateFormatter.string(from: Date())
+        let manifest = sessionDirectoryURL.flatMap { try? LocalSessionManifestStore.load(from: $0) }
+        let packageQuestionnaire = manifest?.questionnaireSnapshot ?? questionnaireData?.questionnaire
 
-        let questionnaire = questionnaireData.map {
+        let questionnaire = packageQuestionnaire.map {
             SessionPackageQuestionnaire(
-                id: $0.questionnaire.id,
-                version: $0.questionnaire.version,
-                title: $0.questionnaire.title,
-                description: $0.questionnaire.description,
-                hash: $0.questionnaire.hash,
-                questions: $0.questionnaire.questions.map {
+                id: $0.id,
+                version: $0.version,
+                title: $0.title,
+                description: $0.description,
+                hash: $0.hash,
+                questions: $0.questions.map {
                     SessionPackageQuestion(
                         id: $0.id,
                         question: $0.question,
@@ -1833,10 +2439,23 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             exportTime: timestampString,
             timestamp: timestamp,
             localSessionId: sessionId ?? "",
-            questionnaireTitle: questionnaireData?.questionnaire.title ?? "Unknown",
+            questionnaireTitle: packageQuestionnaire?.title ?? "Unknown",
             totalResponses: 1,
             questionnaire: questionnaire,
             cloud: cloud
+        )
+
+        let place = manifest?.placeSnapshot
+        let resolvedPoint = manifest?.locationPoint
+        let location = SessionPackageLocation(
+            status: manifest?.locationStatus.rawValue ?? LocalSessionLocationStatus.pending.rawValue,
+            source: manifest?.locationSource.rawValue ?? LocalSessionLocationSource.none.rawValue,
+            quality: manifest?.locationQuality.rawValue ?? LocalSessionLocationQuality.unknown.rawValue,
+            label: place?.displayLabel ?? manifest?.locationLabel ?? respondentInfo?.location,
+            formattedAddress: place?.formattedAddress,
+            latitude: manifest?.locationCoordinates.latitude ?? place?.latitude ?? resolvedPoint?.lat,
+            longitude: manifest?.locationCoordinates.longitude ?? place?.longitude ?? resolvedPoint?.lon,
+            horizontalAccuracyM: manifest?.locationHorizontalAccuracyM
         )
 
         var audio: SessionPackageAudio?
@@ -1873,9 +2492,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             timestamp: timestamp,
             sessionId: sessionId ?? "",
             localSessionId: sessionId ?? "",
-            interviewerInfo: InterviewerProfileStore.shared.currentProfile,
-            respondentInfo: respondentInfo,
-            locationLabel: respondentInfo?.location,
+            interviewerInfo: manifest?.interviewerSnapshot ?? InterviewerProfileStore.shared.currentProfile,
+            respondentInfo: manifest?.respondentSnapshot ?? respondentInfo,
+            locationLabel: location.label,
+            location: location,
             audio: audio,
             recordingStartTrajectoryPoint: recordingStartPoint,
             trajectoryPoints: trajectoryPoints,
@@ -1894,6 +2514,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("interviewer_info", package.interviewerInfo.map { interviewerInfoJSON($0, indent: 1) }),
             ("respondent_info", package.respondentInfo.map { respondentInfoJSON($0, indent: 1) }),
             ("location_label", jsonString(package.locationLabel)),
+            ("location", sessionPackageLocationJSON(package.location, indent: 1)),
             ("audio", package.audio.map { sessionPackageAudioJSON($0, indent: 1) }),
             ("recording_start_trajectory_point", package.recordingStartTrajectoryPoint.map { trajectoryPointJSON($0, indent: 1) }),
             ("trajectory_points", trajectoryPointsJSON(package.trajectoryPoints, indent: 1)),
@@ -1985,6 +2606,19 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("local_session_id", jsonString(audio.localSessionId)),
             ("recorded_at_ms", jsonNumber(audio.recordedAtMs)),
             ("file_size_bytes", jsonNumber(audio.fileSizeBytes))
+        ], indent: indent)
+    }
+
+    private func sessionPackageLocationJSON(_ location: SessionPackageLocation, indent: Int) -> String {
+        orderedObject([
+            ("status", jsonString(location.status)),
+            ("source", jsonString(location.source)),
+            ("quality", jsonString(location.quality)),
+            ("label", jsonString(location.label)),
+            ("formatted_address", jsonString(location.formattedAddress)),
+            ("latitude", jsonNumber(location.latitude) ?? "null"),
+            ("longitude", jsonNumber(location.longitude) ?? "null"),
+            ("horizontal_accuracy_m", jsonNumber(location.horizontalAccuracyM))
         ], indent: indent)
     }
 
@@ -2140,6 +2774,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func requiresClarification(_ matched: MatchedQuestion) -> Bool {
+        if matched.manuallyClarified == true { return false }
         return matched.clarificationNeeded || matched.confidence.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "high"
     }
 
@@ -2281,6 +2916,20 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 selectedOptionCodes: selectedOptions.codes,
                 selectedOptionLabels: selectedOptions.labels
             )
+
+            do {
+                try self.updateCurrentManifest { manifest in
+                    manifest.matchedQuestions = updatedQuestions
+                    manifest.clarificationStatus = .pending
+                    manifest.retry.lastError = nil
+                }
+            } catch {
+                self.showBlockingRecordingError(
+                    title: "Clarification Save Failed",
+                    message: "This clarification was not advanced because the recoverable session manifest could not be updated. \(error.localizedDescription)"
+                )
+                return
+            }
 
             self.showClarificationPrompt(
                 transcription: transcription,
@@ -2480,6 +3129,24 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         matchedQuestions: [MatchedQuestion],
         recordingURL: URL?
     ) {
+        do {
+            try updateCurrentManifest { manifest in
+                manifest.transcriptionStatus = .completed
+                manifest.transcription = transcription
+                manifest.analysisStatus = .completed
+                manifest.matchedQuestions = matchedQuestions
+                manifest.clarificationStatus = .completed
+                manifest.uploadStatus = .notReady
+                manifest.retry.lastError = nil
+            }
+        } catch {
+            showBlockingRecordingError(
+                title: "Analysis Save Failed",
+                message: "The finalized answers could not be persisted in the recoverable session manifest. The participant was not reset. \(error.localizedDescription)"
+            )
+            return
+        }
+
         self.matchedQuestions = matchedQuestions
         displayResults(transcription: transcription, matchedQuestions: matchedQuestions)
 
@@ -2495,61 +3162,40 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         llmButton.alpha = 1.0
         updateNextParticipantButtonState()
 
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                _ = try self.writeSessionPackageJSON(
-                    transcription: transcription,
-                    matchedQuestions: matchedQuestions,
-                    recordingURL: recordingURL
-                )
-            } catch {
-                print("Failed to write local session package: \(error.localizedDescription)")
-                await MainActor.run {
-                    self.statusLabel.text = "Analysis complete, but local save failed"
-                    self.statusLabel.textColor = .systemRed
-                    self.updateNextParticipantButtonState()
-                }
-                return
-            }
-            await self.uploadSessionPackageToCloud(
+        do {
+            _ = try writeSessionPackageJSON(
                 transcription: transcription,
                 matchedQuestions: matchedQuestions,
                 recordingURL: recordingURL
             )
-            await MainActor.run {
-                self.startNextParticipant()
-                self.statusLabel.text = "Analysis saved\nReady for next interview"
-                self.statusLabel.textColor = .systemGreen
+            try updateCurrentManifest { manifest in
+                manifest.uploadStatus = .pending
+                manifest.retry.lastError = nil
             }
-        }
-    }
-
-    // MARK: - Speech Recognition
-    private func transcribeAudio(url: URL, completion: @escaping (String?) -> Void) {
-        resetInactivityTimer()
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")) else {
-            completion(nil)
+        } catch {
+            statusLabel.text = "Analysis complete, but local package save failed"
+            statusLabel.textColor = .systemRed
+            updateNextParticipantButtonState()
+            showBlockingRecordingError(
+                title: "Final Package Save Failed",
+                message: "The interview remains recoverable and was not reset. \(error.localizedDescription)"
+            )
             return
         }
 
-        if !recognizer.isAvailable {
-            completion(nil)
-            return
-        }
-
-        let request = SFSpeechURLRecognitionRequest(url: url)
-        request.shouldReportPartialResults = false
-
-        recognizer.recognitionTask(with: request) { result, error in
-            if let error = error {
-                print("Speech recognition error: \(error)")
-                completion(nil)
-                return
-            }
-
-            if let result = result, result.isFinal {
-                completion(result.bestTranscription.formattedString)
+        let completedLocalSessionId = sessionId
+        startNextParticipant()
+        statusLabel.text = "Analysis saved locally\nReady to upload"
+        statusLabel.textColor = .systemGreen
+        Task { [weak self] in
+            let summary = await DeferredSessionOutbox.shared.run(trigger: .sessionReady)
+            guard let self, let completedLocalSessionId else { return }
+            if summary.uploadedSessionIds.contains(completedLocalSessionId) {
+                statusLabel.text = "Analysis saved and uploaded"
+                statusLabel.textColor = .systemGreen
+            } else if summary.failedSessionIds.contains(completedLocalSessionId) {
+                statusLabel.text = "Analysis saved locally\nUpload pending retry"
+                statusLabel.textColor = .systemOrange
             }
         }
     }
@@ -2615,14 +3261,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func startNextParticipant() {
-        // Stop any active recording/playback while keeping the saved recording in its session folder.
+        // A recording must pass the same audio + manifest verification as a manual Stop
+        // before participant state can be cleared.
         if isRecording {
             isRecording = false
-            audioRecorder?.stop()
-            interviewTrajectoryPoints = TrajectoryTracker.shared.stopInterviewTracking()
-            if let recordingURL {
-                updateRecordingTrajectoryMetadata(for: recordingURL, points: interviewTrajectoryPoints)
-            }
+            stopRecording(showReview: true)
+            return
         }
 
         if let player = audioPlayer, player.isPlaying {
@@ -3240,64 +3884,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         present(alert, animated: true)
     }
 
-    // MARK: - Survey API (Cloud SQL) Upload Flow
-
-    private func appVersionString() -> String? {
-        let dict = Bundle.main.infoDictionary
-        let short = dict?["CFBundleShortVersionString"] as? String
-        let build = dict?["CFBundleVersion"] as? String
-        if let short, let build { return "\(short) (\(build))" }
-        return short ?? build
-    }
-
-    private func ensureCloudSessionCreated() async {
-        guard SurveyAPIClient.shared.isConfigured() else { return }
-        if cloudSessionId != nil { return }
-
-        do {
-            let resp = try await SurveyAPIClient.shared.createSession(
-                questionnaireId: questionnaireData?.questionnaire.id,
-                questionnaireVersion: questionnaireData?.questionnaire.version ?? "1",
-                appVersion: appVersionString(),
-                locale: Locale.current.identifier
-            )
-            cloudRespondentId = resp.respondentId
-            cloudSessionId = resp.sessionId
-            TrajectoryTracker.shared.setCurrentIdentity(respondentId: resp.respondentId, sessionId: resp.sessionId)
-        } catch {
-            // Best-effort: don't block the survey; the local session package remains available on device.
-            print("Survey API createSession failed: \(error.localizedDescription)")
-        }
-    }
-
-    private func uploadSessionPackageToCloud(transcription: String, matchedQuestions: [MatchedQuestion], recordingURL: URL?) async {
-        guard SurveyAPIClient.shared.isConfigured() else { return }
-
-        if cloudSessionId == nil {
-            await ensureCloudSessionCreated()
-        }
-        guard let sid = cloudSessionId else { return }
-
-        do {
-            let packageURL = try writeSessionPackageJSON(
-                transcription: transcription,
-                matchedQuestions: matchedQuestions,
-                recordingURL: recordingURL
-            )
-            let response = try await SurveyAPIClient.shared.uploadSessionPackage(
-                sessionId: sid,
-                sessionJSONURL: packageURL,
-                audioURL: recordingURL,
-                localSessionId: sessionId
-            )
-            if let recordingURL {
-                markSessionPackageUploaded(for: recordingURL, response: response)
-            }
-            print("Survey API session package upload succeeded: \(response.packageDir)")
-        } catch {
-            print("Survey API session package upload failed: \(error.localizedDescription)")
-        }
-    }
+    // MARK: - Legacy trajectory upload compatibility
 
     private func uploadRecordingStartTrajectoryIfNeeded(sessionId: String, recordingURL: URL?) async {
         guard let recordingURL else { return }
@@ -3508,34 +4095,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 
-    private func markSessionPackageUploaded(
-        for recordingURL: URL,
-        response: SurveyAPIClient.SessionPackageUploadResponse
-    ) {
-        let metadataURL = recordingMetadataURL(for: recordingURL)
-        var metadata = recordingMetadata(for: recordingURL) ?? [:]
-        metadata["session_package_uploaded_at_epoch"] = Date().timeIntervalSince1970
-        metadata["server_package_dir"] = response.packageDir
-        metadata["server_session_json_path"] = response.jsonPath
-        metadata["server_session_json_sha256"] = response.jsonSha256
-        if let audioPath = response.audioPath {
-            metadata["server_audio_path"] = audioPath
-        }
-        if let audioSha256 = response.audioSha256 {
-            metadata["server_audio_sha256"] = audioSha256
-        }
-        if let audioFileSizeBytes = response.audioFileSizeBytes {
-            metadata["server_audio_file_size_bytes"] = audioFileSizeBytes
-        }
-
-        do {
-            let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
-            try data.write(to: metadataURL, options: [.atomic])
-        } catch {
-            print("Failed to mark session package as uploaded: \(error.localizedDescription)")
-        }
-    }
-
     private func markRecordingStartTrajectoryUploaded(for recordingURL: URL) {
         let metadataURL = recordingMetadataURL(for: recordingURL)
         var metadata = recordingMetadata(for: recordingURL) ?? [:]
@@ -3547,11 +4106,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         } catch {
             print("Failed to mark recording-start trajectory as uploaded: \(error.localizedDescription)")
         }
-    }
-
-    private func flushPendingSurveyUploads() async {
-        // Legacy answer-row retries are disabled for new package-based storage.
-        // New interviews upload `session.json` plus audio through /sessions/{id}/package.
     }
 
     // MARK: - Respondent Info Form

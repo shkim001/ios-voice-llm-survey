@@ -35,6 +35,22 @@ final class SessionManager {
         return try startNewSession()
     }
 
+    @discardableResult
+    func resumeSession(at directoryURL: URL) throws -> Session {
+        let values = try directoryURL.resourceValues(forKeys: [.isDirectoryKey, .creationDateKey])
+        guard values.isDirectory == true else { throw CocoaError(.fileNoSuchFile) }
+        let manifest = try LocalSessionManifestStore.load(from: directoryURL)
+        let session = Session(
+            id: manifest.localSessionId.isEmpty ? directoryURL.lastPathComponent : manifest.localSessionId,
+            directoryURL: directoryURL,
+            createdAt: manifest.createdAt > 0
+                ? Date(timeIntervalSince1970: manifest.createdAt)
+                : (values.creationDate ?? Date())
+        )
+        currentSession = session
+        return session
+    }
+
     func clearCurrentSessionIfEmpty() {
         guard let currentSession else { return }
         _ = removeSessionIfEmpty(currentSession.directoryURL)
@@ -95,6 +111,9 @@ final class SessionManager {
 
             for url in sorted {
                 guard !keepSet.contains(url) else { continue }
+                guard LocalSessionManifestStore.retentionState(for: url) == .uploaded else {
+                    continue
+                }
 
                 let created = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ??
                               (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ??
@@ -144,7 +163,8 @@ final class SessionManager {
 
         let hasRecording = fileURLs.contains { $0.pathExtension.lowercased() == "m4a" }
         let hasSessionPackage = fileURLs.contains { $0.lastPathComponent == "session.json" }
-        guard !hasRecording && !hasSessionPackage else { return false }
+        let hasSessionManifest = fileURLs.contains { $0.lastPathComponent == LocalSessionManifestStore.fileName }
+        guard !hasRecording && !hasSessionPackage && !hasSessionManifest else { return false }
 
         do {
             try fm.removeItem(at: sessionURL)
