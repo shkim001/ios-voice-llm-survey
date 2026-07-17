@@ -367,13 +367,14 @@ Phase 2 uses an initial maximum horizontal-accuracy threshold of 50 meters and a
 
 ### 9.4 Implemented Phase 3 behavior
 
-- `DurableInterviewProcessingCoordinator` is the single stage resolver. It verifies the readable, nonzero original audio, then resumes from transcription, analysis, clarification, or ready-to-upload state by reading `session_state.json` and the session folder.
+- `DurableInterviewProcessingCoordinator` is the single stage resolver. It verifies that the original audio is a readable, nonempty playable media file, then resumes from transcription, analysis, clarification, or ready-to-upload state by reading `session_state.json` and the session folder. A legacy header-only/corrupt recording is marked as a terminal audio failure, retained locally, and excluded from automatic Speech retries.
 - Apple Speech capability inspection records `supportsOnDeviceRecognition`, normal service availability, and authorization. When the network path hint is unsatisfied, the request sets `requiresOnDeviceRecognition = true` only when the recognizer explicitly supports it. Otherwise transcription remains `pending` with `on_device_speech_unavailable`; the UI does not claim offline Speech is available.
 - Successful Speech output is atomically written to `transcript.txt`, reread from disk, and only then supplied to the LLM. Older manifests containing an embedded completed transcript are migrated by atomically creating `transcript.txt` before analysis resumes.
 - Speech and LLM failures transition to `pending_retry`, persist a stage-specific error category plus retry count, last error, and attempt time, and present Try Again or Process Later. No failure path displays a saved-success message or automatically deletes audio.
 - The coordinator accepts injected Speech, LLM, connectivity, and transcript-store implementations. It suppresses concurrent work for the same local session UUID.
 - Parsed matches are saved before clarification. Manually completed clarification items are skipped after restart, while unfinished items resume through the existing provider, prompt, multiple-choice, checked-option, and clarification behavior.
 - On launch, the app offers the newest recoverable interview; Session Tools also exposes Resume Saved Interview. Rehydration restores frozen questionnaire/respondent snapshots, the original audio path, checked options, trajectory, and cloud identifiers. Inactivity reset clears only active UI state and leaves this recovery path intact.
+- Legacy sidecars created before questionnaire snapshots existed are backfilled with the bundled questionnaire when the interviewer explicitly resumes them. Apple Speech tasks have a bounded 120-second timeout so a recognizer callback that never completes cannot leave recovery running indefinitely.
 - After clarification, `session.json` is written atomically and `upload_status` becomes `pending`, which derives to `ready_to_upload`. Phase 3 stopped at that durable boundary; the implemented Phase 4 outbox now consumes it.
 
 ## 10. Connectivity and retry design
@@ -388,11 +389,13 @@ Actual request results always determine state. Timeouts, connection errors, HTTP
 
 Retry eligible work:
 
-- at app launch;
-- when the app enters the foreground;
-- after `NWPathMonitor` changes to satisfied while the app is active;
+- at app launch for upload-ready packages;
+- when the app enters the foreground for upload-ready packages;
+- after `NWPathMonitor` changes to satisfied while the app is active for upload-ready packages;
 - when the interviewer taps Try Again;
 - when the interviewer opens a recoverable dashboard draft and chooses Resume Processing.
+
+Launch, foreground, and path triggers scan every manifest but do not silently start Apple Speech or LLM work. Incomplete content processing remains an explicit interviewer action through the recovery prompt or **Retry Pending Sessions Now**; finalized package upload may retry automatically.
 
 Foreground retry is the guaranteed behavior. This design does not add `BGTaskScheduler` and does not promise execution while the app is suspended or terminated.
 
@@ -420,7 +423,7 @@ Foreground retry is the guaranteed behavior. This design does not add `BGTaskSch
 
 - `DeferredSessionOutbox` scans `Documents/SurveySessions/*/session_state.json`; session folders, not a global queue file, are the durable source of truth. Legacy folders are conservatively synthesized into a manifest before they enter processing.
 - The outbox starts on app launch, observes foreground activation, treats a satisfied `NWPathMonitor` path as a scheduling trigger, runs after a newly finalized package, and exposes **Retry Pending Sessions Now** in Session Tools. Manual retry bypasses `next_retry_at`.
-- It invokes `DurableInterviewProcessingCoordinator` for the earliest incomplete transcription/analysis stage, leaves clarification for the existing UIKit recovery UI, and uploads only after verified nonempty `session.json` and original `.m4a` files exist.
+- Automatic launch/foreground/path runs upload finalized packages only. They report incomplete transcription/analysis/clarification as deferred rather than starting Speech or LLM behind the recovery UI. An explicit manual retry invokes `DurableInterviewProcessingCoordinator` at the earliest incomplete stage; upload still requires verified nonempty `session.json` and original `.m4a` files.
 - A process-wide run guard plus per-session active IDs prevent duplicate concurrent work. Automatic failures use exponential delays beginning at 30 seconds, capped at two hours, with 20 percent jitter; retry count, attempt time, next retry time, and error text are saved atomically in the session manifest.
 - Cloud respondent/session IDs are requested only after local audio and final-package verification and are persisted before upload. `POST /sessions` now accepts optional `local_session_id`; `session_creation_keys` maps it to exactly one respondent/session, protected by a per-key MySQL advisory lock. Existing clients that omit the field retain the prior behavior.
 - `POST /sessions/{session_id}/package` remains an upsert by cloud session ID. A repeated upload after a lost response replaces the same package index and derived answers rather than creating a second package. The app validates returned IDs, JSON/audio paths, byte counts, and hashes before setting `upload_status = uploaded`.
@@ -533,7 +536,7 @@ Warnings must state when the item is unuploaded and that the action deletes the 
 ### Phase 4: Retry and idempotent upload
 
 - Status: implemented; deployment requires the additive `session_creation_keys` migration and physical server integration validation.
-- Foreground `NWPathMonitor` scheduling, launch/foreground/manual triggers, persisted backoff, and duplicate suppression are implemented.
+- Foreground `NWPathMonitor` scheduling, launch/foreground/manual triggers, persisted backoff, and duplicate suppression are implemented. Automatic triggers upload finalized packages; Speech/LLM resumption requires an explicit recovery/manual action.
 - Cloud-session creation uses optional `local_session_id`; package uploads resume from verified local files and only validated responses mark the manifest uploaded.
 - Mocked tests cover unreachable APIs despite path hints, offline-to-online recovery, timeouts/backoff/manual override, duplicate suppression, lost creation/upload responses, relaunch scanning, and repeated-upload suppression.
 

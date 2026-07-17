@@ -52,6 +52,39 @@ struct DurableInterviewProcessingCoordinatorTests {
         #expect(manifest.audioStatus == .recordedLocally)
     }
 
+    @Test func invalidAudioIsMarkedTerminalAndNeverSentToSpeech() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let speech = FakeSpeech(result: .success("Must not run"))
+        let llm = FakeLLM(result: .success([highConfidenceMatch()]))
+        let coordinator = DurableInterviewProcessingCoordinator(
+            speech: speech,
+            llm: llm,
+            connectivity: FixedConnectivity(networkIsAvailable: true),
+            transcriptStore: FileTranscriptStore(),
+            audioValidator: FailingAudioValidator()
+        )
+
+        let outcome = await coordinator.resume(
+            sessionDirectoryURL: fixture.directory,
+            audioURL: fixture.audioURL
+        )
+
+        guard case .failed(let stage, let category, _) = outcome else {
+            Issue.record("Expected terminal audio validation failure")
+            return
+        }
+        #expect(stage == .transcription)
+        #expect(category == .audioUnavailable)
+        #expect(speech.callCount == 0)
+        #expect(llm.callCount == 0)
+        let manifest = try LocalSessionManifestStore.load(from: fixture.directory)
+        #expect(manifest.audioStatus == .failed)
+        #expect(manifest.transcriptionStatus == .failed)
+        #expect(manifest.transcriptionErrorCategory == DurableProcessingErrorCategory.audioUnavailable.rawValue)
+        #expect(manifest.retry.nextRetryAt == nil)
+    }
+
     @Test func llmTimeoutRetainsTranscriptAndResumesWithoutRetranscribing() async throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
@@ -220,7 +253,8 @@ struct DurableInterviewProcessingCoordinatorTests {
             speech: speech,
             llm: llm,
             connectivity: FixedConnectivity(networkIsAvailable: networkAvailable),
-            transcriptStore: FileTranscriptStore()
+            transcriptStore: FileTranscriptStore(),
+            audioValidator: AcceptingAudioValidator()
         )
     }
 
@@ -331,4 +365,14 @@ private final class FakeLLM: InterviewLLMAnalyzing {
 
 private struct FixedConnectivity: ProcessingConnectivityProviding {
     let networkIsAvailable: Bool
+}
+
+private struct AcceptingAudioValidator: InterviewAudioValidating {
+    func validate(audioURL: URL) throws {}
+}
+
+private struct FailingAudioValidator: InterviewAudioValidating {
+    func validate(audioURL: URL) throws {
+        throw DurableProcessingError.audioUnavailable
+    }
 }

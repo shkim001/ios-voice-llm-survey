@@ -367,7 +367,21 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 message: message,
                 stage: stage
             )
-        case .failed(let stage, _, let message):
+        case .failed(let stage, let category, let message):
+            if category == .audioUnavailable {
+                statusLabel.text = "Saved recording is not playable"
+                statusLabel.textColor = .systemRed
+                let alert = UIAlertController(
+                    title: "Recording Cannot Be Processed",
+                    message: message,
+                    preferredStyle: .alert
+                )
+                alert.addAction(UIAlertAction(title: "OK", style: .default) { [weak self] _ in
+                    self?.startNextParticipant()
+                })
+                present(alert, animated: true)
+                return
+            }
             statusLabel.text = stage == .transcription ? "Transcription needs retry" : "LLM analysis needs retry"
             statusLabel.textColor = .systemRed
             presentProcessingRecoveryAlert(
@@ -544,10 +558,38 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func resumeRecoverableInterview(in directoryURL: URL) {
         do {
             let session = try SessionManager.shared.resumeSession(at: directoryURL)
-            let manifest = try LocalSessionManifestStore.load(from: directoryURL)
+            var manifest = try LocalSessionManifestStore.load(from: directoryURL)
             guard let audioFileName = manifest.audioFileName else { throw CocoaError(.fileNoSuchFile) }
             let audioURL = directoryURL.appendingPathComponent(audioFileName)
-            try verifyRecordedAudio(at: audioURL)
+            do {
+                try verifyRecordedAudio(at: audioURL)
+            } catch {
+                let message = DurableProcessingError.audioUnavailable.localizedDescription
+                try? LocalSessionManifestStore.update(in: directoryURL) { value in
+                    value.audioStatus = .failed
+                    value.transcriptionStatus = .failed
+                    value.transcriptionErrorCategory = DurableProcessingErrorCategory.audioUnavailable.rawValue
+                    value.retry.lastError = message
+                    value.retry.lastAttemptAt = Date().timeIntervalSince1970
+                    value.retry.nextRetryAt = nil
+                }
+                showBlockingRecordingError(
+                    title: "Saved Recording Is Not Playable",
+                    message: message
+                )
+                return
+            }
+
+            if manifest.questionnaireSnapshot == nil {
+                let bundled = try QuestionnaireStore.shared.loadBundledQuestionnaire().questionnaire
+                try LocalSessionManifestStore.update(in: directoryURL) { value in
+                    value.questionnaireSnapshot = bundled
+                    value.questionnaireId = bundled.id
+                    value.questionnaireVersion = bundled.version
+                    value.questionnaireHash = bundled.hash
+                }
+                manifest = try LocalSessionManifestStore.load(from: directoryURL)
+            }
 
             sessionId = session.id
             sessionDirectoryURL = directoryURL
@@ -1842,25 +1884,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func verifyRecordedAudio(at url: URL) throws {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: url.path) else {
-            throw NSError(
-                domain: "VoiceSurveyRecording",
-                code: 4,
-                userInfo: [NSLocalizedDescriptionKey: "The recorded audio file does not exist."]
-            )
-        }
-        let attributes = try fm.attributesOfItem(atPath: url.path)
-        let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
-        guard fileSize > 0 else {
-            throw NSError(
-                domain: "VoiceSurveyRecording",
-                code: 5,
-                userInfo: [NSLocalizedDescriptionKey: "The recorded audio file is empty."]
-            )
-        }
-        let handle = try FileHandle(forReadingFrom: url)
-        try handle.close()
+        try PlayableInterviewAudioValidator().validate(audioURL: url)
     }
 
     private func handleRecordingPersistenceFailure(

@@ -22,6 +22,10 @@ enum DeferredSessionOutboxTrigger: Equatable {
     var bypassesBackoff: Bool {
         self == .manual
     }
+
+    var allowsInterviewProcessing: Bool {
+        self == .manual
+    }
 }
 
 struct DeferredSessionRetryPolicy {
@@ -287,6 +291,10 @@ final class DeferredSessionOutbox: NSObject {
             let audioURL = directoryURL.appendingPathComponent(audioFileName)
 
             if !isFinalPackageReady(manifest, in: directoryURL) {
+                guard trigger.allowsInterviewProcessing else {
+                    summary.deferredSessionIds.append(manifest.localSessionId)
+                    continue
+                }
                 let outcome = await stageProcessor.resume(
                     sessionDirectoryURL: directoryURL,
                     audioURL: audioURL,
@@ -295,8 +303,10 @@ final class DeferredSessionOutbox: NSObject {
                 switch outcome {
                 case .readyToUpload:
                     manifest = (try? LocalSessionManifestStore.load(from: directoryURL)) ?? manifest
-                case .failed:
-                    scheduleExistingProcessingFailure(in: directoryURL)
+                case .failed(_, let category, _):
+                    if category != .audioUnavailable {
+                        scheduleExistingProcessingFailure(in: directoryURL)
+                    }
                     summary.failedSessionIds.append(manifest.localSessionId)
                     continue
                 case .deferred, .needsClarification, .analysisCompleted, .alreadyRunning:

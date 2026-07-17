@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import Network
 import Speech
 
@@ -54,6 +55,30 @@ protocol TranscriptPersisting {
     func load(from transcriptURL: URL) throws -> String
 }
 
+protocol InterviewAudioValidating {
+    func validate(audioURL: URL) throws
+}
+
+struct PlayableInterviewAudioValidator: InterviewAudioValidating {
+    func validate(audioURL: URL) throws {
+        let values = try audioURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .isReadableKey])
+        guard values.isRegularFile == true,
+              values.isReadable != false,
+              (values.fileSize ?? 0) > 0 else {
+            throw DurableProcessingError.audioUnavailable
+        }
+
+        do {
+            let file = try AVAudioFile(forReading: audioURL)
+            guard file.length > 0, file.processingFormat.sampleRate > 0 else {
+                throw DurableProcessingError.audioUnavailable
+            }
+        } catch {
+            throw DurableProcessingError.audioUnavailable
+        }
+    }
+}
+
 enum DurableProcessingOutcome {
     case needsClarification(transcript: String, matchedQuestions: [MatchedQuestion])
     case analysisCompleted(transcript: String, matchedQuestions: [MatchedQuestion])
@@ -96,7 +121,7 @@ enum DurableProcessingError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .audioUnavailable:
-            return "The original audio file is missing, unreadable, or empty."
+            return "The saved audio is missing or is not a valid playable recording. It remains available in Audio Files for review or deletion."
         case .speechPermission:
             return "Speech recognition permission is not available."
         case .speechUnavailable:
@@ -171,7 +196,7 @@ final class AppleSpeechTranscriber: InterviewSpeechTranscribing {
 
         return try await withCheckedThrowingContinuation { continuation in
             let gate = SpeechContinuationGate(continuation: continuation)
-            recognizer.recognitionTask(with: request) { result, error in
+            let task = recognizer.recognitionTask(with: request) { result, error in
                 if let error {
                     gate.resume(with: .failure(error))
                     return
@@ -186,6 +211,8 @@ final class AppleSpeechTranscriber: InterviewSpeechTranscribing {
                     }
                 }
             }
+            gate.attach(recognitionTask: task)
+            gate.scheduleTimeout(after: 120)
         }
     }
 }
@@ -193,6 +220,8 @@ final class AppleSpeechTranscriber: InterviewSpeechTranscribing {
 private final class SpeechContinuationGate: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<String, Error>?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var timeoutWorkItem: DispatchWorkItem?
 
     init(continuation: CheckedContinuation<String, Error>) {
         self.continuation = continuation
@@ -205,8 +234,39 @@ private final class SpeechContinuationGate: @unchecked Sendable {
             return
         }
         self.continuation = nil
+        let recognitionTask = self.recognitionTask
+        self.recognitionTask = nil
+        let timeoutWorkItem = self.timeoutWorkItem
+        self.timeoutWorkItem = nil
         lock.unlock()
+        timeoutWorkItem?.cancel()
+        recognitionTask?.cancel()
         continuation.resume(with: result)
+    }
+
+    func attach(recognitionTask: SFSpeechRecognitionTask) {
+        lock.lock()
+        guard continuation != nil else {
+            lock.unlock()
+            recognitionTask.cancel()
+            return
+        }
+        self.recognitionTask = recognitionTask
+        lock.unlock()
+    }
+
+    func scheduleTimeout(after seconds: TimeInterval) {
+        let item = DispatchWorkItem { [weak self] in
+            self?.resume(with: .failure(URLError(.timedOut)))
+        }
+        lock.lock()
+        guard continuation != nil else {
+            lock.unlock()
+            return
+        }
+        timeoutWorkItem = item
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + seconds, execute: item)
     }
 }
 
@@ -222,25 +282,29 @@ final class DurableInterviewProcessingCoordinator {
         speech: AppleSpeechTranscriber(),
         llm: LiveLLMAnalyzer(),
         connectivity: SystemConnectivityStatus.shared,
-        transcriptStore: FileTranscriptStore()
+        transcriptStore: FileTranscriptStore(),
+        audioValidator: PlayableInterviewAudioValidator()
     )
 
     private let speech: InterviewSpeechTranscribing
     private let llm: InterviewLLMAnalyzing
     private let connectivity: ProcessingConnectivityProviding
     private let transcriptStore: TranscriptPersisting
+    private let audioValidator: InterviewAudioValidating
     private var activeSessionIds: Set<String> = []
 
     init(
         speech: InterviewSpeechTranscribing,
         llm: InterviewLLMAnalyzing,
         connectivity: ProcessingConnectivityProviding,
-        transcriptStore: TranscriptPersisting
+        transcriptStore: TranscriptPersisting,
+        audioValidator: InterviewAudioValidating = PlayableInterviewAudioValidator()
     ) {
         self.speech = speech
         self.llm = llm
         self.connectivity = connectivity
         self.transcriptStore = transcriptStore
+        self.audioValidator = audioValidator
     }
 
     func resume(
@@ -261,9 +325,18 @@ final class DurableInterviewProcessingCoordinator {
         defer { activeSessionIds.remove(localSessionId) }
 
         do {
-            try verifyAudio(at: audioURL)
+            try audioValidator.validate(audioURL: audioURL)
         } catch {
-            return .failed(stage: .transcription, category: .audioUnavailable, message: error.localizedDescription)
+            let message = DurableProcessingError.audioUnavailable.localizedDescription
+            try? LocalSessionManifestStore.update(in: sessionDirectoryURL) { value in
+                value.audioStatus = .failed
+                value.transcriptionStatus = .failed
+                value.transcriptionErrorCategory = DurableProcessingErrorCategory.audioUnavailable.rawValue
+                value.retry.lastError = message
+                value.retry.lastAttemptAt = Date().timeIntervalSince1970
+                value.retry.nextRetryAt = nil
+            }
+            return .failed(stage: .transcription, category: .audioUnavailable, message: message)
         }
 
         do {
@@ -423,15 +496,6 @@ final class DurableInterviewProcessingCoordinator {
             category: .transcriptUnavailable,
             message: "The persisted transcript file is unavailable."
         )
-    }
-
-    private func verifyAudio(at url: URL) throws {
-        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .isReadableKey])
-        guard values.isRegularFile == true, values.isReadable != false, (values.fileSize ?? 0) > 0 else {
-            throw DurableProcessingError.audioUnavailable
-        }
-        let handle = try FileHandle(forReadingFrom: url)
-        try handle.close()
     }
 
     private func persistFailure(_ failure: StageFailure, in directoryURL: URL) {

@@ -154,6 +154,35 @@ struct DeferredSessionOutboxTests {
         #expect(api.uploadCallCount == 1)
     }
 
+    @Test func automaticTriggersDoNotStartSpeechOrLLMButManualRetryMayResumeIt() async throws {
+        let fixture = try makeReadyFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try FileManager.default.removeItem(at: fixture.directory.appendingPathComponent("session.json"))
+        try LocalSessionManifestStore.update(in: fixture.directory) { manifest in
+            manifest.transcriptionStatus = .pending
+            manifest.analysisStatus = .pending
+            manifest.clarificationStatus = .pending
+            manifest.uploadStatus = .notReady
+        }
+        let processor = CountingStageProcessor()
+        let outbox = DeferredSessionOutbox(
+            apiClient: MockDeferredAPI(uploadResults: []),
+            stageProcessor: processor,
+            sessionsRootProvider: { fixture.root },
+            now: { Date(timeIntervalSince1970: 9_000) },
+            jitterUnit: { 0.5 },
+            pathMonitor: nil
+        )
+
+        let launch = await outbox.run(trigger: .launch)
+        #expect(launch.deferredSessionIds == [fixture.localSessionId])
+        #expect(processor.callCount == 0)
+
+        let manual = await outbox.retryNow()
+        #expect(manual.deferredSessionIds == [fixture.localSessionId])
+        #expect(processor.callCount == 1)
+    }
+
     private func makeOutbox(
         root: URL,
         api: MockDeferredAPI,
@@ -231,6 +260,20 @@ private struct NoopStageProcessor: DeferredSessionStageProcessing {
         localeIdentifier: String
     ) async -> DurableProcessingOutcome {
         .readyToUpload
+    }
+}
+
+@MainActor
+private final class CountingStageProcessor: DeferredSessionStageProcessing {
+    private(set) var callCount = 0
+
+    func resume(
+        sessionDirectoryURL: URL,
+        audioURL: URL,
+        localeIdentifier: String
+    ) async -> DurableProcessingOutcome {
+        callCount += 1
+        return .deferred(stage: .transcription, category: .speechUnavailable, message: "Deferred")
     }
 }
 
