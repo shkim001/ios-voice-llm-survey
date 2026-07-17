@@ -430,6 +430,7 @@ Foreground retry is the guaranteed behavior. This design does not add `BGTaskSch
 - The successful upload marker is written both to the authoritative manifest and to the recording sidecar for compatibility with existing Audio Files and Dashboard behavior. Original local audio is retained.
 - `PendingSurveyUploadStore` was removed after repository-wide reference inspection confirmed that no active workflow used it; it only represented the disabled legacy answer-row queue.
 - No `BGTaskScheduler` or background `URLSession` mechanism was added. Launch/foreground/reachability/manual processing is reliable while the app is running, but work is not guaranteed while iOS has suspended or terminated the app.
+- Automatic outbox callbacks verify `UIApplication.applicationState == .active` before scanning or starting network work. The obsolete background-location declaration and lifecycle-time `CLLocationManager` startup were removed; recording GPS is created only by explicit foreground interview actions.
 
 ## 11. Resumable coordinator and UI
 

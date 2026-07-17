@@ -28,9 +28,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneDidBecomeActive(_ scene: UIScene) {
-        // Called when the scene becomes active
-        TrajectoryTracker.shared.startIfPossible()
-        TrajectoryTracker.shared.flushPendingNow()
+        // Recording and location services start only from explicit foreground UI actions.
     }
 
     func sceneWillResignActive(_ scene: UIScene) {
@@ -42,7 +40,6 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) {
-        // Called as the scene transitions to the background
-        TrajectoryTracker.shared.startIfPossible()
+        // No background execution mode is requested by this release.
     }
 }

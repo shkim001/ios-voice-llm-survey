@@ -43,10 +43,6 @@
 			</array>
 		</dict>
 	</dict>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>location</string>
-	</array>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 </dict>

@@ -119,6 +119,7 @@ When the Survey API is configured:
 - The server stores both files under one VM folder, writes a package index row to MySQL, indexes interviewer fields, and extracts matched answers into `analysis_answers` for easier counting/filtering.
 - GPS failure no longer blocks recording: the interviewer can retry, accept a disclosed low-accuracy point, record without GPS, search with native MapKit, or cancel. Device-GPS trajectory sampling continues about every 15 seconds when GPS is available.
 - `NWPathMonitor` only triggers retry attempts; actual Speech, LLM, HTTP, and server responses determine success. iOS does not guarantee retry while the app is suspended or terminated because this phase does not add a background-task mechanism.
+- Retry and location work are foreground-only. The app does not declare a background execution mode; a reachability callback received while inactive is ignored until a later foreground trigger.
 
 ---
 

@@ -171,7 +171,8 @@ struct DeferredSessionOutboxTests {
             sessionsRootProvider: { fixture.root },
             now: { Date(timeIntervalSince1970: 9_000) },
             jitterUnit: { 0.5 },
-            pathMonitor: nil
+            pathMonitor: nil,
+            applicationIsActive: { true }
         )
 
         let launch = await outbox.run(trigger: .launch)
@@ -181,6 +182,26 @@ struct DeferredSessionOutboxTests {
         let manual = await outbox.retryNow()
         #expect(manual.deferredSessionIds == [fixture.localSessionId])
         #expect(processor.callCount == 1)
+    }
+
+    @Test func inactiveAppDoesNotStartAutomaticOutboxWork() async throws {
+        let fixture = try makeReadyFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let api = MockDeferredAPI(uploadResults: [.success(validReceipt())])
+        let outbox = DeferredSessionOutbox(
+            apiClient: api,
+            stageProcessor: NoopStageProcessor(),
+            sessionsRootProvider: { fixture.root },
+            now: { Date(timeIntervalSince1970: 10_000) },
+            jitterUnit: { 0.5 },
+            pathMonitor: nil,
+            applicationIsActive: { false }
+        )
+
+        let backgroundResult = await outbox.run(trigger: .pathSatisfied)
+
+        #expect(backgroundResult.attemptedCount == 0)
+        #expect(api.uploadCallCount == 0)
     }
 
     private func makeOutbox(
@@ -194,7 +215,8 @@ struct DeferredSessionOutboxTests {
             sessionsRootProvider: { root },
             now: { clock.date },
             jitterUnit: { 0.5 },
-            pathMonitor: nil
+            pathMonitor: nil,
+            applicationIsActive: { true }
         )
     }
 

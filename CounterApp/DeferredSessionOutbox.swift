@@ -183,6 +183,7 @@ final class DeferredSessionOutbox: NSObject {
     private let jitterUnit: () -> Double
     private let retryPolicy: DeferredSessionRetryPolicy
     private let pathMonitor: NWPathMonitor?
+    private let applicationIsActive: () -> Bool
     private let pathQueue = DispatchQueue(label: "VoiceSurvey.DeferredSessionOutbox.Path")
     private var isStarted = false
     private var isRunning = false
@@ -196,7 +197,10 @@ final class DeferredSessionOutbox: NSObject {
         now: @escaping () -> Date = Date.init,
         jitterUnit: @escaping () -> Double = { Double.random(in: 0...1) },
         retryPolicy: DeferredSessionRetryPolicy = .standard,
-        pathMonitor: NWPathMonitor? = NWPathMonitor()
+        pathMonitor: NWPathMonitor? = NWPathMonitor(),
+        applicationIsActive: @escaping () -> Bool = {
+            UIApplication.shared.applicationState == .active
+        }
     ) {
         self.apiClient = apiClient
         self.stageProcessor = stageProcessor
@@ -205,6 +209,7 @@ final class DeferredSessionOutbox: NSObject {
         self.jitterUnit = jitterUnit
         self.retryPolicy = retryPolicy
         self.pathMonitor = pathMonitor
+        self.applicationIsActive = applicationIsActive
         super.init()
     }
 
@@ -220,6 +225,7 @@ final class DeferredSessionOutbox: NSObject {
         pathMonitor?.pathUpdateHandler = { [weak self] path in
             guard path.status == .satisfied else { return }
             Task { @MainActor [weak self] in
+                guard self?.applicationIsActive() == true else { return }
                 _ = await self?.run(trigger: .pathSatisfied)
             }
         }
@@ -242,6 +248,9 @@ final class DeferredSessionOutbox: NSObject {
 
     @discardableResult
     func run(trigger: DeferredSessionOutboxTrigger) async -> DeferredSessionOutboxSummary {
+        guard trigger == .manual || applicationIsActive() else {
+            return DeferredSessionOutboxSummary()
+        }
         guard !isRunning else {
             pendingRunRequested = true
             return DeferredSessionOutboxSummary(duplicateRunSuppressed: true)
