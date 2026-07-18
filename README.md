@@ -151,8 +151,6 @@ API_KEY=your-shared-secret
 SURVEY_PACKAGE_STORAGE_DIR=./survey_session_packages
 SESSION_JSON_MAX_BYTES=26214400
 
-# Legacy audio-only endpoint storage. New app uploads use SURVEY_PACKAGE_STORAGE_DIR.
-AUDIO_STORAGE_DIR=./uploaded_audio
 AUDIO_MAX_BYTES=209715200
 ```
 
@@ -177,7 +175,7 @@ survey_session_packages/
     └── recording_....m4a
 ```
 
-For new app uploads, the `.m4a` recording is stored beside `session.json` in this package folder. `server/uploaded_audio/` is only for the legacy `/sessions/{session_id}/audio` endpoint.
+The `.m4a` recording is stored beside `session.json` in this package folder.
 
 ### 2. Install and run
 
@@ -199,11 +197,19 @@ Use HTTPS in production, or configure firewall rules so only trusted clients rea
 
 ### 3. Database schema
 
-Ensure MySQL has the existing `respondents`, `survey_sessions`, and `questions` tables. Then apply the package index and analysis schema:
+Ensure MySQL has the existing `respondents` and `survey_sessions` tables. Then apply the package index and analysis schema:
 
 ```bash
 mysql -h "$MYSQL_HOST" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" < schema.sql
 ```
+
+After deploying this package-only API version and confirming that no older clients still call the removed row-based endpoints, back up the database and optionally remove their tables:
+
+```bash
+mysql -h "$MYSQL_HOST" -u "$MYSQL_USER" -p "$MYSQL_DATABASE" < scripts/drop_legacy_storage.sql
+```
+
+The migration is intentionally not run automatically. Legacy VM files under the former `AUDIO_STORAGE_DIR` and legacy iPad `SurveyExports` or `pending_trajectory_points.json` files should be reviewed and removed separately because they may contain user data from older builds.
 
 For an existing database that already has `session_packages`, run the additive interviewer migration:
 
@@ -229,7 +235,7 @@ New clients send optional `local_session_id` to `POST /sessions`. Repeating the 
 
 The admin dashboard is the intended place to create, edit, publish, archive, and delete test questionnaire versions. The iOS app downloads published questionnaire versions, caches them for field use, and stores only compact questionnaire identity metadata in each `session.json`.
 
-Use the seed script to publish the bundled app questionnaire as the first server-managed questionnaire version and keep legacy `questions` rows available:
+Use the seed script to publish the bundled app questionnaire as the first server-managed questionnaire version:
 
 ```bash
 export $(grep -v '^#' .env | xargs)
@@ -260,11 +266,6 @@ python3 scripts/backfill_analysis_answers.py
 | `POST` | `/interviewers/resolve` | Resolve/register interviewer name and normalized email; email is used as `interviewer_id` |
 | `POST` | `/sessions` | Create respondent + session |
 | `POST` | `/sessions/{session_id}/package` | Upload `session.json` plus the audio file into one server folder; MySQL stores the package index and extracted analysis rows |
-| `POST` | `/sessions/{session_id}/answers` | Legacy: batch upload LLM-matched answers as MySQL rows |
-| `POST` | `/sessions/{session_id}/audio` | Legacy: upload recording audio separately |
-| `POST` | `/respondents/{respondent_id}/trajectory` | Legacy: upload GPS points separately |
-| `GET` | `/respondents/{respondent_id}/trajectory` | Legacy: read back stored GPS points |
-| `POST` | `/llm-events` | Optional LLM telemetry |
 
 Authenticated requests send header `X-API-Key: <API_KEY>` when `API_KEY` is set in `.env`.
 Read-only admin requests use the same `X-API-Key: <API_KEY>` header when `API_KEY` is set.
@@ -332,7 +333,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 5. **Durable save and retry** — after analysis/clarification atomically saves `session.json`, the main screen returns to **Start Interview**. Immediate upload is attempted when configured; failures remain pending with bounded backoff and can be retried from Session Tools.
 6. **Session Tools / Dashboard** — export or share saved packages, review the separate Unprocessed Sessions section, process one session interactively, or select eligible sessions for sequential processing.
 7. **Dashboard** — reviews local/cached sessions, refreshes the lightweight server session list on demand, and downloads a full server `session.json` only when a server row is opened.
-8. **Aggregate** — summarizes analyzed local `SurveySessions/*/session.json` packages on device, with older `SurveyExports/*.json` files included for compatibility.
+8. **Aggregate** — summarizes analyzed local `SurveySessions/*/session.json` packages on device.
 
 If Survey API is configured, the outbox uploads the complete session package after any required clarification is resolved. It creates/reuses a cloud session keyed by the local session ID, persists those IDs, and marks upload complete only after validating the server response. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, and `analysis_answers` stores one extracted row per matched question.
 
@@ -361,8 +362,9 @@ ios-voice-llm-survey/
 ├── CounterAppUITests/
 ├── server/
 │   ├── app/main.py                    # FastAPI Survey API
-│   ├── schema.sql                     # package index + legacy trajectory/audio tables
+│   ├── schema.sql                     # package index + questionnaire/analysis tables
 │   ├── scripts/seed_questions.py
+│   ├── scripts/drop_legacy_storage.sql # optional post-deployment legacy table cleanup
 │   ├── scripts/add_questionnaire_schema.py
 │   ├── scripts/add_session_idempotency_schema.py
 │   ├── requirements.txt
@@ -371,7 +373,6 @@ ios-voice-llm-survey/
 │   │   └── <cloud-session-id>/
 │   │       ├── session.json
 │   │       └── recording_....m4a
-│   └── uploaded_audio/                # legacy runtime audio-only uploads, ignored by Git
 └── README.md
 ```
 

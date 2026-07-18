@@ -5,7 +5,7 @@ import Testing
 
 struct LocalSessionManifestTests {
     @Test func manifestRoundTripPreservesCaptureSnapshot() throws {
-        let point = PendingTrajectoryStore.Point(
+        let point = TrajectoryPoint(
             tsMs: 1_700_000_000_000,
             lat: 40.8075,
             lon: -73.9626,

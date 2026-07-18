@@ -312,7 +312,7 @@ enum DurableSessionPackageFinalizer {
             case sessionId = "session_id"
         }
 
-        init(_ point: PendingTrajectoryStore.Point, cloudSessionId: String?) {
+        init(_ point: TrajectoryPoint, cloudSessionId: String?) {
             lat = point.lat
             lon = point.lon
             timestampMs = point.tsMs

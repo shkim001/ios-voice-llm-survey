@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seed questionnaire rows for both legacy and versioned questionnaire storage.
+"""Seed the bundled questionnaire into versioned questionnaire storage.
 
 Usage on llm-server (from `server/`):
 
@@ -132,20 +132,10 @@ def main():
                         allows_multiple,
                     ),
                 )
-                cur.execute(
-                    """
-                    INSERT INTO questions (id, questionnaire_version, prompt, answer_type)
-                    VALUES (%s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                      prompt = VALUES(prompt),
-                      answer_type = VALUES(answer_type)
-                    """,
-                    (qid, version, prompt, answer_type),
-                )
         conn.commit()
         print(
             f"Published questionnaire {questionnaire_id!r} version={version}; "
-            f"upserted {len(questions)} legacy question rows."
+            f"saved {len(questions)} questionnaire questions."
         )
     finally:
         conn.close()

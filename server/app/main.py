@@ -25,7 +25,6 @@ MYSQL_USER = os.environ["MYSQL_USER"]
 MYSQL_PASSWORD = os.environ["MYSQL_PASSWORD"]
 MYSQL_DATABASE = os.environ["MYSQL_DATABASE"]
 API_KEY = os.environ.get("API_KEY", "").strip()
-AUDIO_STORAGE_DIR = Path(os.environ.get("AUDIO_STORAGE_DIR", "uploaded_audio")).expanduser()
 SURVEY_PACKAGE_STORAGE_DIR = Path(
     os.environ.get("SURVEY_PACKAGE_STORAGE_DIR", "survey_session_packages")
 ).expanduser()
@@ -390,16 +389,6 @@ def analysis_answer_rows(
                 (identity["id"], identity["version"], *unique_ids),
             )
             question_lookup = {str(row["id"]): row for row in cur.fetchall()}
-        if len(question_lookup) < len(unique_ids):
-            cur.execute(
-                f"""
-                SELECT id, prompt, answer_type
-                FROM questions
-                WHERE id IN ({placeholders})
-                """,
-                unique_ids,
-            )
-            question_lookup.update({str(row["id"]): row for row in cur.fetchall()})
 
     rows = []
     for index, item in enumerate(raw_matches):
@@ -835,20 +824,6 @@ def admin_publish_questionnaire(questionnaire_id: str, version: str, _: None = D
                 """,
                 (questionnaire_id, version),
             )
-            cur.executemany(
-                """
-                INSERT INTO questions (id, questionnaire_version, prompt, answer_type)
-                VALUES (%s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                  questionnaire_version = VALUES(questionnaire_version),
-                  prompt = VALUES(prompt),
-                  answer_type = VALUES(answer_type)
-                """,
-                [
-                    (question["id"], version, question["question"], question["type"])
-                    for question in questions
-                ],
-            )
             cur.execute(
                 """
                 SELECT questionnaire_id, version, title, description, status, questionnaire_hash,
@@ -1095,7 +1070,6 @@ def admin_delete_session(session_id: str, _: None = Depends(verify_api_key)):
         raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
 
     package_dir: Path | None = None
-    legacy_audio_paths: list[Path] = []
     deleted_db_rows = 0
 
     with get_conn() as conn:
@@ -1117,42 +1091,9 @@ def admin_delete_session(session_id: str, _: None = Depends(verify_api_key)):
                 json_path = safe_package_path(package_row.get("json_path"))
                 package_dir = json_path.parent if json_path else None
 
-            try:
-                cur.execute(
-                    """
-                    SELECT storage_path
-                    FROM audio_recordings
-                    WHERE session_id = %s
-                    """,
-                    (session_bytes,),
-                )
-                audio_rows = cur.fetchall()
-            except MySQLError as e:
-                if _mysql_errno(e) != 1146:
-                    raise
-                logger.warning("audio_recordings table missing during session cleanup")
-                audio_rows = []
-
-            for row in audio_rows:
-                storage_path = row.get("storage_path")
-                if not storage_path:
-                    continue
-                audio_path = (AUDIO_STORAGE_DIR / storage_path).resolve()
-                audio_root = AUDIO_STORAGE_DIR.resolve()
-                try:
-                    audio_path.relative_to(audio_root)
-                except ValueError:
-                    logger.warning("skipping audio path outside storage root: %s", audio_path)
-                    continue
-                legacy_audio_paths.append(audio_path)
-
             cleanup_statements = [
                 ("DELETE FROM analysis_answers WHERE session_id = %s", (session_bytes,)),
                 ("DELETE FROM session_packages WHERE session_id = %s", (session_bytes,)),
-                ("DELETE FROM audio_recordings WHERE session_id = %s", (session_bytes,)),
-                ("DELETE FROM trajectory_points WHERE session_id = %s", (session_bytes,)),
-                ("DELETE FROM answers WHERE session_id = %s", (session_bytes,)),
-                ("DELETE FROM llm_events WHERE session_id = %s", (session_bytes,)),
                 ("DELETE FROM survey_sessions WHERE id = %s", (session_bytes,)),
             ]
             for sql, params in cleanup_statements:
@@ -1170,17 +1111,6 @@ def admin_delete_session(session_id: str, _: None = Depends(verify_api_key)):
         except Exception as e:
             logger.exception("failed to delete session package folder")
             raise HTTPException(status_code=500, detail="database rows deleted but package folder cleanup failed") from e
-
-    for audio_path in legacy_audio_paths:
-        try:
-            if audio_path.exists():
-                audio_path.unlink()
-                deleted_paths.append(str(audio_path))
-                parent = audio_path.parent
-                if parent != AUDIO_STORAGE_DIR.resolve() and parent.exists() and not any(parent.iterdir()):
-                    parent.rmdir()
-        except Exception:
-            logger.warning("failed to delete legacy audio path: %s", audio_path, exc_info=True)
 
     return {
         "deleted": True,
@@ -1312,179 +1242,6 @@ def create_session(body: SessionCreate, _: None = Depends(verify_api_key)):
         questionnaire_version=body.questionnaire_version,
         questionnaire_id=body.questionnaire_id,
     )
-
-
-class AnswerItem(BaseModel):
-    question_id: str = Field(..., min_length=1, max_length=64)
-    value: dict = Field(default_factory=dict)
-
-
-class AnswersBatch(BaseModel):
-    answers: list[AnswerItem]
-
-
-@app.post("/sessions/{session_id}/answers")
-def post_answers(
-    session_id: str,
-    body: AnswersBatch,
-    _: None = Depends(verify_api_key),
-):
-    try:
-        sid = UUID(hex=session_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
-    session_bytes = uuid_to_bytes(sid)
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM survey_sessions WHERE id = %s",
-                (session_bytes,),
-            )
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="session not found")
-
-            for item in body.answers:
-                payload = json.dumps(item.value, ensure_ascii=False)
-                try:
-                    # Plain JSON text bind; avoids CAST(%s AS JSON) issues with some drivers.
-                    cur.execute(
-                        """
-                        INSERT INTO answers (session_id, question_id, value_json)
-                        VALUES (%s, %s, %s)
-                        """,
-                        (session_bytes, item.question_id, payload),
-                    )
-                except Exception as e:
-                    if (
-                        isinstance(e, (IntegrityError, OperationalError))
-                        and _mysql_errno(e) == 1452
-                    ):
-                        raise HTTPException(
-                            status_code=400,
-                            detail=(
-                                f"Foreign key failed for question_id={item.question_id!r}. "
-                                "Run scripts/seed_questions.py so `questions` rows exist, "
-                                "or remove the FK on `answers.question_id`."
-                            ),
-                        ) from e
-                    logger.exception("answers insert failed")
-                    raise
-
-    return {"inserted": len(body.answers)}
-
-
-@app.post("/sessions/{session_id}/audio")
-def upload_session_audio(
-    session_id: str,
-    file: UploadFile = File(...),
-    recorded_at_ms: int | None = Form(default=None),
-    local_session_id: str | None = Form(default=None),
-    _: None = Depends(verify_api_key),
-):
-    try:
-        sid = UUID(hex=session_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
-    session_bytes = uuid_to_bytes(sid)
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, respondent_id FROM survey_sessions WHERE id = %s",
-                (session_bytes,),
-            )
-            session_row = cur.fetchone()
-            if not session_row:
-                raise HTTPException(status_code=404, detail="session not found")
-
-            respondent_bytes = session_row["respondent_id"]
-
-    original_filename = sanitize_filename(file.filename or "recording.m4a")
-    extension = Path(original_filename).suffix.lower() or ".m4a"
-    storage_name = f"{session_id}_{uuid4().hex}{extension}"
-    session_dir = AUDIO_STORAGE_DIR / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-    storage_path = session_dir / storage_name
-    relative_path = str(Path(session_id) / storage_name)
-
-    bytes_written = 0
-    try:
-        with storage_path.open("wb") as out:
-            while True:
-                chunk = file.file.read(1024 * 1024)
-                if not chunk:
-                    break
-                bytes_written += len(chunk)
-                if bytes_written > AUDIO_MAX_BYTES:
-                    out.close()
-                    storage_path.unlink(missing_ok=True)
-                    raise HTTPException(status_code=413, detail="audio file is too large")
-                out.write(chunk)
-    except HTTPException:
-        raise
-    except Exception as e:
-        storage_path.unlink(missing_ok=True)
-        logger.exception("audio file save failed")
-        raise HTTPException(status_code=500, detail="failed to save audio file") from e
-    finally:
-        file.file.close()
-
-    if bytes_written <= 0:
-        storage_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail="audio file is empty")
-
-    try:
-        import hashlib
-
-        sha256 = hashlib.sha256()
-        with storage_path.open("rb") as saved:
-            for chunk in iter(lambda: saved.read(1024 * 1024), b""):
-                sha256.update(chunk)
-        sha256_hex = sha256.hexdigest()
-
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO audio_recordings (
-                        session_id, respondent_id, original_filename, storage_path,
-                        content_type, file_size_bytes, sha256, recorded_at_ms, local_session_id
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        session_bytes,
-                        respondent_bytes,
-                        original_filename,
-                        relative_path,
-                        file.content_type,
-                        bytes_written,
-                        sha256_hex,
-                        recorded_at_ms,
-                        local_session_id,
-                    ),
-                )
-                audio_id = cur.lastrowid
-    except Exception as e:
-        storage_path.unlink(missing_ok=True)
-        if isinstance(e, (IntegrityError, OperationalError)):
-            logger.exception("audio metadata insert failed")
-            raise HTTPException(
-                status_code=500,
-                detail="audio metadata insert failed; did you apply server/schema.sql?",
-            ) from e
-        logger.exception("audio metadata processing failed")
-        raise HTTPException(status_code=500, detail="audio metadata processing failed") from e
-
-    return {
-        "id": audio_id,
-        "session_id": session_id,
-        "filename": original_filename,
-        "storage_path": relative_path,
-        "file_size_bytes": bytes_written,
-        "sha256": sha256_hex,
-    }
 
 
 @app.post("/sessions/{session_id}/package")
@@ -1647,221 +1404,3 @@ def upload_session_package(
         "audio_sha256": audio_sha256,
         "analysis_answer_count": analysis_answer_count,
     }
-
-
-class LLMEventCreate(BaseModel):
-    session_id: str | None = None
-    question_id: str | None = Field(default=None, max_length=64)
-    model: str
-    latency_ms: int | None = None
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
-    success: bool = True
-    error_message: str | None = None
-    request_gcs_uri: str | None = None
-    response_gcs_uri: str | None = None
-
-
-@app.post("/llm-events")
-def create_llm_event(body: LLMEventCreate, _: None = Depends(verify_api_key)):
-    session_bytes = None
-    if body.session_id:
-        try:
-            session_bytes = uuid_to_bytes(UUID(hex=body.session_id))
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            if session_bytes:
-                cur.execute(
-                    "SELECT id FROM survey_sessions WHERE id = %s",
-                    (session_bytes,),
-                )
-                if not cur.fetchone():
-                    raise HTTPException(status_code=404, detail="session not found")
-
-            cur.execute(
-                """
-                INSERT INTO llm_events (
-                    session_id, question_id, model, latency_ms,
-                    prompt_tokens, completion_tokens, success, error_message,
-                    request_gcs_uri, response_gcs_uri
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    session_bytes,
-                    body.question_id,
-                    body.model,
-                    body.latency_ms,
-                    body.prompt_tokens,
-                    body.completion_tokens,
-                    body.success,
-                    body.error_message,
-                    body.request_gcs_uri,
-                    body.response_gcs_uri,
-                ),
-            )
-            eid = cur.lastrowid
-
-    return {"id": eid}
-
-
-class TrajectoryPointCreate(BaseModel):
-    ts_ms: int = Field(..., ge=0, description="Unix epoch milliseconds (UTC).")
-    lat: float
-    lon: float
-    accuracy_m: float | None = None
-    speed_mps: float | None = None
-    course_deg: float | None = None
-    provider: str | None = Field(default=None, max_length=32)
-    is_background: bool | None = None
-    session_id: str | None = Field(
-        default=None,
-        description="Optional UUID hex of the survey_session to link this point to.",
-    )
-
-
-class TrajectoryBatch(BaseModel):
-    points: list[TrajectoryPointCreate]
-
-
-@app.post("/respondents/{respondent_id}/trajectory")
-def post_trajectory(
-    respondent_id: str,
-    body: TrajectoryBatch,
-    _: None = Depends(verify_api_key),
-):
-    try:
-        rid = UUID(hex=respondent_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail="respondent_id must be a UUID") from e
-    respondent_bytes = uuid_to_bytes(rid)
-
-    if not body.points:
-        return {"inserted": 0}
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM respondents WHERE id = %s", (respondent_bytes,))
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="respondent not found")
-
-            # Validate any session_ids (must exist and belong to this respondent)
-            session_bytes_by_hex: dict[str, bytes] = {}
-            unique_session_hex = {p.session_id for p in body.points if p.session_id}
-            for sid_hex in unique_session_hex:
-                try:
-                    sb = uuid_to_bytes(UUID(hex=sid_hex))
-                except ValueError as e:
-                    raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
-                cur.execute(
-                    "SELECT id FROM survey_sessions WHERE id = %s AND respondent_id = %s",
-                    (sb, respondent_bytes),
-                )
-                if not cur.fetchone():
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"session not found for respondent (session_id={sid_hex})",
-                    )
-                session_bytes_by_hex[sid_hex] = sb
-
-            rows = []
-            for p in body.points:
-                rows.append(
-                    (
-                        respondent_bytes,
-                        session_bytes_by_hex.get(p.session_id) if p.session_id else None,
-                        int(p.ts_ms),
-                        float(p.lat),
-                        float(p.lon),
-                        p.accuracy_m,
-                        p.speed_mps,
-                        p.course_deg,
-                        p.provider,
-                        p.is_background,
-                    )
-                )
-
-            cur.executemany(
-                """
-                INSERT INTO trajectory_points (
-                    respondent_id, session_id, ts_ms,
-                    lat, lon, accuracy_m, speed_mps, course_deg,
-                    provider, is_background
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                rows,
-            )
-
-    return {"inserted": len(body.points)}
-
-
-@app.get("/respondents/{respondent_id}/trajectory")
-def get_trajectory(
-    respondent_id: str,
-    since_ms: int | None = None,
-    limit: int = 5000,
-    _: None = Depends(verify_api_key),
-):
-    try:
-        rid = UUID(hex=respondent_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail="respondent_id must be a UUID") from e
-    respondent_bytes = uuid_to_bytes(rid)
-    limit = max(1, min(int(limit), 20000))
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM respondents WHERE id = %s", (respondent_bytes,))
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="respondent not found")
-
-            if since_ms is None:
-                cur.execute(
-                    """
-                    SELECT ts_ms, lat, lon, accuracy_m, speed_mps, course_deg, provider, is_background,
-                           session_id
-                    FROM trajectory_points
-                    WHERE respondent_id = %s
-                    ORDER BY ts_ms ASC
-                    LIMIT %s
-                    """,
-                    (respondent_bytes, limit),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT ts_ms, lat, lon, accuracy_m, speed_mps, course_deg, provider, is_background,
-                           session_id
-                    FROM trajectory_points
-                    WHERE respondent_id = %s AND ts_ms >= %s
-                    ORDER BY ts_ms ASC
-                    LIMIT %s
-                    """,
-                    (respondent_bytes, int(since_ms), limit),
-                )
-
-            rows = cur.fetchall()
-
-    # Convert session_id bytes (if present) to UUID string
-    out = []
-    for r in rows:
-        sid = r.get("session_id")
-        out.append(
-            {
-                "ts_ms": int(r["ts_ms"]),
-                "lat": float(r["lat"]),
-                "lon": float(r["lon"]),
-                "accuracy_m": r.get("accuracy_m"),
-                "speed_mps": r.get("speed_mps"),
-                "course_deg": r.get("course_deg"),
-                "provider": r.get("provider"),
-                "is_background": r.get("is_background"),
-                "session_id": bytes_to_uuid_hex(sid) if sid else None,
-            }
-        )
-
-    return {"points": out, "count": len(out)}

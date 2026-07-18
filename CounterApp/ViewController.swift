@@ -7,9 +7,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     // MARK: - Properties
     @IBOutlet weak var statusLabel: UILabel!
     @IBOutlet weak var recordButton: UIButton!
-    @IBOutlet weak var playButton: UIButton!
-    @IBOutlet weak var llmButton: UIButton!
-    @IBOutlet weak var exportButton: UIButton!
     @IBOutlet weak var aggregateButton: UIButton!
     private var dashboardButton: UIButton?
     private var audioFilesButton: UIButton?
@@ -22,8 +19,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private var recordingURL: URL?
     private weak var recordingMonitorViewController: RecordingMonitorViewController?
     private weak var recordingReviewViewController: RecordingReviewViewController?
-    private var recordingStartTrajectoryPoint: PendingTrajectoryStore.Point?
-    private var interviewTrajectoryPoints: [PendingTrajectoryStore.Point] = []
+    private var recordingStartTrajectoryPoint: TrajectoryPoint?
+    private var interviewTrajectoryPoints: [TrajectoryPoint] = []
 
     // Per-participant session (local-only separation)
     private var sessionId: String?
@@ -121,19 +118,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         // Setup record button
         setupButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
 
-        // Playback happens in the post-recording review popup.
-        setupButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
-        playButton.isHidden = true
-
-        // Analyze now happens from the post-recording review flow.
-        setupButton(llmButton, title: "Analyze Answers", backgroundColor: .systemBlue)
-        llmButton.isHidden = true
-
-        // The session package is saved automatically after analysis/clarification.
-        // Resetting for the next interview also happens automatically after save/upload.
-        setupButton(exportButton, title: "Start Next Participant", backgroundColor: .systemGreen)
-        exportButton.isHidden = true
-
         // Setup aggregate button
         setupButton(aggregateButton, title: "Aggregate Results", backgroundColor: .systemTeal)
 
@@ -166,16 +150,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             audioBtn.heightAnchor.constraint(equalToConstant: 50)
         ])
 
-        // Initial state: hidden legacy buttons are disabled for storyboard compatibility.
-        playButton.isEnabled = false
-        llmButton.isEnabled = false
         dashboardBtn.isEnabled = true
         audioBtn.isEnabled = true
-        playButton.alpha = 0.5
-        llmButton.alpha = 0.5
         dashboardBtn.alpha = 1.0
         audioBtn.alpha = 1.0
-        updateNextParticipantButtonState()
     }
 
     private func setupButton(_ button: UIButton, title: String, backgroundColor: UIColor) {
@@ -203,22 +181,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         button.configuration?.baseBackgroundColor = backgroundColor
     }
 
-    private func updateNextParticipantButtonState() {
-        let hasParticipantState = respondentInfo != nil ||
-            transcription != nil ||
-            !matchedQuestions.isEmpty ||
-            cloudRespondentId != nil ||
-            cloudSessionId != nil ||
-            recordedData != nil ||
-            recordingURL != nil ||
-            recordingStartTrajectoryPoint != nil ||
-            !interviewTrajectoryPoints.isEmpty ||
-            isRecording
-
-        exportButton.isEnabled = hasParticipantState && !isRecording
-        exportButton.alpha = exportButton.isEnabled ? 1.0 : 0.5
-    }
-
     // MARK: - Button Actions
     @IBAction func recordButtonTapped(_ sender: UIButton) {
         resetInactivityTimer()
@@ -236,11 +198,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             matchedQuestions = []
             interviewerCheckedOptionCodesByQuestionId = [:]
             interviewTrajectoryPoints = []
-
-            // Analysis now runs from the post-recording review flow.
-            llmButton.isEnabled = true  // Can start LLM analysis after recording
-            llmButton.alpha = 1.0
-            updateNextParticipantButtonState()
 
             selectQuestionnaireIfNeeded { [weak self] in
                 self?.showRespondentInfoForm { [weak self] info in
@@ -262,56 +219,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         animateButton(sender)
     }
 
-    @IBAction func playButtonTapped(_ sender: UIButton) {
-        resetInactivityTimer()
-        guard let url = recordingURL else {
-            showMessage("No recording to play")
-            return
-        }
-
-        // Check if already playing
-        if let player = audioPlayer, player.isPlaying {
-            // Stop playing
-            player.stop()
-            audioPlayer = nil
-
-            updateButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
-            statusLabel.text = "Playback stopped"
-            statusLabel.textColor = .systemGray
-        } else {
-            // Start playing
-            do {
-                audioPlayer = try AVAudioPlayer(contentsOf: url)
-                audioPlayer?.delegate = self
-                audioPlayer?.play()
-
-                statusLabel.text = "Playing recording..."
-                statusLabel.textColor = .systemPurple
-
-                updateButton(playButton, title: "Stop Playback", backgroundColor: .systemRed)
-
-            } catch {
-                showMessage("Playback failed: \(error.localizedDescription)")
-            }
-        }
-
-        animateButton(sender)
-    }
-
-    @IBAction func llmButtonTapped(_ sender: UIButton) {
-        resetInactivityTimer()
-        runLLMRecognition()
-        animateButton(sender)
-    }
-
     private func runLLMRecognition() {
         guard let recordingURL, let sessionDirectoryURL else {
             showMessage("No recording available. Please record first.")
             return
         }
         invalidateInactivityTimer()
-        llmButton.isEnabled = false
-        llmButton.alpha = 0.5
         statusLabel.text = "Resuming saved interview processing...\nPlease wait"
         statusLabel.textColor = .systemBlue
         Task { [weak self] in
@@ -329,9 +242,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         recordingURL: URL
     ) {
         resetInactivityTimer()
-        llmButton.isEnabled = true
-        llmButton.alpha = 1
-
         switch outcome {
         case .needsClarification(let transcript, let matches),
              .analysisCompleted(let transcript, let matches):
@@ -444,12 +354,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ? "Audio saved; transcription pending"
             : "Audio and transcript saved; analysis pending"
         statusLabel.textColor = .systemOrange
-    }
-
-    @IBAction func exportButtonTapped(_ sender: UIButton) {
-        resetInactivityTimer()
-        animateButton(sender)
-        startNextParticipant()
     }
 
     @objc private func sessionToolsButtonTapped() {
@@ -586,7 +490,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     Int(key).map { ($0, value) }
                 }
             )
-            updateNextParticipantButtonState()
             runLLMRecognition()
         } catch {
             showBlockingRecordingError(
@@ -644,13 +547,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         do {
             try jsonData.write(to: sessionFileURL, options: [.atomic])
 
-            // Mirror into SurveyExports as well (keeps aggregation/clear flows working)
-            if let exportsDirectory = try? ensureExportsDirectory() {
-                let mirrorName = "survey_results_\(sessionId ?? "unknown")_\(Date().timeIntervalSince1970).json"
-                let mirrorURL = exportsDirectory.appendingPathComponent(mirrorName)
-                try? jsonData.write(to: mirrorURL, options: [.atomic])
-            }
-
             // Show export success
             statusLabel.text = "JSON exported successfully!\nSaved to App Folder"
             statusLabel.textColor = .systemGreen
@@ -658,7 +554,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             // Show success message with file location
             let alert = UIAlertController(
                 title: "Export Successful",
-                message: "File saved to:\n\(fileName)\n\nLocation: App Folder/SurveySessions/\(sessionId ?? "unknown")\n\n(Also mirrored to App Folder/SurveyExports for aggregation.)",
+                message: "File saved to:\n\(fileName)\n\nLocation: App Folder/SurveySessions/\(sessionId ?? "unknown")",
                 preferredStyle: .alert
             )
             alert.addAction(UIAlertAction(title: "View JSON", style: .default) { _ in
@@ -1508,7 +1404,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 
-    private func beginRecording(with point: PendingTrajectoryStore.Point?) {
+    private func beginRecording(with point: TrajectoryPoint?) {
         recordingStartTrajectoryPoint = point
         recordButton.isEnabled = true
         recordButton.alpha = 1.0
@@ -1521,7 +1417,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         source: LocalSessionLocationSource,
         quality: LocalSessionLocationQuality,
         horizontalAccuracyM: Double?,
-        point: PendingTrajectoryStore.Point?,
+        point: TrajectoryPoint?,
         place: LocalSessionPlaceSnapshot?,
         error: String?
     ) throws {
@@ -1704,7 +1600,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 
-    private func startRecording(with recordingStartPoint: PendingTrajectoryStore.Point?) {
+    private func startRecording(with recordingStartPoint: TrajectoryPoint?) {
         resetInactivityTimer()
         let audioSession = AVAudioSession.sharedInstance()
 
@@ -1773,7 +1669,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             audioFilesButton?.isEnabled = false
             dashboardButton?.alpha = 0.5
             audioFilesButton?.alpha = 0.5
-            updateNextParticipantButtonState()
             presentRecordingMonitor()
         } catch {
             audioRecorder?.stop()
@@ -1793,7 +1688,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             audioFilesButton?.isEnabled = true
             dashboardButton?.alpha = 1.0
             audioFilesButton?.alpha = 1.0
-            updateNextParticipantButtonState()
         }
     }
 
@@ -1851,16 +1745,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         statusLabel.text = "Recording stopped\nYou can play, recognize, or export"
         statusLabel.textColor = .systemGray
 
-        // Enable buttons
-        playButton.isEnabled = true
-        playButton.alpha = 1.0
         dashboardButton?.isEnabled = true
         audioFilesButton?.isEnabled = true
         dashboardButton?.alpha = 1.0
         audioFilesButton?.alpha = 1.0
 
         recordedData = "Recording data - Timestamp: \(Date().timeIntervalSince1970)"
-        updateNextParticipantButtonState()
         recordingMonitorViewController = nil
 
         if showReview {
@@ -1995,7 +1885,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         if let player = audioPlayer, player.isPlaying {
             player.stop()
             audioPlayer = nil
-            updateButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
             statusLabel.text = "Playback stopped"
             statusLabel.textColor = .systemGray
             return false
@@ -2005,7 +1894,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             audioPlayer = try AVAudioPlayer(contentsOf: url)
             audioPlayer?.delegate = self
             audioPlayer?.play()
-            updateButton(playButton, title: "Stop Playback", backgroundColor: .systemRed)
             statusLabel.text = "Playing recording..."
             statusLabel.textColor = .systemPurple
             return true
@@ -2074,16 +1962,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         recordingReviewViewController = nil
 
         updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
-        updateButton(playButton, title: "Play Recording", backgroundColor: .systemPurple)
-        playButton.isEnabled = false
-        llmButton.isEnabled = false
-        playButton.alpha = 0.5
-        llmButton.alpha = 0.5
         dashboardButton?.isEnabled = true
         audioFilesButton?.isEnabled = true
         dashboardButton?.alpha = 1.0
         audioFilesButton?.alpha = 1.0
-        updateNextParticipantButtonState()
 
         statusLabel.text = "Recording discarded\nReady to start again"
         statusLabel.textColor = .systemGray
@@ -2091,10 +1973,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         SessionManager.shared.clearCurrentSessionIfEmpty()
         sessionId = nil
         sessionDirectoryURL = nil
-        updateNextParticipantButtonState()
     }
 
-    private func writeRecordingMetadata(for recordingURL: URL, recordingStartPoint: PendingTrajectoryStore.Point?) {
+    private func writeRecordingMetadata(for recordingURL: URL, recordingStartPoint: TrajectoryPoint?) {
         let metadataURL = recordingURL.deletingPathExtension().appendingPathExtension("json")
         var metadata: [String: Any] = [
             "recording_file": recordingURL.lastPathComponent,
@@ -2147,7 +2028,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 
-    private func updateRecordingTrajectoryMetadata(for recordingURL: URL, points: [PendingTrajectoryStore.Point]) {
+    private func updateRecordingTrajectoryMetadata(for recordingURL: URL, points: [TrajectoryPoint]) {
         guard !points.isEmpty else { return }
         let metadataURL = recordingURL.deletingPathExtension().appendingPathExtension("json")
         var metadata = recordingMetadata(for: recordingURL) ?? [:]
@@ -2164,7 +2045,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
     }
 
-    private func trajectoryPointDictionary(_ point: PendingTrajectoryStore.Point) -> [String: Any] {
+    private func trajectoryPointDictionary(_ point: TrajectoryPoint) -> [String: Any] {
         var dict: [String: Any] = [
             "lat": point.lat,
             "lon": point.lon,
@@ -2386,7 +2267,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             case sessionId = "session_id"
         }
 
-        init(_ point: PendingTrajectoryStore.Point) {
+        init(_ point: TrajectoryPoint) {
             tsMs = point.tsMs
             capturedAt = ViewController.readableTimestampString(for: point.tsMs)
             lat = point.lat
@@ -3175,10 +3056,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         statusLabel.text = "AI analysis complete locally\nSaving the final package…"
         statusLabel.textColor = .systemGreen
 
-        llmButton.isEnabled = true
-        llmButton.alpha = 1.0
-        updateNextParticipantButtonState()
-
         do {
             _ = try writeSessionPackageJSON(
                 transcription: transcription,
@@ -3192,7 +3069,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         } catch {
             statusLabel.text = "Analysis complete, but local package save failed"
             statusLabel.textColor = .systemRed
-            updateNextParticipantButtonState()
             showBlockingRecordingError(
                 title: "Final Package Save Failed",
                 message: "The interview remains recoverable and was not reset. \(error.localizedDescription)"
@@ -3249,7 +3125,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     // MARK: - AVAudioPlayerDelegate
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         DispatchQueue.main.async {
-            self.updateButton(self.playButton, title: "Play Recording", backgroundColor: .systemPurple)
             self.statusLabel.text = "Playback complete"
             self.statusLabel.textColor = .systemGray
             self.recordingReviewViewController?.setPlaybackActive(false)
@@ -3299,7 +3174,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         interviewerCheckedOptionCodesByQuestionId = [:]
         cloudRespondentId = nil
         cloudSessionId = nil
-        TrajectoryTracker.shared.setCurrentIdentity(respondentId: nil, sessionId: nil)
         recordedData = nil
         recordingURL = nil
         recordingStartTrajectoryPoint = nil
@@ -3307,15 +3181,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         // Reset UI state
         updateButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
-        playButton.isEnabled = false
-        playButton.alpha = 0.5
-        llmButton.isEnabled = false
-        llmButton.alpha = 0.5
         dashboardButton?.isEnabled = true
         audioFilesButton?.isEnabled = true
         dashboardButton?.alpha = 1.0
         audioFilesButton?.alpha = 1.0
-        updateNextParticipantButtonState()
 
         statusLabel.text = "Ready for next participant"
         statusLabel.textColor = .systemGray
@@ -3383,7 +3252,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let decoder = JSONDecoder()
         let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let sessionsRoot = documentsURL.appendingPathComponent("SurveySessions", isDirectory: true)
-        let exportsRoot = documentsURL.appendingPathComponent("SurveyExports", isDirectory: true)
 
         var records: [AggregationSurveyRecord] = []
         var seenKeys = Set<String>()
@@ -3417,18 +3285,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
         }
 
-        if fileManager.fileExists(atPath: exportsRoot.path) {
-            let exportFiles = (try? fileManager.contentsOfDirectory(
-                at: exportsRoot,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            )) ?? []
-
-            for fileURL in exportFiles where fileURL.pathExtension.lowercased() == "json" {
-                appendIfValid(fileURL, fallbackKey: "export:\(fileURL.lastPathComponent)")
-            }
-        }
-
         return records
     }
 
@@ -3450,10 +3306,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         return string
     }
 
-    private func ensureExportsDirectory() throws -> URL {
+    private func ensureAggregatedExportsDirectory() throws -> URL {
         let fileManager = FileManager.default
         let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let exportsURL = documentsURL.appendingPathComponent("SurveyExports", isDirectory: true)
+        let exportsURL = documentsURL.appendingPathComponent("AggregatedExports", isDirectory: true)
 
         if !fileManager.fileExists(atPath: exportsURL.path) {
             try fileManager.createDirectory(at: exportsURL, withIntermediateDirectories: true, attributes: nil)
@@ -3901,40 +3757,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         present(alert, animated: true)
     }
 
-    // MARK: - Legacy trajectory upload compatibility
-
-    private func uploadRecordingStartTrajectoryIfNeeded(sessionId: String, recordingURL: URL?) async {
-        guard let recordingURL else { return }
-        guard !isRecordingStartTrajectoryUploadMarked(for: recordingURL) else { return }
-        guard let point = recordingStartTrajectoryPoint(for: recordingURL, cloudSessionId: sessionId) else { return }
-
-        do {
-            try await TrajectoryTracker.shared.uploadRecordingStartPoint(point)
-            markRecordingStartTrajectoryUploaded(for: recordingURL)
-        } catch {
-            print("Recording-start trajectory upload failed; point remains in recording metadata for retry: \(error.localizedDescription)")
-        }
-    }
-
-    private func uploadAudioToCloudIfNeeded(sessionId: String, recordingURL: URL?) async {
-        guard let recordingURL else { return }
-        guard FileManager.default.fileExists(atPath: recordingURL.path) else { return }
-        if isAudioUploadMarked(for: recordingURL) { return }
-
-        do {
-            let response = try await SurveyAPIClient.shared.uploadAudio(
-                sessionId: sessionId,
-                fileURL: recordingURL,
-                recordedAtMs: recordedAtMs(for: recordingURL),
-                localSessionId: sessionIdForRecording(recordingURL)
-            )
-            markAudioUploaded(for: recordingURL, response: response)
-            print("Survey API audio upload succeeded: \(response.storagePath)")
-        } catch {
-            print("Survey API audio upload failed: \(error.localizedDescription)")
-        }
-    }
-
     private func recordingMetadataURL(for recordingURL: URL) -> URL {
         return recordingURL.deletingPathExtension().appendingPathExtension("json")
     }
@@ -3969,7 +3791,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func recordingStartTrajectoryPoint(
         for recordingURL: URL,
         cloudSessionId: String
-    ) -> PendingTrajectoryStore.Point? {
+    ) -> TrajectoryPoint? {
         if let point = recordingStartTrajectoryPoint {
             return pointWithCloudSessionId(point, cloudSessionId)
         }
@@ -3983,7 +3805,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             return nil
         }
 
-        let point = PendingTrajectoryStore.Point(
+        let point = TrajectoryPoint(
             tsMs: tsMs,
             lat: lat,
             lon: lon,
@@ -4001,7 +3823,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func interviewTrajectoryPoints(
         for recordingURL: URL,
         cloudSessionId: String
-    ) -> [PendingTrajectoryStore.Point] {
+    ) -> [TrajectoryPoint] {
         if isRecording {
             let currentPoints = TrajectoryTracker.shared.currentInterviewPoints()
             if !currentPoints.isEmpty {
@@ -4031,14 +3853,14 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func trajectoryPoint(
         from raw: [String: Any],
         cloudSessionId: String
-    ) -> PendingTrajectoryStore.Point? {
+    ) -> TrajectoryPoint? {
         guard let tsMs = int64Value(raw["ts_ms"]),
               let lat = doubleValue(raw["lat"]),
               let lon = doubleValue(raw["lon"]) else {
             return nil
         }
 
-        return PendingTrajectoryStore.Point(
+        return TrajectoryPoint(
             tsMs: tsMs,
             lat: lat,
             lon: lon,
@@ -4052,10 +3874,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func pointWithCloudSessionId(
-        _ point: PendingTrajectoryStore.Point,
+        _ point: TrajectoryPoint,
         _ cloudSessionId: String
-    ) -> PendingTrajectoryStore.Point {
-        return PendingTrajectoryStore.Point(
+    ) -> TrajectoryPoint {
+        return TrajectoryPoint(
             tsMs: point.tsMs,
             lat: point.lat,
             lon: point.lon,
@@ -4085,44 +3907,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         if let value = value as? NSNumber { return value.doubleValue }
         if let value = value as? String { return Double(value) }
         return nil
-    }
-
-    private func isAudioUploadMarked(for recordingURL: URL) -> Bool {
-        return recordingMetadata(for: recordingURL)?["audio_uploaded_at_epoch"] != nil
-    }
-
-    private func isRecordingStartTrajectoryUploadMarked(for recordingURL: URL) -> Bool {
-        return recordingMetadata(for: recordingURL)?["recording_start_trajectory_uploaded_at_epoch"] != nil
-    }
-
-    private func markAudioUploaded(for recordingURL: URL, response: SurveyAPIClient.AudioUploadResponse) {
-        let metadataURL = recordingMetadataURL(for: recordingURL)
-        var metadata = recordingMetadata(for: recordingURL) ?? [:]
-        metadata["audio_uploaded_at_epoch"] = Date().timeIntervalSince1970
-        metadata["audio_upload_id"] = response.id
-        metadata["audio_server_storage_path"] = response.storagePath
-        metadata["audio_server_sha256"] = response.sha256
-        metadata["audio_server_file_size_bytes"] = response.fileSizeBytes
-
-        do {
-            let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
-            try data.write(to: metadataURL, options: [.atomic])
-        } catch {
-            print("Failed to mark audio as uploaded: \(error.localizedDescription)")
-        }
-    }
-
-    private func markRecordingStartTrajectoryUploaded(for recordingURL: URL) {
-        let metadataURL = recordingMetadataURL(for: recordingURL)
-        var metadata = recordingMetadata(for: recordingURL) ?? [:]
-        metadata["recording_start_trajectory_uploaded_at_epoch"] = Date().timeIntervalSince1970
-
-        do {
-            let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
-            try data.write(to: metadataURL, options: [.atomic])
-        } catch {
-            print("Failed to mark recording-start trajectory as uploaded: \(error.localizedDescription)")
-        }
     }
 
     // MARK: - Respondent Info Form
@@ -4195,7 +3979,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     // Show location aggregation view
                     let locationVC = LocationAggregationViewController()
                     locationVC.locationData = locationData
-                    locationVC.exportsDirectory = try? self.ensureExportsDirectory()
+                    locationVC.exportsDirectory = try? self.ensureAggregatedExportsDirectory()
 
                     let navController = UINavigationController(rootViewController: locationVC)
                     self.present(navController, animated: true)

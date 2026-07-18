@@ -192,9 +192,9 @@ struct LocalSessionManifest: Codable {
     var locationHorizontalAccuracyM: Double?
     var locationCoordinates: LocalSessionCoordinateSnapshot
     var locationLabel: String?
-    var locationPoint: PendingTrajectoryStore.Point?
+    var locationPoint: TrajectoryPoint?
     var placeSnapshot: LocalSessionPlaceSnapshot?
-    var trajectoryPoints: [PendingTrajectoryStore.Point]
+    var trajectoryPoints: [TrajectoryPoint]
     var interviewerCheckedOptionCodesByQuestionId: [String: [String]]
     var transcriptionStatus: LocalSessionTranscriptionStatus
     var transcriptionPipelineVersion: Int
@@ -263,9 +263,9 @@ struct LocalSessionManifest: Codable {
         locationHorizontalAccuracyM: Double? = nil,
         locationCoordinates: LocalSessionCoordinateSnapshot = LocalSessionCoordinateSnapshot(),
         locationLabel: String? = nil,
-        locationPoint: PendingTrajectoryStore.Point? = nil,
+        locationPoint: TrajectoryPoint? = nil,
         placeSnapshot: LocalSessionPlaceSnapshot? = nil,
-        trajectoryPoints: [PendingTrajectoryStore.Point] = []
+        trajectoryPoints: [TrajectoryPoint] = []
     ) {
         schemaVersion = Self.currentSchemaVersion
         self.localSessionId = localSessionId
@@ -335,7 +335,7 @@ struct LocalSessionManifest: Codable {
             forKey: .locationCoordinates
         ) ?? LocalSessionCoordinateSnapshot()
         locationLabel = try container.decodeIfPresent(String.self, forKey: .locationLabel)
-        locationPoint = try container.decodeIfPresent(PendingTrajectoryStore.Point.self, forKey: .locationPoint)
+        locationPoint = try container.decodeIfPresent(TrajectoryPoint.self, forKey: .locationPoint)
         placeSnapshot = try container.decodeIfPresent(LocalSessionPlaceSnapshot.self, forKey: .placeSnapshot)
         if locationHorizontalAccuracyM == nil {
             locationHorizontalAccuracyM = locationPoint?.accuracyM
@@ -346,7 +346,7 @@ struct LocalSessionManifest: Codable {
                 longitude: placeSnapshot?.longitude ?? locationPoint?.lon
             )
         }
-        trajectoryPoints = try container.decodeIfPresent([PendingTrajectoryStore.Point].self, forKey: .trajectoryPoints) ?? []
+        trajectoryPoints = try container.decodeIfPresent([TrajectoryPoint].self, forKey: .trajectoryPoints) ?? []
         interviewerCheckedOptionCodesByQuestionId = try container.decodeIfPresent(
             [String: [String]].self,
             forKey: .interviewerCheckedOptionCodesByQuestionId
@@ -753,13 +753,13 @@ enum LocalSessionManifestStore {
         )
     }
 
-    private static func trajectoryPoint(from raw: [String: Any]) -> PendingTrajectoryStore.Point? {
+    private static func trajectoryPoint(from raw: [String: Any]) -> TrajectoryPoint? {
         guard let tsMs = int64Value(raw["ts_ms"]),
               let lat = doubleValue(raw["lat"]),
               let lon = doubleValue(raw["lon"]) else {
             return nil
         }
-        return PendingTrajectoryStore.Point(
+        return TrajectoryPoint(
             tsMs: tsMs,
             lat: lat,
             lon: lon,

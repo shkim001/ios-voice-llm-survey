@@ -12,7 +12,7 @@ enum RecordingStartLocationFailure: Equatable {
 }
 
 struct RecordingStartLocationCandidate {
-    let point: PendingTrajectoryStore.Point
+    let point: TrajectoryPoint
     let horizontalAccuracyM: Double
     let quality: LocalSessionLocationQuality
 }
@@ -54,7 +54,7 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
     private let manager = CLLocationManager()
     private let samplingInterval: TimeInterval = 15.0
     private var lastKnownLocation: CLLocation?
-    private var interviewPoints: [PendingTrajectoryStore.Point] = []
+    private var interviewPoints: [TrajectoryPoint] = []
     private var samplingTimer: Timer?
     private var activeInterviewSessionId: String?
 
@@ -88,7 +88,7 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
             let isBackground = await MainActor.run { UIApplication.shared.applicationState != .active }
             let classification = Self.classifyRecordingStartLocation(
                 location,
-                sessionId: currentSessionId(),
+                sessionId: nil,
                 isBackground: isBackground
             )
             switch classification {
@@ -126,7 +126,7 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
         let accuracy = Double(location.horizontalAccuracy)
         let quality: LocalSessionLocationQuality = accuracy <= 10 ? .high
             : (accuracy <= Double(recordingStartAccuracyThresholdM) ? .acceptable : .low)
-        let point = PendingTrajectoryStore.Point(
+        let point = TrajectoryPoint(
             tsMs: Int64(now.timeIntervalSince1970 * 1000.0),
             lat: location.coordinate.latitude,
             lon: location.coordinate.longitude,
@@ -145,12 +145,12 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
         return quality == .low ? .lowAccuracy(candidate) : .acceptable(candidate)
     }
 
-    func startInterviewTracking(with startPoint: PendingTrajectoryStore.Point?) {
+    func startInterviewTracking(with startPoint: TrajectoryPoint?) {
         stopInterviewTracking()
 
         interviewPoints = startPoint.map { [$0] } ?? []
         guard let startPoint else { return }
-        activeInterviewSessionId = startPoint.sessionId ?? currentSessionId()
+        activeInterviewSessionId = startPoint.sessionId
 
         manager.desiredAccuracy = kCLLocationAccuracyBest
         manager.distanceFilter = kCLDistanceFilterNone
@@ -177,7 +177,7 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
     }
 
     @discardableResult
-    func stopInterviewTracking() -> [PendingTrajectoryStore.Point] {
+    func stopInterviewTracking() -> [TrajectoryPoint] {
         if samplingTimer != nil {
             sampleLatestInterviewLocation()
         }
@@ -188,31 +188,8 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
         return interviewPoints
     }
 
-    func currentInterviewPoints() -> [PendingTrajectoryStore.Point] {
+    func currentInterviewPoints() -> [TrajectoryPoint] {
         return interviewPoints
-    }
-
-    func uploadRecordingStartPoint(_ point: PendingTrajectoryStore.Point) async throws {
-        guard SurveyAPIClient.shared.isConfigured() else { return }
-        guard let respondentId = currentRespondentId() else { return }
-        try await SurveyAPIClient.shared.postTrajectory(respondentId: respondentId, points: [point])
-    }
-
-    func setCurrentIdentity(respondentId: String?, sessionId: String?) {
-        if let respondentId {
-            UserDefaults.standard.set(respondentId, forKey: DefaultsKeys.respondentId)
-        } else {
-            UserDefaults.standard.removeObject(forKey: DefaultsKeys.respondentId)
-        }
-        if let sessionId {
-            UserDefaults.standard.set(sessionId, forKey: DefaultsKeys.sessionId)
-        } else {
-            UserDefaults.standard.removeObject(forKey: DefaultsKeys.sessionId)
-        }
-
-        if respondentId == nil {
-            stop()
-        }
     }
 
     // MARK: - CLLocationManagerDelegate
@@ -243,21 +220,6 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
 
     // MARK: - Internals
 
-    private enum DefaultsKeys {
-        static let respondentId = "SurveyAPI_CurrentRespondentID"
-        static let sessionId = "SurveyAPI_CurrentSessionID"
-    }
-
-    private func currentRespondentId() -> String? {
-        let id = UserDefaults.standard.string(forKey: DefaultsKeys.respondentId)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (id?.isEmpty == false) ? id : nil
-    }
-
-    private func currentSessionId() -> String? {
-        let id = UserDefaults.standard.string(forKey: DefaultsKeys.sessionId)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (id?.isEmpty == false) ? id : nil
-    }
-
     private func sampleLatestInterviewLocation() {
         guard let loc = lastKnownLocation, isUsable(loc, maxAgeSeconds: 60) else { return }
         let point = makePoint(
@@ -265,7 +227,7 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
             timestamp: Date(),
             provider: "interview",
             isBackground: UIApplication.shared.applicationState != .active,
-            sessionId: activeInterviewSessionId ?? currentSessionId()
+            sessionId: activeInterviewSessionId
         )
         interviewPoints.append(point)
     }
@@ -282,8 +244,8 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
         provider: String,
         isBackground: Bool,
         sessionId: String?
-    ) -> PendingTrajectoryStore.Point {
-        return PendingTrajectoryStore.Point(
+    ) -> TrajectoryPoint {
+        return TrajectoryPoint(
             tsMs: Int64(timestamp.timeIntervalSince1970 * 1000.0),
             lat: loc.coordinate.latitude,
             lon: loc.coordinate.longitude,

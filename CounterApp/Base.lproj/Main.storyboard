@@ -36,39 +36,6 @@
                                             <action selector="recordButtonTapped:" destination="BYZ-38-t0r" eventType="touchUpInside" id="record-action"/>
                                         </connections>
                                     </button>
-                                    <button opaque="NO" contentMode="scaleToFill" contentHorizontalAlignment="center" contentVerticalAlignment="center" buttonType="system" lineBreakMode="middleTruncation" translatesAutoresizingMaskIntoConstraints="NO" id="play-button">
-                                        <rect key="frame" x="0.0" y="162" width="313" height="50"/>
-                                        <state key="normal" title="Play Recording"/>
-                                        <buttonConfiguration key="configuration" style="filled">
-                                            <color key="baseForegroundColor" systemColor="systemBackgroundColor"/>
-                                            <color key="baseBackgroundColor" systemColor="systemPurpleColor"/>
-                                        </buttonConfiguration>
-                                        <connections>
-                                            <action selector="playButtonTapped:" destination="BYZ-38-t0r" eventType="touchUpInside" id="play-action"/>
-                                        </connections>
-                                    </button>
-                                    <button opaque="NO" contentMode="scaleToFill" contentHorizontalAlignment="center" contentVerticalAlignment="center" buttonType="system" lineBreakMode="middleTruncation" translatesAutoresizingMaskIntoConstraints="NO" id="llm-button">
-                                        <rect key="frame" x="0.0" y="242" width="313" height="50"/>
-                                        <state key="normal" title="LLM Recognition"/>
-                                        <buttonConfiguration key="configuration" style="filled">
-                                            <color key="baseForegroundColor" systemColor="systemBackgroundColor"/>
-                                            <color key="baseBackgroundColor" systemColor="systemBlueColor"/>
-                                        </buttonConfiguration>
-                                        <connections>
-                                            <action selector="llmButtonTapped:" destination="BYZ-38-t0r" eventType="touchUpInside" id="llm-action"/>
-                                        </connections>
-                                    </button>
-                                    <button opaque="NO" contentMode="scaleToFill" contentHorizontalAlignment="center" contentVerticalAlignment="center" buttonType="system" lineBreakMode="middleTruncation" translatesAutoresizingMaskIntoConstraints="NO" id="export-button">
-                                        <rect key="frame" x="0.0" y="322" width="313" height="50"/>
-                                        <state key="normal" title="Export JSON"/>
-                                        <buttonConfiguration key="configuration" style="filled">
-                                            <color key="baseForegroundColor" systemColor="systemBackgroundColor"/>
-                                            <color key="baseBackgroundColor" systemColor="systemGreenColor"/>
-                                        </buttonConfiguration>
-                                        <connections>
-                                            <action selector="exportButtonTapped:" destination="BYZ-38-t0r" eventType="touchUpInside" id="export-action"/>
-                                        </connections>
-                                    </button>
                                     <button opaque="NO" contentMode="scaleToFill" contentHorizontalAlignment="center" contentVerticalAlignment="center" buttonType="system" lineBreakMode="middleTruncation" translatesAutoresizingMaskIntoConstraints="NO" id="aggregate-button">
                                         <rect key="frame" x="0.0" y="402" width="313" height="50"/>
                                         <state key="normal" title="Aggregate Results"/>
@@ -83,9 +50,6 @@
                                 </subviews>
                                 <constraints>
                                     <constraint firstItem="record-button" firstAttribute="height" constant="50" id="record-height"/>
-                                    <constraint firstItem="play-button" firstAttribute="height" constant="50" id="play-height"/>
-                                    <constraint firstItem="llm-button" firstAttribute="height" constant="50" id="llm-height"/>
-                                    <constraint firstItem="export-button" firstAttribute="height" constant="50" id="export-height"/>
                                     <constraint firstItem="aggregate-button" firstAttribute="height" constant="50" id="aggregate-height"/>
                                 </constraints>
                             </stackView>
@@ -102,9 +66,6 @@
                     <connections>
                         <outlet property="statusLabel" destination="status-label" id="status-outlet"/>
                         <outlet property="recordButton" destination="record-button" id="record-outlet"/>
-                        <outlet property="playButton" destination="play-button" id="play-outlet"/>
-                        <outlet property="llmButton" destination="llm-button" id="llm-outlet"/>
-                        <outlet property="exportButton" destination="export-button" id="export-outlet"/>
                         <outlet property="aggregateButton" destination="aggregate-button" id="aggregate-outlet"/>
                     </connections>
                 </viewController>

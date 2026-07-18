@@ -65,20 +65,6 @@ final class SurveyAPIClient {
         }
     }
     
-    struct AnswersBatch: Encodable {
-        let answers: [AnswerItem]
-    }
-    
-    struct AnswerItem: Encodable {
-        let questionId: String
-        let value: AnyJSON
-        
-        enum CodingKeys: String, CodingKey {
-            case questionId = "question_id"
-            case value
-        }
-    }
-
     struct InterviewerResolveRequest: Encodable {
         let name: String
         let email: String
@@ -148,43 +134,6 @@ final class SurveyAPIClient {
         )
     }
     
-    func postAnswers(sessionId: String, answers: [[String: Any]]) async throws {
-        let items = answers.map { dict -> AnswerItem in
-            let qid = (dict["question_id"] as? String) ?? ""
-            let value = dict["value"] as? [String: Any] ?? [:]
-            return AnswerItem(questionId: qid, value: AnyJSON(value))
-        }.filter { !$0.questionId.isEmpty }
-        
-        let body = AnswersBatch(answers: items)
-        _ = try await requestData(
-            method: "POST",
-            path: "/sessions/\(sessionId)/answers",
-            body: body
-        )
-    }
-
-    struct TrajectoryBatch: Encodable {
-        let points: [PendingTrajectoryStore.Point]
-    }
-
-    struct AudioUploadResponse: Decodable {
-        let id: Int
-        let sessionId: String
-        let filename: String
-        let storagePath: String
-        let fileSizeBytes: Int
-        let sha256: String
-
-        enum CodingKeys: String, CodingKey {
-            case id
-            case sessionId = "session_id"
-            case filename
-            case storagePath = "storage_path"
-            case fileSizeBytes = "file_size_bytes"
-            case sha256
-        }
-    }
-
     struct SessionPackageUploadResponse: Decodable {
         let sessionId: String
         let respondentId: String
@@ -260,64 +209,6 @@ final class SurveyAPIClient {
         }
     }
     
-    func postTrajectory(respondentId: String, points: [PendingTrajectoryStore.Point]) async throws {
-        let body = TrajectoryBatch(points: points)
-        _ = try await requestData(
-            method: "POST",
-            path: "/respondents/\(respondentId)/trajectory",
-            body: body
-        )
-    }
-
-    func uploadAudio(
-        sessionId: String,
-        fileURL: URL,
-        recordedAtMs: Int?,
-        localSessionId: String?
-    ) async throws -> AudioUploadResponse {
-        let url = try makeURL(path: "/sessions/\(sessionId)/audio")
-        let boundary = "Boundary-\(UUID().uuidString)"
-        let filename = fileURL.lastPathComponent
-        let fileData = try Data(contentsOf: fileURL)
-
-        var body = Data()
-        appendFormField(name: "recorded_at_ms", value: recordedAtMs.map(String.init), to: &body, boundary: boundary)
-        appendFormField(name: "local_session_id", value: localSessionId, to: &body, boundary: boundary)
-        appendFileField(
-            name: "file",
-            filename: filename,
-            contentType: "audio/mp4",
-            data: fileData,
-            to: &body,
-            boundary: boundary
-        )
-        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        if !apiKey.isEmpty {
-            req.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-        }
-        req.timeoutInterval = 120.0
-
-        let (data, response) = try await URLSession.shared.upload(for: req, from: body)
-        guard let http = response as? HTTPURLResponse else {
-            throw SurveyAPIError.invalidHTTPResponse
-        }
-        guard (200...299).contains(http.statusCode) else {
-            let raw = String(data: data, encoding: .utf8) ?? ""
-            throw SurveyAPIError.httpError(statusCode: http.statusCode, bodyPreview: String(raw.prefix(500)))
-        }
-
-        do {
-            return try JSONDecoder().decode(AudioUploadResponse.self, from: data)
-        } catch {
-            let raw = String(data: data, encoding: .utf8) ?? ""
-            throw SurveyAPIError.decodingFailed(rawPreview: String(raw.prefix(300)))
-        }
-    }
-
     func uploadSessionPackage(
         sessionId: String,
         sessionJSONURL: URL,
@@ -514,42 +405,6 @@ enum SurveyAPIError: LocalizedError {
             return "Survey API error (HTTP \(status)).\n\n\(preview)"
         case .decodingFailed(let preview):
             return "Failed to decode Survey API response.\n\n\(preview)"
-        }
-    }
-}
-
-// MARK: - AnyJSON (minimal heterogeneous JSON encoder)
-
-struct AnyJSON: Encodable {
-    private let value: Any
-    
-    init(_ value: Any) {
-        self.value = value
-    }
-    
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
-        
-        switch value {
-        case is NSNull:
-            try container.encodeNil()
-        case let v as String:
-            try container.encode(v)
-        case let v as Bool:
-            try container.encode(v)
-        case let v as Int:
-            try container.encode(v)
-        case let v as Double:
-            try container.encode(v)
-        case let v as Float:
-            try container.encode(v)
-        case let v as [String: Any]:
-            try container.encode(v.mapValues { AnyJSON($0) })
-        case let v as [Any]:
-            try container.encode(v.map { AnyJSON($0) })
-        default:
-            // Fallback: best-effort stringification to avoid crashing uploads
-            try container.encode(String(describing: value))
         }
     }
 }
