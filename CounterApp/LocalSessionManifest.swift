@@ -169,7 +169,7 @@ struct LocalSessionRetryMetadata: Codable {
 }
 
 struct LocalSessionManifest: Codable {
-    static let currentSchemaVersion = 4
+    static let currentSchemaVersion = 5
     static let currentTranscriptionPipelineVersion = 2
 
     var schemaVersion: Int
@@ -667,7 +667,7 @@ enum LocalSessionManifestStore {
                             ?? intValue(respondent["age"]).flatMap(Self.standardAgeRangeLabel(for:)),
                         gender: nonEmptyString(respondent["gender"]) ?? "Unknown",
                         race: nonEmptyString(respondent["race"]),
-                        phone: nonEmptyString(respondent["phone"]),
+                        email: nonEmptyString(respondent["email"]),
                         location: nonEmptyString(respondent["location"])
                             ?? manifest.locationLabel
                             ?? "Unknown Location"
@@ -709,7 +709,7 @@ enum LocalSessionManifestStore {
                         ?? intValue(respondent["age"]).flatMap(Self.standardAgeRangeLabel(for:)),
                     gender: nonEmptyString(respondent["gender"]) ?? "Unknown",
                     race: nonEmptyString(respondent["race"]),
-                    phone: nonEmptyString(respondent["phone"]),
+                    email: nonEmptyString(respondent["email"]),
                     location: nonEmptyString(respondent["location"])
                         ?? manifest.locationLabel
                         ?? "Unknown Location"

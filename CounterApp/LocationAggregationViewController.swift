@@ -338,7 +338,7 @@ class LocationAggregationViewController: UIViewController {
                         "age_range": respondentInfo.ageRange ?? "",
                         "gender": respondentInfo.gender ?? "",
                         "race": respondentInfo.race ?? "",
-                        "phone": respondentInfo.phone ?? "",
+                        "email": respondentInfo.email ?? "",
                         "location": respondentInfo.location ?? ""
                     ]
                 }

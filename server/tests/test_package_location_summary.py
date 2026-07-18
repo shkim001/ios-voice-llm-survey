@@ -10,6 +10,25 @@ from server.app import main  # noqa: E402
 
 
 class PackageLocationSummaryTests(unittest.TestCase):
+    def test_admin_summary_exposes_current_respondent_contact_fields(self):
+        summary = main.admin_json_summary(
+            {
+                "respondent_info": {
+                    "is_anonymous": False,
+                    "name": "Example Respondent",
+                    "email": "respondent@example.com",
+                    "age_range": "25-34",
+                    "gender": "Prefer not to say",
+                    "race": "Asian",
+                    "location": "Morningside Heights",
+                }
+            }
+        )
+
+        self.assertEqual(summary["respondent_name"], "Example Respondent")
+        self.assertEqual(summary["respondent_email"], "respondent@example.com")
+        self.assertEqual(summary["respondent_location"], "Morningside Heights")
+
     def test_place_search_is_indexed_as_label_but_never_as_device_gps(self):
         summary = main.safe_json_summary(
             {

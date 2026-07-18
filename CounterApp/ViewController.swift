@@ -2008,8 +2008,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             if let age = info.age {
                 respondentMetadata["age"] = age
             }
-            if let phone = info.phone {
-                respondentMetadata["phone"] = phone
+            if let email = info.email {
+                respondentMetadata["email"] = email
             }
             metadata["respondent_info"] = respondentMetadata
         }
@@ -2327,7 +2327,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             }
         }
         let metadata = SessionPackageMetadata(
-            schemaVersion: 2,
+            schemaVersion: 3,
             exportTime: timestampString,
             timestamp: timestamp,
             localSessionId: sessionId ?? "",
@@ -2380,7 +2380,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         return SessionPackage(
             metadata: metadata,
-            schemaVersion: 2,
+            schemaVersion: 3,
             timestamp: timestamp,
             sessionId: sessionId ?? "",
             localSessionId: sessionId ?? "",
@@ -2489,7 +2489,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("age_range", jsonString(info.ageRange)),
             ("gender", jsonString(info.gender)),
             ("race", jsonString(info.race)),
-            ("phone", jsonString(info.phone)),
+            ("email", jsonString(info.email)),
             ("location", jsonString(info.location))
         ], indent: indent)
     }

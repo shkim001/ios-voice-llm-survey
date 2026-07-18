@@ -51,7 +51,7 @@ enum DurableSessionPackageFinalizer {
         let timestamp = now.timeIntervalSince1970
         let package = Package(
             metadata: Metadata(
-                schemaVersion: 2,
+                schemaVersion: 3,
                 exportTime: exportTimestamp(now),
                 timestamp: timestamp,
                 localSessionId: manifest.localSessionId,
@@ -60,7 +60,7 @@ enum DurableSessionPackageFinalizer {
                 questionnaire: questionnaire,
                 cloud: cloud
             ),
-            schemaVersion: 2,
+            schemaVersion: 3,
             timestamp: timestamp,
             sessionId: manifest.localSessionId,
             localSessionId: manifest.localSessionId,

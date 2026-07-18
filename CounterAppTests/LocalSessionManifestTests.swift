@@ -46,8 +46,10 @@ struct LocalSessionManifestTests {
                 isAnonymous: false,
                 name: "Respondent",
                 age: 70,
+                ageRange: "65+",
                 gender: "Prefer not to say",
-                phone: nil,
+                race: "Asian",
+                email: "respondent@example.com",
                 location: "Broadway"
             ),
             questionnaireSnapshot: questionnaire,
@@ -76,6 +78,9 @@ struct LocalSessionManifestTests {
         #expect(decoded.audioStatus == .recordedLocally)
         #expect(decoded.interviewerSnapshot?.email == "worker@example.com")
         #expect(decoded.respondentSnapshot?.name == "Respondent")
+        #expect(decoded.respondentSnapshot?.ageRange == "65+")
+        #expect(decoded.respondentSnapshot?.race == "Asian")
+        #expect(decoded.respondentSnapshot?.email == "respondent@example.com")
         #expect(decoded.questionnaireId == "street-assessment")
         #expect(decoded.questionnaireVersion == "3")
         #expect(decoded.questionnaireSnapshot?.questions.first?.id == 1)

@@ -335,7 +335,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 
 ## Usage workflow
 
-1. **Start Interview** — configure the current interviewer if needed, submit respondent info, and attempt fresh GPS. If GPS is unavailable or insufficient, retry, accept the disclosed low accuracy, search for a place, record without GPS, or cancel; recording is not unconditionally blocked.
+1. **Start Interview** — configure the current interviewer if needed, submit respondent info, and attempt fresh GPS. Respondent intake collects age range, gender, and race; non-anonymous respondents can also provide a name and optional email. Phone numbers are not collected. If GPS is unavailable or insufficient, retry, accept the disclosed low accuracy, search for a place, record without GPS, or cancel; recording is not unconditionally blocked.
 2. **Review Recording** — after Stop & Review, play the audio without closing the review popup, then analyze or discard the recording.
 3. **Analyze Answers** — from the review popup, transcribes the recording (English locale), sends the transcript to the configured LLM, and shows matched questions and extracted answers.
 4. **Clarify Answers** — for medium/low-confidence answers or answers marked as needing clarification, select or type the final answer and optionally add a note. The JSON keeps both the original LLM answer and the manual correction.
@@ -346,7 +346,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 
 If Survey API is configured, the outbox uploads the complete session package after any required clarification is resolved. It creates/reuses a cloud session keyed by the local session ID, persists those IDs, and marks upload complete only after validating the server response. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, and `analysis_answers` stores one extracted row per matched question.
 
-The generated `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. Coordinate objects always place `lat` and `lon` next to each other. Interview paths are saved in `trajectory_points`; each point includes both `ts_ms` and readable UTC `captured_at`.
+The generated schema-v3 `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. The v3 respondent shape uses optional `email` and does not emit `phone`. Coordinate objects always place `lat` and `lon` next to each other. Interview paths are saved in `trajectory_points`; each point includes both `ts_ms` and readable UTC `captured_at`.
 
 ---
 

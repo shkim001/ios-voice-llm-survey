@@ -98,13 +98,17 @@ class RespondentInfoViewController: UIViewController {
         return control
     }()
     
-    private let phoneTextField: UITextField = {
+    private let emailTextField: UITextField = {
         let textField = UITextField()
         textField.translatesAutoresizingMaskIntoConstraints = false
-        textField.placeholder = "Phone Number"
+        textField.placeholder = "Email (optional)"
         textField.borderStyle = .roundedRect
         textField.font = UIFont.systemFont(ofSize: 16)
-        textField.keyboardType = .phonePad
+        textField.keyboardType = .emailAddress
+        textField.textContentType = .emailAddress
+        textField.autocapitalizationType = .none
+        textField.autocorrectionType = .no
+        textField.returnKeyType = .next
         return textField
     }()
 
@@ -144,7 +148,7 @@ class RespondentInfoViewController: UIViewController {
 
     private lazy var nameLabel = createLabel(text: "Name *")
     private lazy var ageLabel = createLabel(text: "Age range *")
-    private lazy var phoneLabel = createLabel(text: "Phone Number *")
+    private lazy var emailLabel = createLabel(text: "Email (optional)")
     private lazy var raceLabel = createLabel(text: "Race *")
     
     // MARK: - Lifecycle
@@ -197,8 +201,8 @@ class RespondentInfoViewController: UIViewController {
         stackView.addArrangedSubview(genderSegmentedControl)
         stackView.addArrangedSubview(raceLabel)
         stackView.addArrangedSubview(raceButton)
-        stackView.addArrangedSubview(phoneLabel)
-        stackView.addArrangedSubview(phoneTextField)
+        stackView.addArrangedSubview(emailLabel)
+        stackView.addArrangedSubview(emailTextField)
         stackView.addArrangedSubview(locationLabel)
         stackView.addArrangedSubview(locationTextField)
         stackView.addArrangedSubview(submitButton)
@@ -217,16 +221,8 @@ class RespondentInfoViewController: UIViewController {
     
     private func setupTextFieldDelegates() {
         nameTextField.delegate = self
-        phoneTextField.delegate = self
+        emailTextField.delegate = self
         locationTextField.delegate = self
-        
-        // Add toolbar with Done button for number pad
-        let toolbar = UIToolbar()
-        toolbar.sizeToFit()
-        let doneButton = UIBarButtonItem(barButtonSystemItem: .done, target: self, action: #selector(dismissKeyboard))
-        toolbar.setItems([UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil), doneButton], animated: false)
-        
-        phoneTextField.inputAccessoryView = toolbar
     }
     
     private func setupKeyboardObservers() {
@@ -314,7 +310,7 @@ class RespondentInfoViewController: UIViewController {
             ageRangeButton.heightAnchor.constraint(equalToConstant: 44),
             genderSegmentedControl.heightAnchor.constraint(equalToConstant: 32),
             raceButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
-            phoneTextField.heightAnchor.constraint(equalToConstant: 44),
+            emailTextField.heightAnchor.constraint(equalToConstant: 44),
             locationTextField.heightAnchor.constraint(equalToConstant: 44),
             submitButton.heightAnchor.constraint(equalToConstant: 50)
         ])
@@ -323,7 +319,7 @@ class RespondentInfoViewController: UIViewController {
     // MARK: - Actions
     @objc private func submitButtonTapped() {
         let nameText = nameTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let phoneText = phoneTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let emailText = emailTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         guard isAnonymousSurvey || !nameText.isEmpty else {
             showAlert(message: "Please enter name")
@@ -340,8 +336,8 @@ class RespondentInfoViewController: UIViewController {
             return
         }
         
-        guard isAnonymousSurvey || !phoneText.isEmpty else {
-            showAlert(message: "Please enter phone number")
+        guard emailText.isEmpty || InterviewerProfile.isValidEmail(emailText) else {
+            showAlert(message: "Please enter a valid email or leave it blank")
             return
         }
         
@@ -363,7 +359,9 @@ class RespondentInfoViewController: UIViewController {
             ageRange: ageRange,
             gender: gender,
             race: race,
-            phone: isAnonymousSurvey ? nil : phoneText,
+            email: isAnonymousSurvey || emailText.isEmpty
+                ? nil
+                : InterviewerProfile.normalizedEmail(emailText),
             location: location
         )
         
@@ -413,12 +411,12 @@ class RespondentInfoViewController: UIViewController {
 
         nameLabel.isHidden = isAnonymousSurvey
         nameTextField.isHidden = isAnonymousSurvey
-        phoneLabel.isHidden = isAnonymousSurvey
-        phoneTextField.isHidden = isAnonymousSurvey
+        emailLabel.isHidden = isAnonymousSurvey
+        emailTextField.isHidden = isAnonymousSurvey
 
         if isAnonymousSurvey {
             nameTextField.text = nil
-            phoneTextField.text = nil
+            emailTextField.text = nil
             activeTextField?.resignFirstResponder()
         }
     }
@@ -483,8 +481,8 @@ extension RespondentInfoViewController: UITextFieldDelegate {
         // Move to next field or dismiss keyboard
         switch textField {
         case nameTextField:
-            phoneTextField.becomeFirstResponder()
-        case phoneTextField:
+            emailTextField.becomeFirstResponder()
+        case emailTextField:
             locationTextField.becomeFirstResponder()
         case locationTextField:
             textField.resignFirstResponder()

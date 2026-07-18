@@ -178,7 +178,7 @@ struct RespondentInfo: Codable {
     let ageRange: String?
     let gender: String
     let race: String?
-    let phone: String?
+    let email: String?
     let location: String
 
     enum CodingKeys: String, CodingKey {
@@ -188,7 +188,7 @@ struct RespondentInfo: Codable {
         case ageRange = "age_range"
         case gender
         case race
-        case phone
+        case email
         case location
     }
 
@@ -199,7 +199,7 @@ struct RespondentInfo: Codable {
         ageRange: String?,
         gender: String,
         race: String?,
-        phone: String?,
+        email: String?,
         location: String
     ) {
         self.isAnonymous = isAnonymous
@@ -208,7 +208,7 @@ struct RespondentInfo: Codable {
         self.ageRange = ageRange
         self.gender = gender
         self.race = race
-        self.phone = phone
+        self.email = email
         self.location = location
     }
 
@@ -221,7 +221,7 @@ struct RespondentInfo: Codable {
             ?? age.flatMap(Self.standardAgeRangeLabel(for:))
         gender = try container.decodeIfPresent(String.self, forKey: .gender) ?? "Unknown"
         race = try container.decodeIfPresent(String.self, forKey: .race)
-        phone = try container.decodeIfPresent(String.self, forKey: .phone)
+        email = try container.decodeIfPresent(String.self, forKey: .email)
         location = try container.decodeIfPresent(String.self, forKey: .location) ?? "Unknown Location"
     }
 
@@ -305,7 +305,7 @@ struct ExportedRespondentInfo: Decodable {
     let ageRange: String?
     let gender: String?
     let race: String?
-    let phone: String?
+    let email: String?
     let location: String?
 
     enum CodingKeys: String, CodingKey {
@@ -314,7 +314,7 @@ struct ExportedRespondentInfo: Decodable {
         case ageRange = "age_range"
         case gender
         case race
-        case phone
+        case email
         case location
     }
 }
