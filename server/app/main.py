@@ -157,10 +157,14 @@ def package_location_summary(data: dict) -> dict[str, Any]:
 
 def original_package_has_location(data: dict) -> bool:
     location = package_location_summary(data)
+    source = (location.get("source") or "").strip().lower()
+    has_coordinates = location.get("latitude") is not None and location.get("longitude") is not None
+    if source == "none":
+        return has_coordinates
     return bool(
         location.get("label")
         or location.get("formatted_address")
-        or (location.get("latitude") is not None and location.get("longitude") is not None)
+        or has_coordinates
     )
 
 

@@ -66,9 +66,9 @@ class PackageLocationSummaryTests(unittest.TestCase):
     def test_empty_location_can_receive_an_admin_override(self):
         package = {
             "location": {
-                "status": "no_location",
+                "status": "unavailable",
                 "source": "none",
-                "label": None,
+                "label": "Respondent form fallback that is not an interview location",
                 "latitude": None,
                 "longitude": None,
             },
@@ -76,6 +76,11 @@ class PackageLocationSummaryTests(unittest.TestCase):
         }
 
         self.assertFalse(main.original_package_has_location(package))
+
+    def test_legacy_label_without_explicit_none_source_remains_original_location(self):
+        package = {"location_label": "Legacy address-only location"}
+
+        self.assertTrue(main.original_package_has_location(package))
 
     def test_legacy_trajectory_counts_as_original_location(self):
         package = {"trajectory_points": [{"lat": 40.8, "lon": -73.9}]}
