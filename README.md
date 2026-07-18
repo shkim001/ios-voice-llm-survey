@@ -116,10 +116,10 @@ When the Survey API is configured:
 - After **Analyze Answers** from the recording review flow, the app writes `session.json` into that local session folder.
 - Each `session.json` includes `interviewer_info` with `interviewer_id`, `name`, `email`, and `identity_scope`.
 - If any matched answer has medium/low confidence or needs clarification, the interviewer can select or type a final answer before the package is saved.
-- If the Survey API is configured, the app uploads `session.json` and the original `.m4a` together to `POST /sessions/{id}/package`. Session-folder manifests are scanned on launch, foreground activation, a satisfied network-path hint, or manual **Retry Pending Sessions Now**. Automatic triggers retry upload-ready packages; unfinished Speech/LLM processing resumes only after the interviewer accepts the recovery prompt or chooses a manual retry.
+- If the Survey API is configured, the app uploads `session.json` and the original `.m4a` together to `POST /sessions/{id}/package`. Launch, foreground, and satisfied network-path callbacks only discover saved work and ask before opening the Dashboard; they do not silently process old sessions. The interviewer can process one session from its detail page or select several eligible sessions for sequential processing.
 - The server stores both files under one VM folder, writes a package index row to MySQL, indexes interviewer fields, and extracts matched answers into `analysis_answers` for easier counting/filtering.
 - GPS failure no longer blocks recording: the interviewer can retry, accept a disclosed low-accuracy point, record without GPS, search with native MapKit, or cancel. Device-GPS trajectory sampling continues about every 15 seconds when GPS is available.
-- `NWPathMonitor` only triggers retry attempts; actual Speech, LLM, HTTP, and server responses determine success. iOS does not guarantee retry while the app is suspended or terminated because this phase does not add a background-task mechanism.
+- `NWPathMonitor` only triggers pending-work discovery; actual user-approved Speech, LLM, HTTP, and server responses determine success. iOS does not guarantee processing while the app is suspended or terminated because this phase does not add a background-task mechanism.
 - Retry and location work are foreground-only. The app does not declare a background execution mode; a reachability callback received while inactive is ignored until a later foreground trigger.
 
 ---
@@ -284,16 +284,22 @@ In app **Settings**:
 The iOS app includes a native **Dashboard** button on the main screen. It is intentionally data-light:
 
 - The dashboard opens immediately with sessions already available on the device.
+- The Dashboard remains accessible when there are no local or cached sessions. Its empty state explains that the device has no saved sessions and keeps Refresh available for checking the server.
+- Unfinished local work appears in a separate **Unprocessed Sessions** section. Completed/uploaded device and cached-server copies remain under **Sessions on this device**, and server-only rows remain under **Available on server**.
 - Local sessions come from `Documents/SurveySessions/<local-session-id>/session_state.json` and/or `session.json`, so recordings awaiting transcription or analysis remain visible after relaunch.
 - Rows and detail views derive truthful status from the manifest: locally saved recording, missing/low-accuracy/manual location, pending transcription/analysis/clarification/upload, scheduled retry, uploaded, or action-required failure. Local saving alone is never labeled **Uploaded** or **Analysis complete**.
 - A pending local session shows **Retry Now** when it has eligible recoverable work. Manual retry bypasses its scheduled backoff but remains protected against duplicate concurrent processing.
+- **Retry All** processes every eligible unfinished session sequentially with one confirmation. Select mode remains available when the interviewer wants to retry only a subset. It never starts concurrent Speech/LLM jobs; sessions requiring interviewer clarification remain unprocessed and must be opened individually.
+- Sequential batch transcription retains partial Speech segments until each recording reaches its final result, then fully releases that request before starting the next recording. This prevents a final callback containing only the last answer from replacing the earlier interview transcript.
+- Users never choose between retry and re-transcription. **Retry Now** and **Retry All** inspect durable state automatically: transcripts from before the corrected cumulative Speech pipeline are rebuilt once from the original `.m4a`; current transcripts resume at analysis; human clarification is preserved; and finalized current packages retry upload only.
+- When a batch retry completes analysis without needing clarification, durable processing atomically creates the same schema-v2 `session.json` package used by the interactive flow and continues directly to the existing idempotent upload path. A missing final package or pending clarification always remains actionable in the session detail view.
 - Detail views explicitly say when the original recording is safe on the device. They preserve nullable/pending location state and expose a disabled future location-editing entry point without mislabeling searched places as GPS.
 - Session rows and detail pages show the interviewer saved in `interviewer_info`.
 - Tapping the dashboard refresh button calls `GET /admin/sessions` and fetches only the lightweight server session list.
 - Server-only sessions appear under **Available on server**.
 - Tapping one server-only row then calls `GET /admin/sessions/{session_id}` to download that one full `session.json`.
 - Downloaded server packages are cached under `Documents/DashboardCache/<server-session-id>/session.json`.
-- Cached server packages appear under **Ready on this device** and can be opened again without another full download.
+- Cached server packages appear under **Sessions on this device** and can be opened again without another full download.
 - Detail pages can delete the device-local copy only after confirmation. For local sessions this removes the `SurveySessions/<local-session-id>/` folder from the iPad and warns when it may be the only unuploaded copy; for cached server sessions this removes only the `DashboardCache/<server-session-id>/` copy. It does not delete the uploaded server package.
 
 The dashboard uses the same **Survey API Base URL** and **Survey API Key** configured in app Settings. There is no separate admin API key.
@@ -324,7 +330,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 3. **Analyze Answers** — from the review popup, transcribes the recording (English locale), sends the transcript to the configured LLM, and shows matched questions and extracted answers.
 4. **Clarify Answers** — for medium/low-confidence answers or answers marked as needing clarification, select or type the final answer and optionally add a note. The JSON keeps both the original LLM answer and the manual correction.
 5. **Durable save and retry** — after analysis/clarification atomically saves `session.json`, the main screen returns to **Start Interview**. Immediate upload is attempted when configured; failures remain pending with bounded backoff and can be retried from Session Tools.
-6. **Session Tools / Dashboard** — export or share saved packages, resume processing, or choose **Retry Pending Sessions Now**.
+6. **Session Tools / Dashboard** — export or share saved packages, review the separate Unprocessed Sessions section, process one session interactively, or select eligible sessions for sequential processing.
 7. **Dashboard** — reviews local/cached sessions, refreshes the lightweight server session list on demand, and downloads a full server `session.json` only when a server row is opened.
 8. **Aggregate** — summarizes analyzed local `SurveySessions/*/session.json` packages on device, with older `SurveyExports/*.json` files included for compatibility.
 
@@ -384,6 +390,8 @@ ios-voice-llm-survey/
 | Cannot find answers/transcript on server | Open `SURVEY_PACKAGE_STORAGE_DIR/<session-id>/session.json`; new uploads no longer store full answers/transcripts as MySQL rows |
 | iOS cannot reach HTTP server | ATS / use HTTPS; VM firewall allows device IP |
 | Package/audio not uploading | `SURVEY_PACKAGE_STORAGE_DIR` writable on server; Survey API configured; cloud session created |
+| Retried transcript contains only the last answer | Install a build containing the batch Speech fix and press the normal **Retry Now** or **Retry All** action. The app automatically rebuilds transcripts created by the older transcription pipeline from their original audio. |
+| Session says `Final Package missing` after Retry All | Install a build containing the durable package-finalization fix and press **Retry Now** or **Retry All** again. Analysis-complete sessions now rebuild `session.json` from their manifest, transcript, matches, and original audio before upload; the recovery action is no longer hidden. |
 | Cleartext blocked | Add VM host to `NSAppTransportSecurity` in `Info.plist` or use TLS |
 
 ---

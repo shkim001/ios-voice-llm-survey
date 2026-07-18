@@ -3,6 +3,64 @@ import Speech
 import Testing
 @testable import CounterApp
 
+struct SpeechTranscriptAccumulatorTests {
+    @Test func finalTailDoesNotDiscardEarlierPartialSegments() {
+        var accumulator = SpeechTranscriptAccumulator()
+        accumulator.ingest(
+            formattedString: "Answer one Answer two Answer three Answer four Answer five",
+            segments: [
+                .init(timestamp: 0, duration: 1, text: "Answer one"),
+                .init(timestamp: 2, duration: 1, text: "Answer two"),
+                .init(timestamp: 4, duration: 1, text: "Answer three"),
+                .init(timestamp: 6, duration: 1, text: "Answer four"),
+                .init(timestamp: 8, duration: 1, text: "Answer five")
+            ]
+        )
+        accumulator.ingest(
+            formattedString: "Answer five.",
+            segments: [.init(timestamp: 8, duration: 1, text: "Answer five.")]
+        )
+
+        #expect(accumulator.transcript == "Answer one Answer two Answer three Answer four Answer five.")
+    }
+
+    @Test func revisedSegmentsReplaceTheSameAudioRangeWithoutDuplication() {
+        var accumulator = SpeechTranscriptAccumulator()
+        accumulator.ingest(
+            formattedString: "There is no seating",
+            segments: [
+                .init(timestamp: 0, duration: 1, text: "There is"),
+                .init(timestamp: 1, duration: 1, text: "low seating")
+            ]
+        )
+        accumulator.ingest(
+            formattedString: "There is no seating",
+            segments: [
+                .init(timestamp: 0, duration: 1, text: "There is"),
+                .init(timestamp: 1, duration: 1, text: "no seating")
+            ]
+        )
+
+        #expect(accumulator.transcript == "There is no seating")
+    }
+
+    @Test func separateBatchSessionsDoNotShareTranscriptState() {
+        var first = SpeechTranscriptAccumulator()
+        first.ingest(
+            formattedString: "First interview answer",
+            segments: [.init(timestamp: 0, duration: 1, text: "First interview answer")]
+        )
+        var second = SpeechTranscriptAccumulator()
+        second.ingest(
+            formattedString: "Second interview answer",
+            segments: [.init(timestamp: 0, duration: 1, text: "Second interview answer")]
+        )
+
+        #expect(first.transcript == "First interview answer")
+        #expect(second.transcript == "Second interview answer")
+    }
+}
+
 @MainActor
 struct DurableInterviewProcessingCoordinatorTests {
     @Test func successfulTranscriptionIsPersistedBeforeLLMAnalysis() async throws {
@@ -28,6 +86,41 @@ struct DurableInterviewProcessingCoordinatorTests {
         #expect(manifest.transcriptionStatus == .completed)
         #expect(manifest.transcriptFileName == "transcript.txt")
         #expect(manifest.analysisStatus == .completed)
+    }
+
+    @Test func userRetryAutomaticallyReplacesLegacyTranscriptBeforeAnalysis() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        try Data("Only the last answer".utf8).write(
+            to: fixture.directory.appendingPathComponent("transcript.txt"),
+            options: [.atomic]
+        )
+        try LocalSessionManifestStore.update(in: fixture.directory) { manifest in
+            manifest.transcriptionStatus = .completed
+            manifest.transcriptionPipelineVersion = 0
+            manifest.transcriptFileName = "transcript.txt"
+            manifest.transcription = "Only the last answer"
+            manifest.analysisStatus = .pendingRetry
+        }
+        let speech = FakeSpeech(result: .success("All five complete answers"))
+        let llm = FakeLLM(result: .success([highConfidenceMatch()]))
+        let coordinator = makeCoordinator(speech: speech, llm: llm, networkAvailable: true)
+
+        let outcome = await coordinator.resume(
+            sessionDirectoryURL: fixture.directory,
+            audioURL: fixture.audioURL
+        )
+
+        guard case .analysisCompleted(let transcript, _) = outcome else {
+            Issue.record("Expected analysis after automatic re-transcription")
+            return
+        }
+        #expect(transcript == "All five complete answers")
+        #expect(speech.callCount == 1)
+        #expect(llm.receivedTranscripts == ["All five complete answers"])
+        let manifest = try LocalSessionManifestStore.load(from: fixture.directory)
+        #expect(manifest.transcriptionPipelineVersion == LocalSessionManifest.currentTranscriptionPipelineVersion)
+        #expect(try String(contentsOf: fixture.directory.appendingPathComponent("transcript.txt"), encoding: .utf8) == "All five complete answers")
     }
 
     @Test func speechFailureBecomesPendingRetryWithoutCallingLLM() async throws {
@@ -197,6 +290,7 @@ struct DurableInterviewProcessingCoordinatorTests {
         )
         try LocalSessionManifestStore.update(in: fixture.directory) { manifest in
             manifest.transcriptionStatus = .completed
+            manifest.transcriptionPipelineVersion = LocalSessionManifest.currentTranscriptionPipelineVersion
             manifest.transcriptFileName = "transcript.txt"
             manifest.transcription = "Saved transcript"
             manifest.analysisStatus = .completed

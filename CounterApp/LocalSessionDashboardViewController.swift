@@ -71,6 +71,17 @@ struct LocalSessionDashboardSession {
             return "Cached"
         }
     }
+
+    var needsProcessing: Bool {
+        source == .local && statusSummary.primary != "Uploaded"
+    }
+
+    var canRetryInBatch: Bool {
+        needsProcessing
+            && statusSummary.canRetryNow
+            && statusSummary.primary != "Clarification required"
+    }
+
 }
 
 enum LocalSessionDashboardLibrary {
@@ -494,6 +505,7 @@ enum LocalSessionDashboardLibrary {
 
 final class LocalSessionDashboardViewController: UITableViewController {
     private enum Section: Int, CaseIterable {
+        case unprocessed
         case device
         case server
     }
@@ -506,6 +518,8 @@ final class LocalSessionDashboardViewController: UITableViewController {
     private var sessions: [LocalSessionDashboardSession]
     private var serverSummaries: [LocalSessionDashboardLibrary.ServerSessionSummary]
     private var loadingServerSessionIds: Set<String> = []
+    private let onProcessSession: (URL) -> Void
+    private var isBatchProcessing = false
 
     private lazy var refreshButton = UIBarButtonItem(
         barButtonSystemItem: .refresh,
@@ -518,10 +532,22 @@ final class LocalSessionDashboardViewController: UITableViewController {
         target: self,
         action: #selector(selectTapped)
     )
+    private lazy var retryAllButton = UIBarButtonItem(
+        title: "Retry All",
+        style: .plain,
+        target: self,
+        action: #selector(retryAllTapped)
+    )
     private lazy var cancelSelectionButton = UIBarButtonItem(
         barButtonSystemItem: .cancel,
         target: self,
         action: #selector(cancelSelectionTapped)
+    )
+    private lazy var selectAllUnprocessedButton = UIBarButtonItem(
+        title: "All Unprocessed",
+        style: .plain,
+        target: self,
+        action: #selector(selectAllUnprocessedTapped)
     )
     private lazy var deleteSelectedButton = UIBarButtonItem(
         title: "Delete",
@@ -535,6 +561,12 @@ final class LocalSessionDashboardViewController: UITableViewController {
         target: self,
         action: #selector(downloadSelectedTapped)
     )
+    private lazy var processSelectedButton = UIBarButtonItem(
+        title: "Retry",
+        style: .plain,
+        target: self,
+        action: #selector(processSelectedTapped)
+    )
 
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -543,9 +575,13 @@ final class LocalSessionDashboardViewController: UITableViewController {
         return formatter
     }()
 
-    init(sessions: [LocalSessionDashboardSession]) {
+    init(
+        sessions: [LocalSessionDashboardSession],
+        onProcessSession: @escaping (URL) -> Void = { _ in }
+    ) {
         self.sessions = sessions
         self.serverSummaries = LocalSessionDashboardLibrary.loadCachedServerSummaries()
+        self.onProcessSession = onProcessSession
         super.init(style: .insetGrouped)
     }
 
@@ -561,7 +597,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
             target: self,
             action: #selector(closeTapped)
         )
-        navigationItem.rightBarButtonItems = [refreshButton, selectButton]
+        navigationItem.rightBarButtonItems = [refreshButton, selectButton, retryAllButton]
         tableView.allowsMultipleSelectionDuringEditing = true
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "DashboardCell")
         updateHeader()
@@ -573,8 +609,10 @@ final class LocalSessionDashboardViewController: UITableViewController {
         tableView.setEditing(editing, animated: animated)
         if editing {
             navigationItem.leftBarButtonItem = cancelSelectionButton
-            navigationItem.rightBarButtonItems = nil
+            navigationItem.rightBarButtonItems = [selectAllUnprocessedButton]
             setToolbarItems([
+                processSelectedButton,
+                UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil),
                 deleteSelectedButton,
                 UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil),
                 downloadSelectedButton
@@ -587,7 +625,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
                 target: self,
                 action: #selector(closeTapped)
             )
-            navigationItem.rightBarButtonItems = [refreshButton, selectButton]
+            navigationItem.rightBarButtonItems = [refreshButton, selectButton, retryAllButton]
             setToolbarItems(nil, animated: animated)
             navigationController?.setToolbarHidden(true, animated: animated)
         }
@@ -600,6 +638,8 @@ final class LocalSessionDashboardViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
         switch Section(rawValue: section) {
+        case .unprocessed:
+            return "Unprocessed Sessions"
         case .device:
             return "Sessions on this device"
         case .server:
@@ -667,6 +707,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
     }
 
     private func updateHeader() {
+        let unprocessedCount = sessions.filter(\.needsProcessing).count
         let localCount = sessions.filter { $0.source == .local }.count
         let cachedCount = sessions.filter { $0.source == .cachedServer }.count
         let serverOnly = serverOnlySummaries().count
@@ -677,10 +718,26 @@ final class LocalSessionDashboardViewController: UITableViewController {
         label.numberOfLines = 0
         label.font = .preferredFont(forTextStyle: .subheadline)
         label.textColor = .secondaryLabel
-        label.text = "Local: \(localCount)    Cached: \(cachedCount)    Server: \(serverOnly)\nCached GPS points: \(points)\nLatest cached/local: \(latest)"
+        label.text = "Unprocessed: \(unprocessedCount)    Local: \(localCount)    Cached: \(cachedCount)    Server: \(serverOnly)\nCached GPS points: \(points)\nLatest cached/local: \(latest)"
         label.frame = CGRect(x: 0, y: 0, width: tableView.bounds.width, height: 72)
         label.textAlignment = .center
         tableView.tableHeaderView = label
+        updateEmptyState()
+    }
+
+    private func updateEmptyState() {
+        guard sessions.isEmpty, serverOnlySummaries().isEmpty else {
+            tableView.backgroundView = nil
+            return
+        }
+        let label = UILabel()
+        label.text = "No sessions are saved on this device yet.\nTap Refresh to check for sessions available on the server."
+        label.numberOfLines = 0
+        label.textAlignment = .center
+        label.textColor = .secondaryLabel
+        label.font = .preferredFont(forTextStyle: .body)
+        label.adjustsFontForContentSizeCategory = true
+        tableView.backgroundView = label
     }
 
     @objc private func refreshTapped() {
@@ -717,6 +774,36 @@ final class LocalSessionDashboardViewController: UITableViewController {
 
     @objc private func cancelSelectionTapped() {
         setEditing(false, animated: true)
+    }
+
+    @objc private func retryAllTapped() {
+        let eligible = sessions.filter {
+            $0.canRetryInBatch
+        }
+        guard !eligible.isEmpty else {
+            showAlert(message: "No saved sessions are currently eligible for automatic retry. Sessions awaiting clarification must be opened individually.")
+            return
+        }
+        guard !isBatchProcessing else { return }
+
+        let alert = UIAlertController(
+            title: "Retry All Unprocessed Sessions?",
+            message: "The app will choose the correct stage for each of the \(eligible.count) eligible session(s) and process them one at a time. Original recordings remain safe on this device.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Retry All", style: .default) { [weak self] _ in
+            self?.processSelectedSessions(eligible)
+        })
+        present(alert, animated: true)
+    }
+
+    @objc private func selectAllUnprocessedTapped() {
+        let section = Section.unprocessed.rawValue
+        for row in rows(for: section).indices {
+            tableView.selectRow(at: IndexPath(row: row, section: section), animated: false, scrollPosition: .none)
+        }
+        updateBatchButtons()
     }
 
     @objc private func closeTapped() {
@@ -769,10 +856,36 @@ final class LocalSessionDashboardViewController: UITableViewController {
         downloadServerSummaries(selectedSummaries)
     }
 
+    @objc private func processSelectedTapped() {
+        let selectedSessions = selectedProcessableSessions()
+        guard !selectedSessions.isEmpty else {
+            showAlert(message: "Select one or more unprocessed sessions that can be retried. Clarification-required sessions must be opened individually.")
+            return
+        }
+        guard !isBatchProcessing else { return }
+
+        let alert = UIAlertController(
+            title: "Retry Selected Sessions?",
+            message: "The app will choose the correct stage for each of the \(selectedSessions.count) selected session(s) and process them one at a time. Sessions that require interviewer clarification will remain in Unprocessed Sessions for individual review.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Retry", style: .default) { [weak self] _ in
+            self?.processSelectedSessions(selectedSessions)
+        })
+        present(alert, animated: true)
+    }
+
     private func rows(for section: Int) -> [Row] {
         switch Section(rawValue: section) {
+        case .unprocessed:
+            return sessions
+                .filter(\.needsProcessing)
+                .sorted { $0.createdAt > $1.createdAt }
+                .map(Row.session)
         case .device:
             return sessions
+                .filter { !$0.needsProcessing }
                 .sorted { $0.createdAt > $1.createdAt }
                 .map(Row.session)
         case .server:
@@ -859,6 +972,12 @@ final class LocalSessionDashboardViewController: UITableViewController {
         }
     }
 
+    private func selectedProcessableSessions() -> [LocalSessionDashboardSession] {
+        selectedDeviceSessions().filter {
+            $0.canRetryInBatch
+        }
+    }
+
     private func selectedServerSummaries() -> [LocalSessionDashboardLibrary.ServerSessionSummary] {
         selectedRows().compactMap { row in
             if case .server(let summary) = row { return summary }
@@ -868,13 +987,43 @@ final class LocalSessionDashboardViewController: UITableViewController {
 
     private func updateBatchButtons() {
         let deviceCount = selectedDeviceSessions().count
+        let processCount = selectedProcessableSessions().count
         let serverCount = selectedServerSummaries()
             .filter { !loadingServerSessionIds.contains($0.sessionId) }
             .count
         deleteSelectedButton.isEnabled = deviceCount > 0
         downloadSelectedButton.isEnabled = serverCount > 0
+        processSelectedButton.isEnabled = processCount > 0 && !isBatchProcessing
+        retryAllButton.isEnabled = sessions.contains {
+            $0.canRetryInBatch
+        } && !isBatchProcessing
         deleteSelectedButton.title = deviceCount > 0 ? "Delete (\(deviceCount))" : "Delete"
         downloadSelectedButton.title = serverCount > 0 ? "Get (\(serverCount))" : "Get"
+        processSelectedButton.title = processCount > 0 ? "Retry (\(processCount))" : "Retry"
+    }
+
+    private func processSelectedSessions(_ selectedSessions: [LocalSessionDashboardSession]) {
+        isBatchProcessing = true
+        processSelectedButton.isEnabled = false
+        retryAllButton.isEnabled = false
+        setEditing(false, animated: true)
+
+        Task { [weak self] in
+            let ids = Set(selectedSessions.map(\.localSessionId))
+            let summary = await DeferredSessionOutbox.shared.retryNow(localSessionIds: ids)
+            guard let self else { return }
+            isBatchProcessing = false
+            sessions = LocalSessionDashboardLibrary.loadSessions()
+            updateHeader()
+            tableView.reloadData()
+            updateBatchButtons()
+
+            let completed = summary.uploadedSessionIds.count
+            let failed = summary.failedSessionIds.count
+            let remaining = summary.deferredSessionIds.count
+            let message = "Processed sequentially. Uploaded: \(completed). Failed: \(failed). Still awaiting another step or clarification: \(remaining). All original recordings remain stored locally."
+            showAlert(message: message)
+        }
     }
 
     private func deleteSelectedDeviceSessions(_ selectedSessions: [LocalSessionDashboardSession]) {
@@ -948,11 +1097,17 @@ final class LocalSessionDashboardViewController: UITableViewController {
     }
 
     private func makeDetailViewController(for session: LocalSessionDashboardSession) -> LocalSessionDetailViewController {
-        LocalSessionDetailViewController(session: session) { [weak self] in
-            self?.sessions = LocalSessionDashboardLibrary.loadSessions()
-            self?.updateHeader()
-            self?.tableView.reloadData()
-        }
+        LocalSessionDetailViewController(
+            session: session,
+            onProcessRequested: { [weak self] session in
+                self?.onProcessSession(session.directoryURL)
+            },
+            onChanged: { [weak self] in
+                self?.sessions = LocalSessionDashboardLibrary.loadSessions()
+                self?.updateHeader()
+                self?.tableView.reloadData()
+            }
+        )
     }
 }
 
@@ -973,7 +1128,8 @@ final class LocalSessionDetailViewController: UITableViewController {
     }
 
     private var session: LocalSessionDashboardSession
-    private let onDeleted: () -> Void
+    private let onProcessRequested: (LocalSessionDashboardSession) -> Void
+    private let onChanged: () -> Void
 
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -982,9 +1138,14 @@ final class LocalSessionDetailViewController: UITableViewController {
         return formatter
     }()
 
-    init(session: LocalSessionDashboardSession, onDeleted: @escaping () -> Void = {}) {
+    init(
+        session: LocalSessionDashboardSession,
+        onProcessRequested: @escaping (LocalSessionDashboardSession) -> Void = { _ in },
+        onChanged: @escaping () -> Void = {}
+    ) {
         self.session = session
-        self.onDeleted = onDeleted
+        self.onProcessRequested = onProcessRequested
+        self.onChanged = onChanged
         super.init(style: .insetGrouped)
         title = "Session"
     }
@@ -1183,6 +1344,12 @@ final class LocalSessionDetailViewController: UITableViewController {
     }
 
     private func retryNow() {
+        let uploadOnly = session.packageURL != nil
+            && session.statusSummary.messages.contains("Waiting for upload")
+        if !uploadOnly {
+            onProcessRequested(session)
+            return
+        }
         navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Retrying…", style: .plain, target: nil, action: nil)
         Task { [weak self] in
             guard let self else { return }
@@ -1190,7 +1357,7 @@ final class LocalSessionDetailViewController: UITableViewController {
             if let refreshed = LocalSessionDashboardLibrary.localSession(id: session.localSessionId) {
                 session = refreshed
             }
-            onDeleted()
+            onChanged()
             navigationItem.rightBarButtonItem = nil
             tableView.reloadData()
             let message: String
@@ -1245,7 +1412,7 @@ final class LocalSessionDetailViewController: UITableViewController {
     private func deleteLocalCopy() {
         do {
             try LocalSessionDashboardLibrary.deleteLocalCopy(session)
-            onDeleted()
+            onChanged()
             navigationController?.popViewController(animated: true)
         } catch {
             let alert = UIAlertController(

@@ -56,6 +56,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         initializeSessionAndPurge()
         resetInactivityTimer()
 
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(deferredSessionWorkDiscovered(_:)),
+            name: .deferredSessionWorkDiscovered,
+            object: nil
+        )
         DeferredSessionOutbox.shared.start()
     }
 
@@ -461,13 +467,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         alert.addAction(UIAlertAction(title: "Dashboard", style: .default) { [weak self] _ in
             self?.showDashboard()
         })
-        alert.addAction(UIAlertAction(title: "Resume Saved Interview", style: .default) { [weak self] _ in
+        alert.addAction(UIAlertAction(title: "Review Unprocessed Sessions", style: .default) { [weak self] _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                 self?.offerRecoverableInterviewIfNeeded(force: true)
             }
-        })
-        alert.addAction(UIAlertAction(title: "Retry Pending Sessions Now", style: .default) { [weak self] _ in
-            self?.retryPendingSessionsNow()
         })
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
 
@@ -478,58 +481,34 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         present(alert, animated: true)
     }
 
-    private func retryPendingSessionsNow() {
-        statusLabel.text = "Retrying saved sessions..."
-        statusLabel.textColor = .systemOrange
-        Task { [weak self] in
-            let summary = await DeferredSessionOutbox.shared.retryNow()
-            guard let self else { return }
-            if summary.duplicateRunSuppressed {
-                showMessage("Deferred processing is already running.")
-            } else if !summary.uploadedSessionIds.isEmpty {
-                showMessage("Uploaded \(summary.uploadedSessionIds.count) saved session(s).")
-            } else if !summary.failedSessionIds.isEmpty {
-                showMessage("Retry finished. Saved sessions remain protected and will be retried later.")
-            } else if !summary.deferredSessionIds.isEmpty {
-                showMessage("Some saved sessions still need transcription, analysis, clarification, configuration, or a later retry.")
-            } else {
-                showMessage("No saved session is currently ready to retry.")
-            }
-        }
-    }
-
     private func offerRecoverableInterviewIfNeeded(force: Bool = false) {
         guard !isRecording, respondentInfo == nil, recordingURL == nil else { return }
         guard force || !didOfferRecoveryThisAppearance else { return }
+        guard viewIfLoaded?.window != nil else { return }
         guard presentedViewController == nil else { return }
         didOfferRecoveryThisAppearance = true
 
-        guard let directoryURL = recoverableSessionDirectories().first,
-              let manifest = try? LocalSessionManifestStore.load(from: directoryURL) else {
+        let directories = recoverableSessionDirectories()
+        guard !directories.isEmpty else {
             if force { showMessage("No saved interview currently needs processing.") }
             return
         }
 
-        let stage: String
-        if manifest.transcriptionStatus != .completed {
-            stage = "transcription"
-        } else if manifest.analysisStatus != .completed {
-            stage = "LLM analysis"
-        } else if manifest.clarificationStatus == .pending {
-            stage = "clarification"
-        } else {
-            stage = "upload"
-        }
+        let count = directories.count
         let alert = UIAlertController(
-            title: "Resume Saved Interview?",
-            message: "A recoverable interview is waiting for \(stage). Its original audio remains saved.",
+            title: count == 1 ? "Unprocessed Session Found" : "Unprocessed Sessions Found",
+            message: "There \(count == 1 ? "is" : "are") \(count) saved session\(count == 1 ? "" : "s") waiting for processing or upload. The original recordings remain safe on this device. Would you like to review them now?",
             preferredStyle: .alert
         )
-        alert.addAction(UIAlertAction(title: "Resume Processing", style: .default) { [weak self] _ in
-            self?.resumeRecoverableInterview(in: directoryURL)
+        alert.addAction(UIAlertAction(title: "Review Now", style: .default) { [weak self] _ in
+            self?.showDashboard()
         })
-        alert.addAction(UIAlertAction(title: "Later", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Do Later", style: .cancel))
         present(alert, animated: true)
+    }
+
+    @objc private func deferredSessionWorkDiscovered(_ notification: Notification) {
+        offerRecoverableInterviewIfNeeded()
     }
 
     private func recoverableSessionDirectories() -> [URL] {
@@ -808,12 +787,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
 
         let sessions = LocalSessionDashboardLibrary.loadSessions()
-        guard !sessions.isEmpty else {
-            showMessage("No local session packages found yet")
-            return
+        let vc = LocalSessionDashboardViewController(sessions: sessions) { [weak self] directoryURL in
+            self?.dismiss(animated: true) {
+                self?.resumeRecoverableInterview(in: directoryURL)
+            }
         }
-
-        let vc = LocalSessionDashboardViewController(sessions: sessions)
         let nav = UINavigationController(rootViewController: vc)
         present(nav, animated: true)
     }

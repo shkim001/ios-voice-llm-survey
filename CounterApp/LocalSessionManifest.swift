@@ -169,7 +169,8 @@ struct LocalSessionRetryMetadata: Codable {
 }
 
 struct LocalSessionManifest: Codable {
-    static let currentSchemaVersion = 3
+    static let currentSchemaVersion = 4
+    static let currentTranscriptionPipelineVersion = 2
 
     var schemaVersion: Int
     var localSessionId: String
@@ -196,6 +197,7 @@ struct LocalSessionManifest: Codable {
     var trajectoryPoints: [PendingTrajectoryStore.Point]
     var interviewerCheckedOptionCodesByQuestionId: [String: [String]]
     var transcriptionStatus: LocalSessionTranscriptionStatus
+    var transcriptionPipelineVersion: Int
     var transcriptFileName: String?
     var transcription: String?
     var transcriptionErrorCategory: String?
@@ -234,6 +236,7 @@ struct LocalSessionManifest: Codable {
         case trajectoryPoints = "trajectory_points"
         case interviewerCheckedOptionCodesByQuestionId = "interviewer_checked_option_codes_by_question_id"
         case transcriptionStatus = "transcription_status"
+        case transcriptionPipelineVersion = "transcription_pipeline_version"
         case transcriptFileName = "transcript_file_name"
         case transcription
         case transcriptionErrorCategory = "transcription_error_category"
@@ -289,6 +292,7 @@ struct LocalSessionManifest: Codable {
         self.trajectoryPoints = trajectoryPoints
         interviewerCheckedOptionCodesByQuestionId = [:]
         transcriptionStatus = .pending
+        transcriptionPipelineVersion = 0
         transcriptFileName = nil
         transcription = nil
         transcriptionErrorCategory = nil
@@ -351,6 +355,10 @@ struct LocalSessionManifest: Codable {
             LocalSessionTranscriptionStatus.self,
             forKey: .transcriptionStatus
         ) ?? .pending
+        transcriptionPipelineVersion = try container.decodeIfPresent(
+            Int.self,
+            forKey: .transcriptionPipelineVersion
+        ) ?? 0
         transcriptFileName = try container.decodeIfPresent(String.self, forKey: .transcriptFileName)
         transcription = try container.decodeIfPresent(String.self, forKey: .transcription)
         transcriptionErrorCategory = try container.decodeIfPresent(String.self, forKey: .transcriptionErrorCategory)
@@ -416,7 +424,7 @@ struct LocalSessionStatusSummary: Equatable {
             retryableStage = manifest.analysisStatus != .inProgress
         } else if manifest.clarificationStatus == .pending {
             primary = "Clarification required"
-            retryableStage = false
+            retryableStage = true
         } else if hasFinalPackage {
             if manifest.uploadStatus == .failed {
                 primary = "Failed — action required"
@@ -428,7 +436,7 @@ struct LocalSessionStatusSummary: Equatable {
         } else {
             primary = "Failed — action required"
             messages.append("Final package missing")
-            retryableStage = false
+            retryableStage = true
         }
 
         if !messages.contains(primary) {
@@ -486,6 +494,69 @@ enum LocalSessionManifestStore {
         mutate(&manifest)
         manifest.updatedAt = now.timeIntervalSince1970
         try save(manifest, to: directoryURL)
+    }
+
+    static func resetDerivedProcessingForRetranscription(
+        in directoryURL: URL,
+        now: Date = Date()
+    ) throws {
+        let manifest = try load(from: directoryURL)
+        guard manifest.audioStatus == .recordedLocally,
+              let audioFileName = manifest.audioFileName else {
+            throw DurableProcessingError.audioUnavailable
+        }
+        let audioURL = directoryURL.appendingPathComponent(audioFileName)
+        let values = try audioURL.resourceValues(forKeys: [.isRegularFileKey, .isReadableKey, .fileSizeKey])
+        guard values.isRegularFile == true,
+              values.isReadable != false,
+              (values.fileSize ?? 0) > 0 else {
+            throw DurableProcessingError.audioUnavailable
+        }
+
+        // Reset the authoritative manifest first. If file cleanup is interrupted,
+        // the next coordinator run still knows it must regenerate every derived
+        // artifact from the preserved original audio.
+        try update(in: directoryURL, now: now) { value in
+            value.transcriptionStatus = .pending
+            value.transcriptionPipelineVersion = 0
+            value.transcriptFileName = nil
+            value.transcription = nil
+            value.transcriptionErrorCategory = nil
+            value.analysisStatus = .pending
+            value.matchedQuestions = []
+            value.analysisErrorCategory = nil
+            value.clarificationStatus = .pending
+            value.uploadStatus = .notReady
+            value.retry = LocalSessionRetryMetadata()
+        }
+
+        let derivedURLs = [
+            directoryURL.appendingPathComponent(FileTranscriptStore.fileName),
+            directoryURL.appendingPathComponent("session.json")
+        ]
+        for url in derivedURLs where FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    @discardableResult
+    static func prepareForUserRetry(
+        in directoryURL: URL,
+        now: Date = Date()
+    ) throws -> Bool {
+        let manifest = try load(from: directoryURL)
+        let hasHumanClarification = manifest.matchedQuestions.contains {
+            $0.manuallyClarified == true
+        }
+        let needsCurrentTranscription = manifest.audioStatus == .recordedLocally
+            && manifest.uploadStatus != .uploaded
+            && manifest.transcriptionStatus == .completed
+            && manifest.transcriptionPipelineVersion < LocalSessionManifest.currentTranscriptionPipelineVersion
+            && !hasHumanClarification
+        guard needsCurrentTranscription else { return false }
+
+        try resetDerivedProcessingForRetranscription(in: directoryURL, now: now)
+        return true
     }
 
     static func remove(from directoryURL: URL) throws {

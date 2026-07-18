@@ -61,6 +61,7 @@ struct LocalSessionManifestTests {
         manifest.recordingStartedAt = 101
         manifest.recordingStoppedAt = 120
         manifest.transcriptionStatus = .completed
+        manifest.transcriptionPipelineVersion = LocalSessionManifest.currentTranscriptionPipelineVersion
         manifest.transcription = "Yes, there are benches."
         manifest.retry = LocalSessionRetryMetadata(retryCount: 2, lastError: "Previous error")
 
@@ -81,6 +82,7 @@ struct LocalSessionManifestTests {
         #expect(decoded.locationPoint?.lat == 40.8075)
         #expect(decoded.trajectoryPoints.count == 1)
         #expect(decoded.transcription == "Yes, there are benches.")
+        #expect(decoded.transcriptionPipelineVersion == LocalSessionManifest.currentTranscriptionPipelineVersion)
         #expect(decoded.retry.retryCount == 2)
     }
 
@@ -104,6 +106,7 @@ struct LocalSessionManifestTests {
         #expect(decoded.locationCoordinates.latitude == nil)
         #expect(decoded.locationCoordinates.longitude == nil)
         #expect(decoded.transcriptionStatus == .pending)
+        #expect(decoded.transcriptionPipelineVersion == 0)
         #expect(decoded.analysisStatus == .pending)
         #expect(decoded.clarificationStatus == .pending)
         #expect(decoded.uploadStatus == .notReady)
@@ -239,6 +242,134 @@ struct LocalSessionManifestTests {
         #expect(decoded.updatedAt == 20)
     }
 
+    @Test func automaticRetryRebuildsLegacyTranscriptAndPreservesOriginalAudio() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("recording.m4a")
+        try Data([0x01, 0x02, 0x03]).write(to: audioURL)
+        try Data("Incomplete last answer".utf8).write(
+            to: directory.appendingPathComponent("transcript.txt"),
+            options: [.atomic]
+        )
+        try Data("{}".utf8).write(
+            to: directory.appendingPathComponent("session.json"),
+            options: [.atomic]
+        )
+
+        var manifest = LocalSessionManifest(
+            localSessionId: "retranscribe-local",
+            audioFileName: audioURL.lastPathComponent
+        )
+        manifest.audioStatus = .recordedLocally
+        manifest.locationStatus = .available
+        manifest.locationSource = .deviceGPS
+        manifest.transcriptionStatus = .completed
+        manifest.transcriptFileName = "transcript.txt"
+        manifest.transcription = "Incomplete last answer"
+        manifest.analysisStatus = .completed
+        manifest.matchedQuestions = [
+            MatchedQuestion(
+                matchedQuestionId: 5,
+                matchedQuestion: "Last question",
+                extractedAnswer: "Only answer",
+                confidence: "high",
+                clarificationNeeded: false
+            )
+        ]
+        manifest.clarificationStatus = .notRequired
+        manifest.uploadStatus = .pending
+        manifest.cloudSessionId = "cloud-session"
+        manifest.cloudRespondentId = "cloud-respondent"
+        manifest.retry = LocalSessionRetryMetadata(
+            retryCount: 3,
+            lastError: "Previous failure",
+            lastAttemptAt: 10,
+            nextRetryAt: 20
+        )
+        try LocalSessionManifestStore.save(manifest, to: directory)
+
+        let restarted = try LocalSessionManifestStore.prepareForUserRetry(
+            in: directory,
+            now: Date(timeIntervalSince1970: 30)
+        )
+
+        let reset = try LocalSessionManifestStore.load(from: directory)
+        #expect(restarted)
+        #expect(reset.audioStatus == .recordedLocally)
+        #expect(reset.audioFileName == "recording.m4a")
+        #expect(reset.locationSource == .deviceGPS)
+        #expect(reset.cloudSessionId == "cloud-session")
+        #expect(reset.cloudRespondentId == "cloud-respondent")
+        #expect(reset.transcriptionStatus == .pending)
+        #expect(reset.transcriptionPipelineVersion == 0)
+        #expect(reset.transcriptFileName == nil)
+        #expect(reset.transcription == nil)
+        #expect(reset.analysisStatus == .pending)
+        #expect(reset.matchedQuestions.isEmpty)
+        #expect(reset.clarificationStatus == .pending)
+        #expect(reset.uploadStatus == .notReady)
+        #expect(reset.retry.retryCount == 0)
+        #expect(reset.updatedAt == 30)
+        #expect(FileManager.default.fileExists(atPath: audioURL.path))
+        #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("transcript.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("session.json").path))
+    }
+
+    @Test func automaticRetryKeepsCurrentTranscriptAndHumanClarification() throws {
+        let currentDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: currentDirectory) }
+        try Data([0x01]).write(to: currentDirectory.appendingPathComponent("recording.m4a"))
+        try Data("Current transcript".utf8).write(
+            to: currentDirectory.appendingPathComponent("transcript.txt"),
+            options: [.atomic]
+        )
+        var current = LocalSessionManifest(
+            localSessionId: "current",
+            audioFileName: "recording.m4a"
+        )
+        current.audioStatus = .recordedLocally
+        current.transcriptionStatus = .completed
+        current.transcriptionPipelineVersion = LocalSessionManifest.currentTranscriptionPipelineVersion
+        current.transcriptFileName = "transcript.txt"
+        current.analysisStatus = .pendingRetry
+        try LocalSessionManifestStore.save(current, to: currentDirectory)
+
+        #expect(try !LocalSessionManifestStore.prepareForUserRetry(in: currentDirectory))
+        #expect(FileManager.default.fileExists(atPath: currentDirectory.appendingPathComponent("transcript.txt").path))
+
+        let clarifiedDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: clarifiedDirectory) }
+        try Data([0x01]).write(to: clarifiedDirectory.appendingPathComponent("recording.m4a"))
+        try Data("Legacy transcript".utf8).write(
+            to: clarifiedDirectory.appendingPathComponent("transcript.txt"),
+            options: [.atomic]
+        )
+        var clarified = LocalSessionManifest(
+            localSessionId: "clarified",
+            audioFileName: "recording.m4a"
+        )
+        clarified.audioStatus = .recordedLocally
+        clarified.transcriptionStatus = .completed
+        clarified.transcriptFileName = "transcript.txt"
+        clarified.analysisStatus = .completed
+        clarified.clarificationStatus = .pending
+        clarified.matchedQuestions = [
+            MatchedQuestion(
+                matchedQuestionId: 1,
+                matchedQuestion: "Question",
+                extractedAnswer: "Original",
+                confidence: "low",
+                clarificationNeeded: true,
+                finalAnswer: "Corrected",
+                manuallyClarified: true
+            )
+        ]
+        try LocalSessionManifestStore.save(clarified, to: clarifiedDirectory)
+
+        #expect(try !LocalSessionManifestStore.prepareForUserRetry(in: clarifiedDirectory))
+        #expect(try LocalSessionManifestStore.load(from: clarifiedDirectory).matchedQuestions.first?.finalAnswer == "Corrected")
+    }
+
     @Test func retentionProtectsPendingAndLegacyUnuploadedAudio() throws {
         let pendingDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: pendingDirectory) }
@@ -347,6 +478,17 @@ struct LocalSessionManifestTests {
         manifest.clarificationStatus = .completed
         manifest.uploadStatus = .pending
         manifest.retry = LocalSessionRetryMetadata()
+        summary = .derive(from: manifest, hasFinalPackage: false)
+        #expect(summary.primary == "Failed — action required")
+        #expect(summary.messages.contains("Final package missing"))
+        #expect(summary.canRetryNow)
+
+        manifest.clarificationStatus = .pending
+        summary = .derive(from: manifest, hasFinalPackage: false)
+        #expect(summary.primary == "Clarification required")
+        #expect(summary.canRetryNow)
+
+        manifest.clarificationStatus = .completed
         summary = .derive(from: manifest, hasFinalPackage: true)
         #expect(summary.primary == "Waiting for upload")
         #expect(!summary.messages.contains("Uploaded"))

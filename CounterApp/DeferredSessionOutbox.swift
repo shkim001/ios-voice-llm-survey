@@ -2,6 +2,10 @@ import Foundation
 import Network
 import UIKit
 
+extension Notification.Name {
+    static let deferredSessionWorkDiscovered = Notification.Name("VoiceSurvey.DeferredSessionWorkDiscovered")
+}
+
 private func defaultDeferredSessionsRoot() throws -> URL {
     let documents = try FileManager.default.url(
         for: .documentDirectory,
@@ -187,7 +191,6 @@ final class DeferredSessionOutbox: NSObject {
     private let pathQueue = DispatchQueue(label: "VoiceSurvey.DeferredSessionOutbox.Path")
     private var isStarted = false
     private var isRunning = false
-    private var pendingRunRequested = false
     private var activeSessionIds: Set<String> = []
 
     init(
@@ -218,7 +221,7 @@ final class DeferredSessionOutbox: NSObject {
         isStarted = true
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(applicationDidBecomeActive),
+            selector: #selector(applicationDidBecomeActive(_:)),
             name: UIApplication.didBecomeActiveNotification,
             object: nil
         )
@@ -226,19 +229,15 @@ final class DeferredSessionOutbox: NSObject {
             guard path.status == .satisfied else { return }
             Task { @MainActor [weak self] in
                 guard self?.applicationIsActive() == true else { return }
-                _ = await self?.run(trigger: .pathSatisfied)
+                self?.announcePendingWorkIfNeeded()
             }
         }
         pathMonitor?.start(queue: pathQueue)
-        Task { [weak self] in
-            _ = await self?.run(trigger: .launch)
-        }
+        announcePendingWorkIfNeeded()
     }
 
-    @objc private func applicationDidBecomeActive() {
-        Task { [weak self] in
-            _ = await self?.run(trigger: .foreground)
-        }
+    @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        announcePendingWorkIfNeeded()
     }
 
     @discardableResult
@@ -252,27 +251,34 @@ final class DeferredSessionOutbox: NSObject {
     }
 
     @discardableResult
+    func retryNow(localSessionIds: Set<String>) async -> DeferredSessionOutboxSummary {
+        guard !localSessionIds.isEmpty else { return DeferredSessionOutboxSummary() }
+        return await run(trigger: .manual, requestedLocalSessionIds: localSessionIds)
+    }
+
+    @discardableResult
     func run(
         trigger: DeferredSessionOutboxTrigger,
         localSessionId requestedLocalSessionId: String? = nil
+    ) async -> DeferredSessionOutboxSummary {
+        await run(
+            trigger: trigger,
+            requestedLocalSessionIds: requestedLocalSessionId.map { Set([$0]) }
+        )
+    }
+
+    private func run(
+        trigger: DeferredSessionOutboxTrigger,
+        requestedLocalSessionIds: Set<String>?
     ) async -> DeferredSessionOutboxSummary {
         guard trigger == .manual || applicationIsActive() else {
             return DeferredSessionOutboxSummary()
         }
         guard !isRunning else {
-            pendingRunRequested = true
             return DeferredSessionOutboxSummary(duplicateRunSuppressed: true)
         }
         isRunning = true
-        defer {
-            isRunning = false
-            if pendingRunRequested {
-                pendingRunRequested = false
-                Task { [weak self] in
-                    _ = await self?.run(trigger: .foreground)
-                }
-            }
-        }
+        defer { isRunning = false }
 
         var summary = DeferredSessionOutboxSummary()
         let directories: [URL]
@@ -287,8 +293,8 @@ final class DeferredSessionOutbox: NSObject {
             guard var manifest = try? LocalSessionManifestStore.loadOrSynthesize(from: directoryURL) else {
                 continue
             }
-            if let requestedLocalSessionId,
-               manifest.localSessionId != requestedLocalSessionId {
+            if let requestedLocalSessionIds,
+               !requestedLocalSessionIds.contains(manifest.localSessionId) {
                 continue
             }
             if !FileManager.default.fileExists(atPath: LocalSessionManifestStore.url(in: directoryURL).path) {
@@ -311,6 +317,17 @@ final class DeferredSessionOutbox: NSObject {
             summary.attemptedCount += 1
             let audioURL = directoryURL.appendingPathComponent(audioFileName)
 
+            if trigger.allowsInterviewProcessing {
+                do {
+                    if try LocalSessionManifestStore.prepareForUserRetry(in: directoryURL, now: now()) {
+                        manifest = try LocalSessionManifestStore.load(from: directoryURL)
+                    }
+                } catch {
+                    summary.failedSessionIds.append(manifest.localSessionId)
+                    continue
+                }
+            }
+
             if !isFinalPackageReady(manifest, in: directoryURL) {
                 guard trigger.allowsInterviewProcessing else {
                     summary.deferredSessionIds.append(manifest.localSessionId)
@@ -324,13 +341,26 @@ final class DeferredSessionOutbox: NSObject {
                 switch outcome {
                 case .readyToUpload:
                     manifest = (try? LocalSessionManifestStore.load(from: directoryURL)) ?? manifest
+                case .analysisCompleted(let transcript, let matchedQuestions):
+                    do {
+                        _ = try DurableSessionPackageFinalizer.finalize(
+                            sessionDirectoryURL: directoryURL,
+                            transcript: transcript,
+                            matchedQuestions: matchedQuestions,
+                            now: now()
+                        )
+                        manifest = try LocalSessionManifestStore.load(from: directoryURL)
+                    } catch {
+                        summary.failedSessionIds.append(manifest.localSessionId)
+                        continue
+                    }
                 case .failed(_, let category, _):
                     if category != .audioUnavailable {
                         scheduleExistingProcessingFailure(in: directoryURL)
                     }
                     summary.failedSessionIds.append(manifest.localSessionId)
                     continue
-                case .deferred, .needsClarification, .analysisCompleted, .alreadyRunning:
+                case .deferred, .needsClarification, .alreadyRunning:
                     summary.deferredSessionIds.append(manifest.localSessionId)
                     continue
                 }
@@ -349,6 +379,22 @@ final class DeferredSessionOutbox: NSObject {
             }
         }
         return summary
+    }
+
+    private func announcePendingWorkIfNeeded() {
+        guard pendingSessionCount() > 0 else { return }
+        NotificationCenter.default.post(name: .deferredSessionWorkDiscovered, object: self)
+    }
+
+    private func pendingSessionCount() -> Int {
+        guard let directories = try? sessionDirectories() else { return 0 }
+        return directories.reduce(into: 0) { count, directoryURL in
+            guard let manifest = try? LocalSessionManifestStore.loadOrSynthesize(from: directoryURL),
+                  manifest.audioStatus == .recordedLocally,
+                  manifest.uploadStatus != .uploaded,
+                  manifest.audioFileName != nil else { return }
+            count += 1
+        }
     }
 
     private func uploadSession(in directoryURL: URL, audioURL: URL) async throws {

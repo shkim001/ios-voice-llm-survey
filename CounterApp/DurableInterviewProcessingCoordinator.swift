@@ -161,6 +161,66 @@ final class SystemConnectivityStatus: ProcessingConnectivityProviding {
     }
 }
 
+struct SpeechTranscriptSegment: Equatable {
+    let timestamp: TimeInterval
+    let duration: TimeInterval
+    let text: String
+}
+
+struct SpeechTranscriptAccumulator {
+    private var segmentsByStartMillisecond: [Int: SpeechTranscriptSegment] = [:]
+    private var longestFormattedCandidate = ""
+
+    mutating func ingest(formattedString: String, segments: [SpeechTranscriptSegment]) {
+        let formatted = formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if informationScore(formatted) > informationScore(longestFormattedCandidate) {
+            longestFormattedCandidate = formatted
+        }
+
+        for segment in segments {
+            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            let key = Int((segment.timestamp * 1_000).rounded())
+            segmentsByStartMillisecond[key] = SpeechTranscriptSegment(
+                timestamp: segment.timestamp,
+                duration: segment.duration,
+                text: text
+            )
+        }
+    }
+
+    var transcript: String {
+        let assembled = segmentsByStartMillisecond
+            .values
+            .sorted { $0.timestamp < $1.timestamp }
+            .reduce(into: "") { result, segment in
+                appendSpeechText(segment.text, to: &result)
+            }
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return informationScore(assembled) >= informationScore(longestFormattedCandidate)
+            ? assembled
+            : longestFormattedCandidate
+    }
+
+    private func informationScore(_ value: String) -> (Int, Int) {
+        let words = value.split(whereSeparator: { $0.isWhitespace }).count
+        return (words, value.count)
+    }
+
+    private func appendSpeechText(_ text: String, to result: inout String) {
+        guard !result.isEmpty else {
+            result = text
+            return
+        }
+        let noLeadingSpace = CharacterSet(charactersIn: ".,?!;:%)]}")
+        if let first = text.unicodeScalars.first, noLeadingSpace.contains(first) {
+            result += text
+        } else {
+            result += " " + text
+        }
+    }
+}
+
 final class AppleSpeechTranscriber: InterviewSpeechTranscribing {
     func capabilities(localeIdentifier: String) -> SpeechRecognitionCapabilities {
         let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier))
@@ -191,24 +251,23 @@ final class AppleSpeechTranscriber: InterviewSpeechTranscribing {
         }
 
         let request = SFSpeechURLRecognitionRequest(url: audioURL)
-        request.shouldReportPartialResults = false
+        // Batch recovery may receive a final callback containing only the tail of
+        // a recording. Keep cumulative partial/segment results so earlier answers
+        // are not discarded when the next saved session is processed.
+        request.shouldReportPartialResults = true
         request.requiresOnDeviceRecognition = requiresOnDeviceRecognition
+        request.taskHint = .dictation
+        request.addsPunctuation = true
 
         return try await withCheckedThrowingContinuation { continuation in
             let gate = SpeechContinuationGate(continuation: continuation)
             let task = recognizer.recognitionTask(with: request) { result, error in
+                if let result {
+                    gate.receive(result)
+                    if result.isFinal { return }
+                }
                 if let error {
                     gate.resume(with: .failure(error))
-                    return
-                }
-                if let result, result.isFinal {
-                    let transcript = result.bestTranscription.formattedString
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    if transcript.isEmpty {
-                        gate.resume(with: .failure(DurableProcessingError.emptyTranscript))
-                    } else {
-                        gate.resume(with: .success(transcript))
-                    }
                 }
             }
             gate.attach(recognitionTask: task)
@@ -222,12 +281,49 @@ private final class SpeechContinuationGate: @unchecked Sendable {
     private var continuation: CheckedContinuation<String, Error>?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var timeoutWorkItem: DispatchWorkItem?
+    private var transcriptAccumulator = SpeechTranscriptAccumulator()
 
     init(continuation: CheckedContinuation<String, Error>) {
         self.continuation = continuation
     }
 
-    func resume(with result: Result<String, Error>) {
+    func receive(_ result: SFSpeechRecognitionResult) {
+        let transcription = result.bestTranscription
+        let segments = transcription.segments.map {
+            SpeechTranscriptSegment(
+                timestamp: $0.timestamp,
+                duration: $0.duration,
+                text: $0.substring
+            )
+        }
+
+        lock.lock()
+        guard continuation != nil else {
+            lock.unlock()
+            return
+        }
+        transcriptAccumulator.ingest(
+            formattedString: transcription.formattedString,
+            segments: segments
+        )
+        let finalTranscript = result.isFinal ? transcriptAccumulator.transcript : nil
+        lock.unlock()
+
+        guard let finalTranscript else { return }
+        if finalTranscript.isEmpty {
+            resume(with: .failure(DurableProcessingError.emptyTranscript))
+        } else {
+            // A final result means Speech has completed this request. Clearing the
+            // task without cancelling it avoids interrupting Speech while a batch
+            // immediately advances to the next recording.
+            resume(with: .success(finalTranscript), cancelRecognitionTask: false)
+        }
+    }
+
+    func resume(
+        with result: Result<String, Error>,
+        cancelRecognitionTask: Bool = true
+    ) {
         lock.lock()
         guard let continuation else {
             lock.unlock()
@@ -240,7 +336,9 @@ private final class SpeechContinuationGate: @unchecked Sendable {
         self.timeoutWorkItem = nil
         lock.unlock()
         timeoutWorkItem?.cancel()
-        recognitionTask?.cancel()
+        if cancelRecognitionTask {
+            recognitionTask?.cancel()
+        }
         continuation.resume(with: result)
     }
 
@@ -340,6 +438,7 @@ final class DurableInterviewProcessingCoordinator {
         }
 
         do {
+            _ = try LocalSessionManifestStore.prepareForUserRetry(in: sessionDirectoryURL)
             var manifest = try LocalSessionManifestStore.load(from: sessionDirectoryURL)
             if manifest.analysisStatus == .completed, !manifest.matchedQuestions.isEmpty {
                 let transcript = try durableTranscript(for: manifest, in: sessionDirectoryURL)
@@ -381,6 +480,7 @@ final class DurableInterviewProcessingCoordinator {
 
                 try LocalSessionManifestStore.update(in: sessionDirectoryURL) { value in
                     value.transcriptionStatus = .inProgress
+                    value.transcriptionPipelineVersion = 0
                     value.transcriptionErrorCategory = nil
                     value.retry.lastAttemptAt = Date().timeIntervalSince1970
                     value.retry.lastError = nil
@@ -405,6 +505,7 @@ final class DurableInterviewProcessingCoordinator {
                     transcriptURL = try transcriptStore.save(recognized, in: sessionDirectoryURL)
                     try LocalSessionManifestStore.update(in: sessionDirectoryURL) { value in
                         value.transcriptionStatus = .completed
+                        value.transcriptionPipelineVersion = LocalSessionManifest.currentTranscriptionPipelineVersion
                         value.transcriptFileName = transcriptURL.lastPathComponent
                         value.transcription = recognized
                         value.transcriptionErrorCategory = nil

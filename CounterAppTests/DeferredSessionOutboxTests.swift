@@ -4,6 +4,20 @@ import Testing
 
 @MainActor
 struct DeferredSessionOutboxTests {
+    @Test func startingOutboxDiscoversWorkWithoutProcessingIt() async throws {
+        let fixture = try makeReadyFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let api = MockDeferredAPI(uploadResults: [.success(validReceipt())])
+        let outbox = makeOutbox(root: fixture.root, api: api, clock: MutableClock(500))
+
+        outbox.start()
+        await Task.yield()
+
+        #expect(api.createCallCount == 0)
+        #expect(api.uploadCallCount == 0)
+        #expect(try LocalSessionManifestStore.load(from: fixture.directory).uploadStatus == .pending)
+    }
+
     @Test func unreachableAPIThenManualOnlineRetryUploadsPersistedPackage() async throws {
         let fixture = try makeReadyFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -184,6 +198,39 @@ struct DeferredSessionOutboxTests {
         #expect(processor.callCount == 1)
     }
 
+    @Test func manualRetryReprocessesLegacyFinalPackageInsteadOfUploadingIt() async throws {
+        let fixture = try makeReadyFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try Data("Legacy tail transcript".utf8).write(
+            to: fixture.directory.appendingPathComponent("transcript.txt"),
+            options: [.atomic]
+        )
+        try LocalSessionManifestStore.update(in: fixture.directory) { manifest in
+            manifest.transcriptionPipelineVersion = 0
+            manifest.transcriptFileName = "transcript.txt"
+            manifest.transcription = "Legacy tail transcript"
+        }
+        let processor = CountingStageProcessor()
+        let api = MockDeferredAPI(uploadResults: [.success(validReceipt())])
+        let outbox = DeferredSessionOutbox(
+            apiClient: api,
+            stageProcessor: processor,
+            sessionsRootProvider: { fixture.root },
+            now: { Date(timeIntervalSince1970: 9_500) },
+            jitterUnit: { 0.5 },
+            pathMonitor: nil,
+            applicationIsActive: { true }
+        )
+
+        let result = await outbox.retryNow(localSessionId: fixture.localSessionId)
+
+        #expect(result.deferredSessionIds == [fixture.localSessionId])
+        #expect(processor.callCount == 1)
+        #expect(api.uploadCallCount == 0)
+        #expect(!FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("session.json").path))
+        #expect(try LocalSessionManifestStore.load(from: fixture.directory).transcriptionStatus == .pending)
+    }
+
     @Test func inactiveAppDoesNotStartAutomaticOutboxWork() async throws {
         let fixture = try makeReadyFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -214,6 +261,7 @@ struct DeferredSessionOutboxTests {
         var second = LocalSessionManifest(localSessionId: "second", audioFileName: "recording.m4a")
         second.audioStatus = .recordedLocally
         second.transcriptionStatus = .completed
+        second.transcriptionPipelineVersion = LocalSessionManifest.currentTranscriptionPipelineVersion
         second.analysisStatus = .completed
         second.clarificationStatus = .completed
         second.uploadStatus = .pending
@@ -227,6 +275,86 @@ struct DeferredSessionOutboxTests {
         #expect(result.uploadedSessionIds == [first.localSessionId])
         #expect(api.uploadCallCount == 1)
         #expect(try LocalSessionManifestStore.load(from: secondDirectory).uploadStatus == .pending)
+    }
+
+    @Test func retryNowProcessesSelectedSessionsSequentially() async throws {
+        let first = try makeReadyFixture()
+        defer { try? FileManager.default.removeItem(at: first.root) }
+        let secondDirectory = first.root.appendingPathComponent("second", isDirectory: true)
+        let thirdDirectory = first.root.appendingPathComponent("third", isDirectory: true)
+        try makeReadySession(id: "second", directory: secondDirectory)
+        try makeReadySession(id: "third", directory: thirdDirectory)
+
+        let api = MockDeferredAPI(uploadResults: [
+            .success(validReceipt()),
+            .success(validReceipt())
+        ])
+        let outbox = makeOutbox(root: first.root, api: api, clock: MutableClock(12_000))
+
+        let result = await outbox.retryNow(localSessionIds: [first.localSessionId, "second"])
+
+        #expect(result.attemptedCount == 2)
+        #expect(Set(result.uploadedSessionIds) == Set([first.localSessionId, "second"]))
+        #expect(api.uploadCallCount == 2)
+        #expect(try LocalSessionManifestStore.load(from: thirdDirectory).uploadStatus == .pending)
+    }
+
+    @Test func batchRetryFinalizesCompletedAnalysisAndUploadsIt() async throws {
+        let fixture = try makeReadyFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try FileManager.default.removeItem(at: fixture.directory.appendingPathComponent("session.json"))
+        try LocalSessionManifestStore.update(in: fixture.directory) { manifest in
+            manifest.transcriptionStatus = .pending
+            manifest.transcriptionPipelineVersion = 0
+            manifest.transcriptFileName = nil
+            manifest.transcription = nil
+            manifest.analysisStatus = .pending
+            manifest.matchedQuestions = []
+            manifest.clarificationStatus = .pending
+            manifest.uploadStatus = .notReady
+        }
+        let processor = CompletingStageProcessor()
+        let api = MockDeferredAPI(uploadResults: [.success(validReceipt())])
+        let outbox = DeferredSessionOutbox(
+            apiClient: api,
+            stageProcessor: processor,
+            sessionsRootProvider: { fixture.root },
+            now: { Date(timeIntervalSince1970: 12_500) },
+            jitterUnit: { 0.5 },
+            pathMonitor: nil,
+            applicationIsActive: { true }
+        )
+
+        let result = await outbox.retryNow(localSessionId: fixture.localSessionId)
+
+        #expect(result.uploadedSessionIds == [fixture.localSessionId])
+        #expect(processor.callCount == 1)
+        #expect(api.uploadCallCount == 1)
+        let packageURL = fixture.directory.appendingPathComponent("session.json")
+        let package = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: packageURL)) as? [String: Any]
+        )
+        #expect(package["transcription"] as? String == CompletingStageProcessor.transcript)
+        #expect((package["matched_questions"] as? [[String: Any]])?.count == 1)
+        let manifest = try LocalSessionManifestStore.load(from: fixture.directory)
+        #expect(manifest.analysisStatus == .completed)
+        #expect(manifest.clarificationStatus == .completed)
+        #expect(manifest.uploadStatus == .uploaded)
+        #expect(FileManager.default.fileExists(atPath: fixture.audioURL.path))
+    }
+
+    private func makeReadySession(id: String, directory: URL) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data([0x01]).write(to: directory.appendingPathComponent("recording.m4a"))
+        try Data("{}".utf8).write(to: directory.appendingPathComponent("session.json"))
+        var manifest = LocalSessionManifest(localSessionId: id, audioFileName: "recording.m4a")
+        manifest.audioStatus = .recordedLocally
+        manifest.transcriptionStatus = .completed
+        manifest.transcriptionPipelineVersion = LocalSessionManifest.currentTranscriptionPipelineVersion
+        manifest.analysisStatus = .completed
+        manifest.clarificationStatus = .completed
+        manifest.uploadStatus = .pending
+        try LocalSessionManifestStore.save(manifest, to: directory)
     }
 
     private func makeOutbox(
@@ -268,6 +396,7 @@ struct DeferredSessionOutboxTests {
         )
         manifest.audioStatus = .recordedLocally
         manifest.transcriptionStatus = .completed
+        manifest.transcriptionPipelineVersion = LocalSessionManifest.currentTranscriptionPipelineVersion
         manifest.analysisStatus = .completed
         manifest.clarificationStatus = .completed
         manifest.uploadStatus = .pending
@@ -321,6 +450,32 @@ private final class CountingStageProcessor: DeferredSessionStageProcessing {
     ) async -> DurableProcessingOutcome {
         callCount += 1
         return .deferred(stage: .transcription, category: .speechUnavailable, message: "Deferred")
+    }
+}
+
+@MainActor
+private final class CompletingStageProcessor: DeferredSessionStageProcessing {
+    static let transcript = "Complete recovered interview with every recorded answer."
+    private(set) var callCount = 0
+
+    func resume(
+        sessionDirectoryURL: URL,
+        audioURL: URL,
+        localeIdentifier: String
+    ) async -> DurableProcessingOutcome {
+        callCount += 1
+        return .analysisCompleted(
+            transcript: Self.transcript,
+            matchedQuestions: [
+                MatchedQuestion(
+                    matchedQuestionId: 1,
+                    matchedQuestion: "Is the area comfortable?",
+                    extractedAnswer: "Yes",
+                    confidence: "high",
+                    clarificationNeeded: false
+                )
+            ]
+        )
     }
 }
 
