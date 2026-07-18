@@ -21,6 +21,7 @@ class APISurfaceTests(unittest.TestCase):
         self.assertIn(("/sessions/{session_id}/package", "POST"), route_methods)
         self.assertIn(("/questionnaires/active", "GET"), route_methods)
         self.assertIn(("/admin/sessions", "GET"), route_methods)
+        self.assertIn(("/admin/sessions/{session_id}/location", "PUT"), route_methods)
 
         self.assertNotIn(("/sessions/{session_id}/answers", "POST"), route_methods)
         self.assertNotIn(("/sessions/{session_id}/audio", "POST"), route_methods)

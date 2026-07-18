@@ -231,9 +231,17 @@ python3 scripts/add_session_idempotency_schema.py
 
 New clients send optional `local_session_id` to `POST /sessions`. Repeating the same request returns the original respondent/session identity. Older clients may omit the field.
 
+To let the web admin dashboard attach a location to packages that originally recorded no location, run the additive admin-location migration:
+
+```bash
+python3 scripts/add_admin_location_override_schema.py
+```
+
+The admin override is stored only in the `session_packages` index. FastAPI returns it as `admin_location_override` from the admin detail endpoint without rewriting the uploaded `session.json`, so the original field record remains intact.
+
 ### 4. Questionnaire rows
 
-The admin dashboard is the intended place to create, edit, publish, archive, and delete test questionnaire versions. The iOS app downloads published questionnaire versions, caches them for field use, and stores only compact questionnaire identity metadata in each `session.json`.
+The admin dashboard is the intended place to create, edit, publish, archive, and delete test questionnaire versions. The iOS app downloads published questionnaire versions, caches them for field use, and stores the selected questionnaire identity plus its question snapshot in each schema-v2 `session.json` so historical answers remain interpretable.
 
 Use the seed script to publish the bundled app questionnaire as the first server-managed questionnaire version:
 
@@ -262,6 +270,7 @@ python3 scripts/backfill_analysis_answers.py
 | `DELETE` | `/admin/questionnaires/{questionnaire_id}/versions/{version}` | Admin only: delete a questionnaire version; `force=true` clears SQL references for test cleanup |
 | `GET` | `/admin/sessions` | Admin only: list uploaded session packages |
 | `GET` | `/admin/sessions/{session_id}` | Admin only: return the stored `session.json` for one package |
+| `PUT` | `/admin/sessions/{session_id}/location` | Admin only: add or revise a separate location override when the original package has no location |
 | `DELETE` | `/admin/sessions/{session_id}` | Admin only: delete one uploaded package folder plus related MySQL rows |
 | `POST` | `/interviewers/resolve` | Resolve/register interviewer name and normalized email; email is used as `interviewer_id` |
 | `POST` | `/sessions` | Create respondent + session |
@@ -367,6 +376,7 @@ ios-voice-llm-survey/
 │   ├── scripts/drop_legacy_storage.sql # optional post-deployment legacy table cleanup
 │   ├── scripts/add_questionnaire_schema.py
 │   ├── scripts/add_session_idempotency_schema.py
+│   ├── scripts/add_admin_location_override_schema.py
 │   ├── requirements.txt
 │   ├── .env.example
 │   ├── survey_session_packages/       # runtime only: uploaded session packages, ignored by Git

@@ -65,6 +65,7 @@ def safe_json_summary(data: dict) -> dict:
     interviewer_info = data.get("interviewer_info") if isinstance(data.get("interviewer_info"), dict) else {}
     audio = data.get("audio") if isinstance(data.get("audio"), dict) else {}
     location = data.get("location") if isinstance(data.get("location"), dict) else {}
+    package_location = package_location_summary(data)
     gps = data.get("recording_start_trajectory_point")
     if not isinstance(gps, dict):
         gps = location if location.get("source") == "device_gps" else {}
@@ -76,7 +77,7 @@ def safe_json_summary(data: dict) -> dict:
 
     return {
         "local_session_id": data.get("local_session_id") or data.get("session_id"),
-        "location_label": location.get("label") or data.get("location_label") or respondent_info.get("location"),
+        "location_label": package_location.get("label") or respondent_info.get("location"),
         "interviewer_id": interviewer_info.get("interviewer_id") or interviewer_info.get("email"),
         "interviewer_name": interviewer_info.get("name"),
         "interviewer_email": interviewer_info.get("email"),
@@ -119,6 +120,64 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result == result and result not in {float("inf"), float("-inf")} else None
+
+
+def package_location_summary(data: dict) -> dict[str, Any]:
+    location = _nested_dict(data, "location")
+    latitude = _float_or_none(location.get("latitude", location.get("lat")))
+    longitude = _float_or_none(location.get("longitude", location.get("lon", location.get("lng"))))
+    trajectory_points = _list_value(data, "trajectory_points", "trajectory", "gps", "coordinates")
+
+    if (latitude is None or longitude is None) and trajectory_points:
+        first_point = trajectory_points[0] if isinstance(trajectory_points[0], dict) else {}
+        latitude = _float_or_none(first_point.get("lat", first_point.get("latitude")))
+        longitude = _float_or_none(
+            first_point.get("lon", first_point.get("lng", first_point.get("longitude")))
+        )
+
+    return {
+        "label": _string_value(location, "label") or _string_value(data, "location_label"),
+        "formatted_address": _string_value(location, "formatted_address", "formattedAddress", "address"),
+        "latitude": latitude,
+        "longitude": longitude,
+        "source": _string_value(location, "source"),
+        "status": _string_value(location, "status"),
+    }
+
+
+def original_package_has_location(data: dict) -> bool:
+    location = package_location_summary(data)
+    return bool(
+        location.get("label")
+        or location.get("formatted_address")
+        or (location.get("latitude") is not None and location.get("longitude") is not None)
+    )
+
+
+def admin_location_override_from_row(row: dict) -> dict[str, Any] | None:
+    latitude = _float_or_none(row.get("admin_location_lat"))
+    longitude = _float_or_none(row.get("admin_location_lon"))
+    if latitude is None or longitude is None:
+        return None
+    updated_at = row.get("admin_location_updated_at")
+    return {
+        "label": row.get("admin_location_label"),
+        "formatted_address": row.get("admin_formatted_address"),
+        "latitude": latitude,
+        "longitude": longitude,
+        "source": "admin_override",
+        "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
+    }
 
 
 def normalize_email(value: str) -> str:
@@ -262,6 +321,7 @@ def admin_json_summary(data: dict) -> dict:
     trajectory_points = _list_value(data, "trajectory_points", "trajectory", "gps", "coordinates")
     matched_questions = _list_value(data, "matched_questions", "answers")
     questionnaire = questionnaire_identity(data)
+    location = package_location_summary(data)
 
     return {
         "cloud_session_id": _string_value(cloud, "session_id"),
@@ -273,7 +333,12 @@ def admin_json_summary(data: dict) -> dict:
         "interviewer_id": _string_value(interviewer_info, "interviewer_id", "email"),
         "interviewer_name": _string_value(interviewer_info, "name"),
         "interviewer_email": _string_value(interviewer_info, "email"),
-        "location_label": _string_value(data, "location_label"),
+        "location_label": location.get("label"),
+        "location_formatted_address": location.get("formatted_address"),
+        "location_lat": location.get("latitude"),
+        "location_lon": location.get("longitude"),
+        "location_source": location.get("source"),
+        "location_status": location.get("status"),
         "questionnaire_id": questionnaire.get("id"),
         "questionnaire_version": questionnaire.get("version"),
         "questionnaire_title": questionnaire.get("title") or _string_value(metadata, "questionnaire_title"),
@@ -589,6 +654,13 @@ class QuestionnaireVersionPayload(BaseModel):
 
 class QuestionnaireStatusChange(BaseModel):
     status: str
+
+
+class AdminLocationOverridePayload(BaseModel):
+    label: str = Field(..., min_length=1, max_length=255)
+    formatted_address: str = Field(..., min_length=1, max_length=500)
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
 
 
 def save_questionnaire_version(cur, body: QuestionnaireVersionPayload, *, require_draft: bool) -> dict:
@@ -989,7 +1061,9 @@ def admin_list_sessions(_: None = Depends(verify_api_key)):
                     session_id, local_session_id, json_path, audio_original_filename,
                     recorded_at_ms, location_label, interviewer_id, interviewer_name,
                     interviewer_email, questionnaire_id, questionnaire_version,
-                    questionnaire_hash, answer_count, uploaded_at
+                    questionnaire_hash, answer_count, uploaded_at,
+                    admin_location_label, admin_formatted_address,
+                    admin_location_lat, admin_location_lon, admin_location_updated_at
                 FROM session_packages
                 ORDER BY uploaded_at DESC
                 LIMIT 500
@@ -1006,6 +1080,15 @@ def admin_list_sessions(_: None = Depends(verify_api_key)):
         except HTTPException as exc:
             logger.warning("admin session summary read failed for %s: %s", session_id, exc.detail)
 
+        admin_location = admin_location_override_from_row(row)
+        effective_location = admin_location or {
+            "label": json_summary.get("location_label") or row.get("location_label"),
+            "formatted_address": json_summary.get("location_formatted_address"),
+            "latitude": json_summary.get("location_lat"),
+            "longitude": json_summary.get("location_lon"),
+            "source": json_summary.get("location_source"),
+        }
+
         sessions.append(
             {
                 "session_id": session_id,
@@ -1020,7 +1103,12 @@ def admin_list_sessions(_: None = Depends(verify_api_key)):
                 "interviewer_id": json_summary.get("interviewer_id") or row.get("interviewer_id"),
                 "interviewer_name": json_summary.get("interviewer_name") or row.get("interviewer_name"),
                 "interviewer_email": json_summary.get("interviewer_email") or row.get("interviewer_email"),
-                "location_label": json_summary.get("location_label") or row.get("location_label"),
+                "location_label": effective_location.get("label"),
+                "location_formatted_address": effective_location.get("formatted_address"),
+                "location_lat": effective_location.get("latitude"),
+                "location_lon": effective_location.get("longitude"),
+                "location_source": effective_location.get("source"),
+                "location_is_admin_override": admin_location is not None,
                 "questionnaire_id": json_summary.get("questionnaire_id") or row.get("questionnaire_id"),
                 "questionnaire_version": json_summary.get("questionnaire_version") or row.get("questionnaire_version"),
                 "questionnaire_title": json_summary.get("questionnaire_title"),
@@ -1048,7 +1136,8 @@ def admin_get_session(session_id: str, _: None = Depends(verify_api_key)):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT json_path
+                SELECT json_path, admin_location_label, admin_formatted_address,
+                       admin_location_lat, admin_location_lon, admin_location_updated_at
                 FROM session_packages
                 WHERE session_id = %s
                 """,
@@ -1059,7 +1148,76 @@ def admin_get_session(session_id: str, _: None = Depends(verify_api_key)):
     if not row:
         raise HTTPException(status_code=404, detail="session package not found")
 
-    return read_package_json(row["json_path"])
+    package_data = read_package_json(row["json_path"])
+    package_data["admin_location_override"] = admin_location_override_from_row(row)
+    return package_data
+
+
+@app.put("/admin/sessions/{session_id}/location")
+def admin_update_session_location(
+    session_id: str,
+    body: AdminLocationOverridePayload,
+    _: None = Depends(verify_api_key),
+):
+    try:
+        session_bytes = uuid_to_bytes(UUID(hex=session_id))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT json_path, admin_location_label, admin_formatted_address,
+                       admin_location_lat, admin_location_lon, admin_location_updated_at
+                FROM session_packages
+                WHERE session_id = %s
+                FOR UPDATE
+                """,
+                (session_bytes,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="session package not found")
+
+            has_existing_override = admin_location_override_from_row(row) is not None
+            package_data = read_package_json(row["json_path"])
+            if original_package_has_location(package_data) and not has_existing_override:
+                raise HTTPException(
+                    status_code=409,
+                    detail="the original session package already contains location data",
+                )
+
+            cur.execute(
+                """
+                UPDATE session_packages
+                SET admin_location_label = %s,
+                    admin_formatted_address = %s,
+                    admin_location_lat = %s,
+                    admin_location_lon = %s,
+                    admin_location_updated_at = CURRENT_TIMESTAMP(6)
+                WHERE session_id = %s
+                """,
+                (
+                    body.label.strip(),
+                    body.formatted_address.strip(),
+                    body.latitude,
+                    body.longitude,
+                    session_bytes,
+                ),
+            )
+            cur.execute(
+                """
+                SELECT admin_location_label, admin_formatted_address,
+                       admin_location_lat, admin_location_lon, admin_location_updated_at
+                FROM session_packages
+                WHERE session_id = %s
+                """,
+                (session_bytes,),
+            )
+            updated_row = cur.fetchone()
+
+    return {"location": admin_location_override_from_row(updated_row)}
 
 
 @app.delete("/admin/sessions/{session_id}")

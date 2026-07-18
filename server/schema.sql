@@ -96,6 +96,11 @@ CREATE TABLE IF NOT EXISTS session_packages (
   questionnaire_hash CHAR(64) NULL,
   gps_lat DOUBLE NULL,
   gps_lon DOUBLE NULL,
+  admin_location_label VARCHAR(255) NULL,
+  admin_formatted_address VARCHAR(500) NULL,
+  admin_location_lat DOUBLE NULL,
+  admin_location_lon DOUBLE NULL,
+  admin_location_updated_at TIMESTAMP(6) NULL,
   answer_count INT UNSIGNED NULL,
   transcript_chars INT UNSIGNED NULL,
 
