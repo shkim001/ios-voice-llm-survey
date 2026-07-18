@@ -1,5 +1,14 @@
 import Foundation
 
+enum LocalRecordingStoragePolicy {
+    static let minimumAvailableCapacityBytes: Int64 = 100 * 1_024 * 1_024
+
+    static func hasSufficientCapacity(_ availableBytes: Int64?) -> Bool {
+        guard let availableBytes else { return true }
+        return availableBytes >= minimumAvailableCapacityBytes
+    }
+}
+
 final class SessionManager {
     static let shared = SessionManager()
 
@@ -155,16 +164,9 @@ final class SessionManager {
             return false
         }
 
-        let fileURLs = (try? fm.contentsOfDirectory(
-            at: sessionURL,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )) ?? []
-
-        let hasRecording = fileURLs.contains { $0.pathExtension.lowercased() == "m4a" }
-        let hasSessionPackage = fileURLs.contains { $0.lastPathComponent == "session.json" }
-        let hasSessionManifest = fileURLs.contains { $0.lastPathComponent == LocalSessionManifestStore.fileName }
-        guard !hasRecording && !hasSessionPackage && !hasSessionManifest else { return false }
+        guard LocalSessionManifestStore.retentionState(for: sessionURL) == .emptyMetadataOnly else {
+            return false
+        }
 
         do {
             try fm.removeItem(at: sessionURL)

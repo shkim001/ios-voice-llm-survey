@@ -183,7 +183,7 @@ final class DeferredSessionOutbox: NSObject {
     private let jitterUnit: () -> Double
     private let retryPolicy: DeferredSessionRetryPolicy
     private let pathMonitor: NWPathMonitor?
-    private let applicationIsActive: () -> Bool
+    private let applicationIsActive: @MainActor () -> Bool
     private let pathQueue = DispatchQueue(label: "VoiceSurvey.DeferredSessionOutbox.Path")
     private var isStarted = false
     private var isRunning = false
@@ -198,7 +198,7 @@ final class DeferredSessionOutbox: NSObject {
         jitterUnit: @escaping () -> Double = { Double.random(in: 0...1) },
         retryPolicy: DeferredSessionRetryPolicy = .standard,
         pathMonitor: NWPathMonitor? = NWPathMonitor(),
-        applicationIsActive: @escaping () -> Bool = {
+        applicationIsActive: @escaping @MainActor () -> Bool = {
             UIApplication.shared.applicationState == .active
         }
     ) {
@@ -247,7 +247,15 @@ final class DeferredSessionOutbox: NSObject {
     }
 
     @discardableResult
-    func run(trigger: DeferredSessionOutboxTrigger) async -> DeferredSessionOutboxSummary {
+    func retryNow(localSessionId: String) async -> DeferredSessionOutboxSummary {
+        await run(trigger: .manual, localSessionId: localSessionId)
+    }
+
+    @discardableResult
+    func run(
+        trigger: DeferredSessionOutboxTrigger,
+        localSessionId requestedLocalSessionId: String? = nil
+    ) async -> DeferredSessionOutboxSummary {
         guard trigger == .manual || applicationIsActive() else {
             return DeferredSessionOutboxSummary()
         }
@@ -277,6 +285,10 @@ final class DeferredSessionOutbox: NSObject {
 
         for directoryURL in directories {
             guard var manifest = try? LocalSessionManifestStore.loadOrSynthesize(from: directoryURL) else {
+                continue
+            }
+            if let requestedLocalSessionId,
+               manifest.localSessionId != requestedLocalSessionId {
                 continue
             }
             if !FileManager.default.fileExists(atPath: LocalSessionManifestStore.url(in: directoryURL).path) {

@@ -65,10 +65,10 @@ def safe_json_summary(data: dict) -> dict:
     respondent_info = data.get("respondent_info") if isinstance(data.get("respondent_info"), dict) else {}
     interviewer_info = data.get("interviewer_info") if isinstance(data.get("interviewer_info"), dict) else {}
     audio = data.get("audio") if isinstance(data.get("audio"), dict) else {}
+    location = data.get("location") if isinstance(data.get("location"), dict) else {}
     gps = data.get("recording_start_trajectory_point")
     if not isinstance(gps, dict):
-        location = data.get("location")
-        gps = location if isinstance(location, dict) else {}
+        gps = location if location.get("source") == "device_gps" else {}
 
     matched_questions = data.get("matched_questions")
     answers = matched_questions if isinstance(matched_questions, list) else []
@@ -77,12 +77,12 @@ def safe_json_summary(data: dict) -> dict:
 
     return {
         "local_session_id": data.get("local_session_id") or data.get("session_id"),
-        "location_label": respondent_info.get("location") or data.get("location_label"),
+        "location_label": location.get("label") or data.get("location_label") or respondent_info.get("location"),
         "interviewer_id": interviewer_info.get("interviewer_id") or interviewer_info.get("email"),
         "interviewer_name": interviewer_info.get("name"),
         "interviewer_email": interviewer_info.get("email"),
-        "gps_lat": gps.get("lat"),
-        "gps_lon": gps.get("lon"),
+        "gps_lat": gps.get("lat", gps.get("latitude")),
+        "gps_lon": gps.get("lon", gps.get("longitude")),
         "recorded_at_ms": audio.get("recorded_at_ms"),
         "questionnaire_id": questionnaire.get("id"),
         "questionnaire_version": questionnaire.get("version"),
@@ -488,31 +488,34 @@ def replace_analysis_answers(
 def write_upload_file(upload: UploadFile, destination: Path, max_bytes: int) -> tuple[int, str]:
     bytes_written = 0
     sha256 = hashlib.sha256()
+    temporary_destination = destination.with_name(f".{destination.name}.{uuid4().hex}.uploading")
     try:
-        with destination.open("wb") as out:
+        with temporary_destination.open("xb") as out:
             while True:
                 chunk = upload.file.read(1024 * 1024)
                 if not chunk:
                     break
                 bytes_written += len(chunk)
                 if bytes_written > max_bytes:
-                    out.close()
-                    destination.unlink(missing_ok=True)
                     raise HTTPException(status_code=413, detail=f"{upload.filename or 'file'} is too large")
                 sha256.update(chunk)
                 out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+
+        if bytes_written <= 0:
+            raise HTTPException(status_code=400, detail=f"{upload.filename or 'file'} is empty")
+
+        os.replace(temporary_destination, destination)
     except HTTPException:
+        temporary_destination.unlink(missing_ok=True)
         raise
     except Exception as e:
-        destination.unlink(missing_ok=True)
+        temporary_destination.unlink(missing_ok=True)
         logger.exception("uploaded file save failed")
         raise HTTPException(status_code=500, detail="failed to save uploaded file") from e
     finally:
         upload.file.close()
-
-    if bytes_written <= 0:
-        destination.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=f"{upload.filename or 'file'} is empty")
 
     return bytes_written, sha256.hexdigest()
 

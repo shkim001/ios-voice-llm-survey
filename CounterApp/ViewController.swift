@@ -663,13 +663,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
 
         do {
-            try jsonData.write(to: sessionFileURL)
+            try jsonData.write(to: sessionFileURL, options: [.atomic])
 
             // Mirror into SurveyExports as well (keeps aggregation/clear flows working)
             if let exportsDirectory = try? ensureExportsDirectory() {
                 let mirrorName = "survey_results_\(sessionId ?? "unknown")_\(Date().timeIntervalSince1970).json"
                 let mirrorURL = exportsDirectory.appendingPathComponent(mirrorName)
-                try? jsonData.write(to: mirrorURL)
+                try? jsonData.write(to: mirrorURL, options: [.atomic])
             }
 
             // Show export success
@@ -692,9 +692,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             })
             alert.addAction(UIAlertAction(title: "OK", style: .cancel))
             present(alert, animated: true)
-
-            // Also print file path for debugging
-            print("File saved to: \(sessionFileURL.path)")
 
         } catch {
             statusLabel.text = "Export failed"
@@ -1230,7 +1227,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let fileURL = tempDirectory.appendingPathComponent(fileName)
 
         do {
-            try jsonDataEncoded.write(to: fileURL)
+            try jsonDataEncoded.write(to: fileURL, options: [.atomic])
 
             // Use share functionality
             let activityViewController = UIActivityViewController(
@@ -1429,6 +1426,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         guard !isRecording else { return }
 
         do {
+            try verifyRecordingStorageCapacity()
             let session = try SessionManager.shared.ensureCurrentSession()
             sessionId = session.id
             sessionDirectoryURL = session.directoryURL
@@ -1446,7 +1444,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         } catch {
             showBlockingRecordingError(
                 title: "Interview Draft Could Not Be Saved",
-                message: "Recording was not started. (error.localizedDescription)"
+                message: "Recording was not started. \(error.localizedDescription)"
             )
             return
         }
@@ -1462,6 +1460,23 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 guard let self else { return }
                 self.handleRecordingStartLocation(outcome)
             }
+        }
+    }
+
+    private func verifyRecordingStorageCapacity() throws {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let values = try documents.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        guard LocalRecordingStoragePolicy.hasSufficientCapacity(
+            values.volumeAvailableCapacityForImportantUsage
+        ) else {
+            throw NSError(
+                domain: "VoiceSurveyStorage",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "At least 100 MB of free storage is required before recording. Free space and try again."
+                ]
+            )
         }
     }
 
@@ -3179,7 +3194,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }.joined(separator: "\n")
         recordedData = "Transcription: \(transcription)\n\nMatched Questions:\n\(resultSummary)"
 
-        statusLabel.text = "Analysis complete!\n\(matchedQuestions.count) question(s) matched"
+        statusLabel.text = "AI analysis complete locally\nSaving the final package…"
         statusLabel.textColor = .systemGreen
 
         llmButton.isEnabled = true
@@ -3209,7 +3224,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         let completedLocalSessionId = sessionId
         startNextParticipant()
-        statusLabel.text = "Analysis saved locally\nReady to upload"
+        statusLabel.text = "Recording and analysis saved locally\nWaiting for upload"
         statusLabel.textColor = .systemGreen
         Task { [weak self] in
             let summary = await DeferredSessionOutbox.shared.run(trigger: .sessionReady)

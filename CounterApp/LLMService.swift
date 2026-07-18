@@ -349,12 +349,7 @@ class LLMService {
                 throw NSError(domain: "LLMService", code: -2, userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response"])
             }
             
-            let responseString = String(data: data, encoding: .utf8) ?? ""
-            
             print("OpenAI API Response Status: \(httpResponse.statusCode)")
-            if httpResponse.statusCode != 200 {
-                print("OpenAI API Error Response: \(responseString)")
-            }
             
             guard httpResponse.statusCode == 200 else {
                 if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -369,7 +364,7 @@ class LLMService {
                 throw NSError(
                     domain: "LLMService",
                     code: httpResponse.statusCode,
-                    userInfo: [NSLocalizedDescriptionKey: "OpenAI API returned error: HTTP \(httpResponse.statusCode)\n\(responseString.prefix(300))"]
+                    userInfo: [NSLocalizedDescriptionKey: "OpenAI API returned HTTP \(httpResponse.statusCode)."]
                 )
             }
             
@@ -440,12 +435,7 @@ class LLMService {
                 throw NSError(domain: "LLMService", code: -2, userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response"])
             }
             
-            let responseString = String(data: data, encoding: .utf8) ?? ""
-            
             print("Gemini API Response Status: \(httpResponse.statusCode)")
-            if httpResponse.statusCode != 200 {
-                print("Gemini API Error Response: \(responseString)")
-            }
             
             guard httpResponse.statusCode == 200 else {
                 if let errorJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -460,7 +450,7 @@ class LLMService {
                 throw NSError(
                     domain: "LLMService",
                     code: httpResponse.statusCode,
-                    userInfo: [NSLocalizedDescriptionKey: "Gemini API returned error: HTTP \(httpResponse.statusCode)\n\(responseString.prefix(300))"]
+                    userInfo: [NSLocalizedDescriptionKey: "Gemini API returned HTTP \(httpResponse.statusCode)."]
                 )
             }
             

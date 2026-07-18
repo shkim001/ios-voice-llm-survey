@@ -322,6 +322,138 @@ struct LocalSessionManifestTests {
         #expect(LocalSessionManifestStore.retentionState(for: directory) == .protected)
     }
 
+    @Test func statusSummaryNeverConfusesLocalSafetyWithUpload() {
+        var manifest = LocalSessionManifest(localSessionId: "status", audioFileName: "recording.m4a")
+        manifest.audioStatus = .recordedLocally
+        manifest.locationStatus = .unavailable
+        manifest.locationSource = .none
+
+        var summary = LocalSessionStatusSummary.derive(from: manifest, hasFinalPackage: false)
+        #expect(summary.primary == "Waiting for transcription")
+        #expect(summary.messages.contains("Recording saved locally"))
+        #expect(summary.messages.contains("Location missing"))
+        #expect(!summary.messages.contains("Uploaded"))
+
+        manifest.transcriptionStatus = .completed
+        manifest.analysisStatus = .pendingRetry
+        manifest.retry.nextRetryAt = 500
+        summary = .derive(from: manifest, hasFinalPackage: false)
+        #expect(summary.primary == "Failed — action required")
+        #expect(summary.messages.contains("Waiting for AI analysis"))
+        #expect(summary.messages.contains("Retry scheduled"))
+        #expect(summary.canRetryNow)
+
+        manifest.analysisStatus = .completed
+        manifest.clarificationStatus = .completed
+        manifest.uploadStatus = .pending
+        manifest.retry = LocalSessionRetryMetadata()
+        summary = .derive(from: manifest, hasFinalPackage: true)
+        #expect(summary.primary == "Waiting for upload")
+        #expect(!summary.messages.contains("Uploaded"))
+
+        manifest.uploadStatus = .uploaded
+        summary = .derive(from: manifest, hasFinalPackage: true)
+        #expect(summary.primary == "Uploaded")
+        #expect(!summary.canRetryNow)
+    }
+
+    @Test func statusSummaryDistinguishesGPSAndManualPlaceLocation() {
+        var manifest = LocalSessionManifest(localSessionId: "location", audioFileName: "recording.m4a")
+        manifest.audioStatus = .recordedLocally
+        manifest.locationStatus = .lowAccuracy
+        manifest.locationSource = .deviceGPS
+        manifest.locationQuality = .low
+        var summary = LocalSessionStatusSummary.derive(from: manifest, hasFinalPackage: false)
+        #expect(summary.messages.contains("Low-accuracy GPS"))
+
+        manifest.locationStatus = .available
+        manifest.locationSource = .placeSearch
+        manifest.locationQuality = .unknown
+        summary = .derive(from: manifest, hasFinalPackage: false)
+        #expect(summary.messages.contains("Address selected manually"))
+        #expect(!summary.messages.contains("Low-accuracy GPS"))
+    }
+
+    @Test func metadataOnlyManifestIsSafelyCleanable() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try LocalSessionManifestStore.save(
+            LocalSessionManifest(localSessionId: "metadata-only"),
+            to: directory
+        )
+
+        #expect(LocalSessionManifestStore.retentionState(for: directory) == .emptyMetadataOnly)
+    }
+
+    @Test func moreThanFiftyPendingAudioFoldersRemainProtected() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var directories: [URL] = []
+        for index in 0..<60 {
+            let directory = root.appendingPathComponent("pending-\(index)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data([0x01]).write(to: directory.appendingPathComponent("recording.m4a"))
+            var manifest = LocalSessionManifest(
+                localSessionId: "pending-\(index)",
+                audioFileName: "recording.m4a"
+            )
+            manifest.audioStatus = .recordedLocally
+            manifest.uploadStatus = .pending
+            try LocalSessionManifestStore.save(manifest, to: directory)
+            directories.append(directory)
+        }
+
+        #expect(directories.allSatisfy {
+            LocalSessionManifestStore.retentionState(for: $0) == .protected
+        })
+    }
+
+    @Test func recordingStoragePolicyBlocksKnownLowCapacity() {
+        #expect(LocalRecordingStoragePolicy.hasSufficientCapacity(nil))
+        #expect(!LocalRecordingStoragePolicy.hasSufficientCapacity(99 * 1_024 * 1_024))
+        #expect(LocalRecordingStoragePolicy.hasSufficientCapacity(100 * 1_024 * 1_024))
+    }
+
+    @Test func fourPrimaryConnectivityAndLocationStatesRemainRecoverable() {
+        func manifest(hasGPS: Bool, processingComplete: Bool) -> LocalSessionManifest {
+            var value = LocalSessionManifest(localSessionId: UUID().uuidString, audioFileName: "recording.m4a")
+            value.audioStatus = .recordedLocally
+            value.locationStatus = hasGPS ? .available : .unavailable
+            value.locationSource = hasGPS ? .deviceGPS : .none
+            if processingComplete {
+                value.transcriptionStatus = .completed
+                value.analysisStatus = .completed
+                value.clarificationStatus = .completed
+                value.uploadStatus = .pending
+            }
+            return value
+        }
+
+        let onlineGPS = LocalSessionStatusSummary.derive(
+            from: manifest(hasGPS: true, processingComplete: true),
+            hasFinalPackage: true
+        )
+        let offlineGPS = LocalSessionStatusSummary.derive(
+            from: manifest(hasGPS: true, processingComplete: false),
+            hasFinalPackage: false
+        )
+        let onlineNoGPS = LocalSessionStatusSummary.derive(
+            from: manifest(hasGPS: false, processingComplete: true),
+            hasFinalPackage: true
+        )
+        let offlineNoGPS = LocalSessionStatusSummary.derive(
+            from: manifest(hasGPS: false, processingComplete: false),
+            hasFinalPackage: false
+        )
+
+        #expect(onlineGPS.primary == "Waiting for upload")
+        #expect(offlineGPS.primary == "Waiting for transcription")
+        #expect(onlineNoGPS.messages.contains("Location missing"))
+        #expect(onlineNoGPS.primary == "Waiting for upload")
+        #expect(offlineNoGPS.messages.contains("Location missing"))
+        #expect(offlineNoGPS.recordingIsSafeLocally)
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("LocalSessionManifestTests-\(UUID().uuidString)", isDirectory: true)

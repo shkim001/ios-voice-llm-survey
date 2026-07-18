@@ -213,6 +213,19 @@ final class AudioFilesViewController: UITableViewController, AVAudioPlayerDelega
             if FileManager.default.fileExists(atPath: metadataURL.path) {
                 try? FileManager.default.removeItem(at: metadataURL)
             }
+            let sessionDirectory = item.url.deletingLastPathComponent()
+            if FileManager.default.fileExists(
+                atPath: LocalSessionManifestStore.url(in: sessionDirectory).path
+            ) {
+                try LocalSessionManifestStore.update(in: sessionDirectory) { manifest in
+                    manifest.audioStatus = .failed
+                    if manifest.uploadStatus != .uploaded {
+                        manifest.uploadStatus = .failed
+                    }
+                    manifest.retry.lastError = "Original audio was explicitly deleted on this device."
+                    manifest.retry.nextRetryAt = nil
+                }
+            }
             
             recordings.removeAll { $0.url == item.url }
             if recordings.isEmpty {

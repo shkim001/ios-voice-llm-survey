@@ -38,7 +38,7 @@ struct LocalSessionDashboardSession {
     }
 
     let localSessionId: String
-    let packageURL: URL
+    let packageURL: URL?
     let directoryURL: URL
     let createdAt: Date
     let locationLabel: String
@@ -54,6 +54,7 @@ struct LocalSessionDashboardSession {
     let trajectoryPoints: [TrajectoryPoint]
     let source: Source
     let serverSessionId: String?
+    let statusSummary: LocalSessionStatusSummary
 
     var titleText: String {
         if let respondentName, !respondentName.isEmpty {
@@ -106,6 +107,10 @@ enum LocalSessionDashboardLibrary {
         return sessionDirs
             .compactMap { loadSession(in: $0, source: .local, serverSessionId: nil) }
             .sorted { $0.createdAt > $1.createdAt }
+    }
+
+    static func localSession(id: String) -> LocalSessionDashboardSession? {
+        loadLocalSessions().first { $0.localSessionId == id }
     }
 
     static func loadCachedServerSessions() -> [LocalSessionDashboardSession] {
@@ -181,7 +186,12 @@ enum LocalSessionDashboardLibrary {
         let packageURL = directoryURL.appendingPathComponent("session.json")
         guard let data = try? Data(contentsOf: packageURL),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
+            guard source == .local,
+                  let manifest = try? LocalSessionManifestStore.loadOrSynthesize(from: directoryURL),
+                  manifest.audioFileName != nil || manifest.audioStatus == .failed else {
+                return nil
+            }
+            return draftSession(from: manifest, in: directoryURL)
         }
 
         let metadata = json["metadata"] as? [String: Any]
@@ -225,7 +235,8 @@ enum LocalSessionDashboardLibrary {
         let interviewerEmail = nonEmptyString(interviewer?["email"])
         let audioFileName = nonEmptyString(audio?["file_name"])
         let transcription = nonEmptyString(json["transcription"]) ?? ""
-        let manifestUploadConfirmed = (try? LocalSessionManifestStore.load(from: directoryURL).uploadStatus) == .uploaded
+        let manifest = try? LocalSessionManifestStore.loadOrSynthesize(from: directoryURL)
+        let manifestUploadConfirmed = manifest?.uploadStatus == .uploaded
         let legacyUploadConfirmed = recordingMetadata(
             in: directoryURL,
             audioFileName: audioFileName
@@ -256,6 +267,28 @@ enum LocalSessionDashboardLibrary {
             )
         }
 
+        let statusSummary: LocalSessionStatusSummary
+        if source == .cachedServer {
+            var uploadedManifest = manifest ?? LocalSessionManifest(localSessionId: localSessionId)
+            uploadedManifest.audioStatus = audioFileName == nil ? .preparing : .recordedLocally
+            uploadedManifest.transcriptionStatus = .completed
+            uploadedManifest.analysisStatus = .completed
+            uploadedManifest.clarificationStatus = .completed
+            uploadedManifest.uploadStatus = .uploaded
+            statusSummary = .derive(from: uploadedManifest, hasFinalPackage: true)
+        } else if var manifest {
+            if isUploaded { manifest.uploadStatus = .uploaded }
+            statusSummary = .derive(from: manifest, hasFinalPackage: true)
+        } else {
+            var legacy = LocalSessionManifest(localSessionId: localSessionId, audioFileName: audioFileName)
+            legacy.audioStatus = audioFileName == nil ? .preparing : .recordedLocally
+            legacy.transcriptionStatus = transcription.isEmpty ? .pending : .completed
+            legacy.analysisStatus = answers.isEmpty ? .pending : .completed
+            legacy.clarificationStatus = answers.isEmpty ? .pending : .completed
+            legacy.uploadStatus = isUploaded ? .uploaded : .pending
+            statusSummary = .derive(from: legacy, hasFinalPackage: true)
+        }
+
         return LocalSessionDashboardSession(
             localSessionId: localSessionId,
             packageURL: packageURL,
@@ -273,7 +306,70 @@ enum LocalSessionDashboardLibrary {
             matchedAnswers: answers,
             trajectoryPoints: trajectoryPoints,
             source: source,
-            serverSessionId: serverSessionId ?? nonEmptyString(cloud?["session_id"])
+            serverSessionId: serverSessionId ?? nonEmptyString(cloud?["session_id"]),
+            statusSummary: statusSummary
+        )
+    }
+
+    private static func draftSession(
+        from manifest: LocalSessionManifest,
+        in directoryURL: URL
+    ) -> LocalSessionDashboardSession {
+        let createdAt = manifest.createdAt > 0
+            ? Date(timeIntervalSince1970: manifest.createdAt)
+            : (resourceDate(for: directoryURL) ?? .distantPast)
+        let resolvedLocation = LocalSessionDashboardSession.ResolvedLocation(
+            status: manifest.locationStatus.rawValue,
+            source: manifest.locationSource.rawValue,
+            quality: manifest.locationQuality.rawValue,
+            label: manifest.placeSnapshot?.displayLabel ?? manifest.locationLabel,
+            formattedAddress: manifest.placeSnapshot?.formattedAddress,
+            latitude: manifest.locationCoordinates.latitude,
+            longitude: manifest.locationCoordinates.longitude
+        )
+        let transcriptURL = directoryURL.appendingPathComponent(
+            manifest.transcriptFileName ?? FileTranscriptStore.fileName
+        )
+        let transcription = (try? String(contentsOf: transcriptURL, encoding: .utf8))
+            ?? manifest.transcription
+            ?? ""
+        let answers = manifest.matchedQuestions.map {
+            LocalSessionDashboardSession.MatchedAnswer(
+                questionId: $0.matchedQuestionId,
+                question: $0.matchedQuestion,
+                answer: $0.finalAnswer ?? $0.extractedAnswer,
+                confidence: $0.confidence
+            )
+        }
+        let trajectory = manifest.trajectoryPoints.map {
+            LocalSessionDashboardSession.TrajectoryPoint(
+                latitude: $0.lat,
+                longitude: $0.lon,
+                timestampMs: $0.tsMs,
+                capturedAt: nil
+            )
+        }
+        return LocalSessionDashboardSession(
+            localSessionId: manifest.localSessionId,
+            packageURL: nil,
+            directoryURL: directoryURL,
+            createdAt: createdAt,
+            locationLabel: manifest.placeSnapshot?.displayLabel
+                ?? manifest.locationLabel
+                ?? "Location not recorded",
+            resolvedLocation: resolvedLocation,
+            respondentName: manifest.respondentSnapshot?.name,
+            interviewerId: manifest.interviewerSnapshot?.interviewerId,
+            interviewerName: manifest.interviewerSnapshot?.name,
+            interviewerEmail: manifest.interviewerSnapshot?.email,
+            audioFileName: manifest.audioFileName,
+            isUploaded: manifest.uploadStatus == .uploaded,
+            transcription: transcription.trimmingCharacters(in: .whitespacesAndNewlines),
+            matchedAnswers: answers,
+            trajectoryPoints: trajectory,
+            source: .local,
+            serverSessionId: manifest.cloudSessionId,
+            statusSummary: .derive(from: manifest, hasFinalPackage: false)
         )
     }
 
@@ -505,7 +601,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
     override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
         switch Section(rawValue: section) {
         case .device:
-            return "Ready on this device"
+            return "Sessions on this device"
         case .server:
             return "Available on server"
         case .none:
@@ -521,7 +617,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
         let cell = tableView.dequeueReusableCell(withIdentifier: "DashboardCell", for: indexPath)
 
         var content = UIListContentConfiguration.subtitleCell()
-        content.secondaryTextProperties.numberOfLines = 2
+        content.secondaryTextProperties.numberOfLines = 4
 
         switch rows(for: indexPath.section)[indexPath.row] {
         case .session(let session):
@@ -530,8 +626,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
                 Self.dateFormatter.string(from: session.createdAt),
                 session.locationLabel,
                 "Interviewer: \(session.interviewerName ?? session.interviewerEmail ?? "Unknown")",
-                "\(session.matchedAnswers.count) answer(s)",
-                "\(session.trajectoryPoints.count) GPS point(s)",
+                session.statusSummary.messages.joined(separator: " • "),
                 session.sourceLabel
             ].joined(separator: "  |  ")
             cell.accessoryType = .disclosureIndicator
@@ -641,9 +736,15 @@ final class LocalSessionDashboardViewController: UITableViewController {
             localCount == 0 ? nil : "\(localCount) local",
             cachedCount == 0 ? nil : "\(cachedCount) cached"
         ].compactMap { $0 }.joined(separator: " and ")
+        let unuploadedCount = selectedSessions.filter {
+            $0.source == .local && $0.statusSummary.primary != "Uploaded"
+        }.count
+        let unuploadedWarning = unuploadedCount > 0
+            ? " \(unuploadedCount) selected session(s) are not confirmed uploaded; deleting them may destroy the only original recording."
+            : ""
         let alert = UIAlertController(
             title: "Delete Selected Sessions?",
-            message: "This permanently removes \(pieces) folder copy/copies from this iPad, including any original audio, manifest, and JSON inside them. Local-only sessions may have no other copy. Uploaded server packages are not deleted.",
+            message: "This permanently removes \(pieces) folder copy/copies from this iPad, including any original audio, manifest, transcript, and JSON inside them.\(unuploadedWarning) Uploaded server packages are not deleted.",
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
@@ -863,7 +964,15 @@ final class LocalSessionDetailViewController: UITableViewController {
         case transcript
     }
 
-    private let session: LocalSessionDashboardSession
+    private enum DetailAction {
+        case map
+        case retry
+        case locationEditing
+        case share
+        case delete
+    }
+
+    private var session: LocalSessionDashboardSession
     private let onDeleted: () -> Void
 
     private static let dateFormatter: DateFormatter = {
@@ -898,7 +1007,7 @@ final class LocalSessionDetailViewController: UITableViewController {
         case .overview:
             return 8
         case .actions:
-            return 3
+            return actionRows().count
         case .answers:
             return max(session.matchedAnswers.count, 1)
         case .transcript:
@@ -938,7 +1047,8 @@ final class LocalSessionDetailViewController: UITableViewController {
             content.secondaryText = rows[indexPath.row].value
             cell.selectionStyle = .none
         case .actions:
-            if indexPath.row == 0 {
+            switch actionRows()[indexPath.row] {
+            case .map:
                 content.text = "View Map"
                 let hasMapLocation = !session.trajectoryPoints.isEmpty || session.resolvedLocation?.coordinate != nil
                 if session.resolvedLocation?.source == "place_search" {
@@ -948,17 +1058,23 @@ final class LocalSessionDetailViewController: UITableViewController {
                 }
                 cell.accessoryType = hasMapLocation ? .disclosureIndicator : .none
                 cell.selectionStyle = hasMapLocation ? .default : .none
-            } else {
-                if indexPath.row == 1 {
-                    content.text = "Share session.json"
-                    content.secondaryText = session.packageURL.lastPathComponent
-                    cell.accessoryType = .disclosureIndicator
-                } else {
-                    content.text = deleteActionTitle()
-                    content.secondaryText = deleteActionSubtitle()
-                    content.textProperties.color = .systemRed
-                    cell.accessoryType = .none
-                }
+            case .retry:
+                content.text = "Retry Now"
+                content.secondaryText = "Resume this saved interview from its earliest incomplete stage."
+                content.textProperties.color = .systemBlue
+            case .locationEditing:
+                content.text = "Edit Location (future)"
+                content.secondaryText = "The current location source and null/pending coordinates are preserved for a future editor."
+                content.textProperties.color = .secondaryLabel
+                cell.selectionStyle = .none
+            case .share:
+                content.text = "Share session.json"
+                content.secondaryText = session.packageURL?.lastPathComponent
+                cell.accessoryType = .disclosureIndicator
+            case .delete:
+                content.text = deleteActionTitle()
+                content.secondaryText = deleteActionSubtitle()
+                content.textProperties.color = .systemRed
             }
         case .answers:
             if session.matchedAnswers.isEmpty {
@@ -989,17 +1105,37 @@ final class LocalSessionDetailViewController: UITableViewController {
         tableView.deselectRow(at: indexPath, animated: true)
         guard Section(rawValue: indexPath.section) == .actions else { return }
 
-        if indexPath.row == 0 {
+        switch actionRows()[indexPath.row] {
+        case .map:
             guard !session.trajectoryPoints.isEmpty || session.resolvedLocation?.coordinate != nil else { return }
             navigationController?.pushViewController(
                 LocalSessionMapViewController(session: session),
                 animated: true
             )
-        } else if indexPath.row == 1 {
+        case .retry:
+            retryNow()
+        case .locationEditing:
+            break
+        case .share:
             shareSessionJSON(sourceView: tableView.cellForRow(at: indexPath) ?? tableView)
-        } else {
+        case .delete:
             confirmDeleteLocalCopy()
         }
+    }
+
+    private func actionRows() -> [DetailAction] {
+        var rows: [DetailAction] = [.map]
+        if session.source == .local, session.statusSummary.canRetryNow {
+            rows.append(.retry)
+        }
+        if session.source == .local {
+            rows.append(.locationEditing)
+        }
+        if session.packageURL != nil {
+            rows.append(.share)
+        }
+        rows.append(.delete)
+        return rows
     }
 
     private func overviewRows() -> [(title: String, value: String)] {
@@ -1009,7 +1145,7 @@ final class LocalSessionDetailViewController: UITableViewController {
             ("Interviewer Email", session.interviewerEmail ?? session.interviewerId ?? "Unknown"),
             ("Date", Self.dateFormatter.string(from: session.createdAt)),
             ("Location", locationOverviewText()),
-            ("Status", session.isUploaded ? "Uploaded" : "Local only"),
+            ("Status", statusOverviewText()),
             ("Audio", session.audioFileName ?? "No audio listed"),
             ("Local ID", session.localSessionId)
         ]
@@ -1025,12 +1161,52 @@ final class LocalSessionDetailViewController: UITableViewController {
     }
 
     private func shareSessionJSON(sourceView: UIView) {
-        let vc = UIActivityViewController(activityItems: [session.packageURL], applicationActivities: nil)
+        guard let packageURL = session.packageURL else { return }
+        let vc = UIActivityViewController(activityItems: [packageURL], applicationActivities: nil)
         if let popover = vc.popoverPresentationController {
             popover.sourceView = sourceView
             popover.sourceRect = sourceView.bounds
         }
         present(vc, animated: true)
+    }
+
+    private func statusOverviewText() -> String {
+        var lines = session.statusSummary.messages
+        if let timestamp = session.statusSummary.retryScheduledAt {
+            lines.append("Next retry: \(Self.dateFormatter.string(from: Date(timeIntervalSince1970: timestamp)))")
+        }
+        if session.statusSummary.recordingIsSafeLocally,
+           session.statusSummary.primary != "Uploaded" {
+            lines.append("The original recording is safe on this device.")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func retryNow() {
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Retrying…", style: .plain, target: nil, action: nil)
+        Task { [weak self] in
+            guard let self else { return }
+            let summary = await DeferredSessionOutbox.shared.retryNow(localSessionId: session.localSessionId)
+            if let refreshed = LocalSessionDashboardLibrary.localSession(id: session.localSessionId) {
+                session = refreshed
+            }
+            onDeleted()
+            navigationItem.rightBarButtonItem = nil
+            tableView.reloadData()
+            let message: String
+            if summary.uploadedSessionIds.contains(session.localSessionId) {
+                message = "The saved interview was uploaded successfully."
+            } else if summary.failedSessionIds.contains(session.localSessionId) {
+                message = "Retry failed. The original recording remains safe locally; review the status and try again later."
+            } else if summary.duplicateRunSuppressed {
+                message = "This interview is already being processed."
+            } else {
+                message = "The saved interview remains local and still needs processing, clarification, configuration, or connectivity."
+            }
+            let alert = UIAlertController(title: "Retry Now", message: message, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
+        }
     }
 
     private func deleteActionTitle() -> String {

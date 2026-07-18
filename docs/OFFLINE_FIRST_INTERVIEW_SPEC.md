@@ -1,6 +1,6 @@
 # Offline-First Interview Specification
 
-Status: agreed design; documentation phase only
+Status: implemented through final integration review; physical-device and deployed-server field validation remains
 
 Date: 2026-07-17
 
@@ -29,7 +29,7 @@ The design is offline-first rather than offline-only. Local durable files are au
 - `CounterApp/PendingTrajectoryStore.swift` defines persisted trajectory points and a legacy trajectory queue.
 - `CounterApp/QuestionnaireModels.swift` defines questionnaire, respondent, matched-answer, and exported-package compatibility models. `QuestionnaireStore` loads the bundled questionnaire before considering the cache.
 - `CounterApp/MapViewController.swift` displays device location with MapKit and can pass a GPS coordinate into the survey screen. It does not currently search for an address or place.
-- `CounterApp/LocalSessionDashboardViewController.swift` loads finalized local or cached-server `session.json` packages. It cannot currently show unfinished recordings without `session.json`.
+- `CounterApp/LocalSessionDashboardViewController.swift` loads local manifests and finalized/cached-server packages, shows recoverable unfinished recordings, and provides a scoped Retry Now action for eligible local sessions.
 - `CounterApp/AudioFilesViewController.swift` discovers `.m4a` files independently of `session.json` and supports playback, sharing, and confirmed deletion.
 - `CounterApp/Info.plist` and Xcode build settings contain the existing microphone, Speech, and location permissions and background-location declaration.
 
@@ -475,7 +475,7 @@ Finalized legacy packages without a draft continue to load through the current p
 
 ### 12.1 Automatic cleanup
 
-- Empty session folders remain eligible for cleanup only when they contain no `.m4a`, no `session_state.json`, and no `session.json`.
+- Empty metadata-only folders remain eligible for cleanup when they contain no `.m4a` and no `session.json`; a manifest left in `preparing` state without audio is not treated as an interview recording.
 - Any session with an `.m4a` that is not durably marked uploaded is retained indefinitely.
 - Any draft or finalized package with `upload_status != uploaded` is retained indefinitely.
 - Legacy folders with no reliable upload marker are conservatively treated as unuploaded.
@@ -543,24 +543,26 @@ Warnings must state when the item is unuploaded and that the action deletes the 
 
 ### Phase 5: Dashboard and file-management integration
 
-- Show unfinished drafts and next actions in Dashboard.
-- Preserve local/cached/server row behavior and aggregation.
-- Strengthen unuploaded deletion warnings in Dashboard and Audio Files.
-- Verify map behavior for GPS, place-search, and no-location sessions.
+- Status: implemented; physical-device accessibility/layout validation remains required.
+- Dashboard discovery includes manifest-only drafts and derives a single truthful status summary from persisted state. Local save, completed analysis, scheduled retry, and confirmed upload are distinct states.
+- Rows/details identify safe local audio, missing/low-accuracy/manual-place location, pending transcription/analysis/clarification/upload, scheduled retry, confirmed upload, and action-required failure.
+- Eligible local rows expose a per-session Retry Now action. The location detail preserves null/pending/source fields and exposes a future editing seam without implementing a large editor.
+- Local/cached/server rows, aggregation, export, place markers, and device-GPS trajectory maps remain compatible. Place coordinates are never placed into or indexed as device-GPS trajectory data.
+- Single and batch deletion warnings identify unuploaded-only-copy risk. Explicit Audio Files deletion updates the manifest so the missing original cannot be retried or shown as safely recorded.
 
 ### Phase 6: Server indexing, documentation, and release verification
 
-- Add only required nullable location-source/status and idempotency indexing.
-- Verify old and new package uploads against `server/app/main.py`.
-- Run server tests/syntax checks and database migration tests.
-- Run iOS unit/UI tests and build on a machine with a working simulator or physical-device runtime.
-- Update README and `AGENTS.md` to match the shipped behavior before pushing.
+- Status: implementation and automated local verification complete; deployed GCP and real-device field tests remain.
+- Server summaries preserve a searched-place label while indexing GPS columns only for `location.source = device_gps`. Incoming file bodies are staged, flushed, and atomically replaced so interrupted writes do not expose partial package files.
+- The only database addition remains the idempotent `session_creation_keys` migration described in Phase 4; no credentials, signing values, questionnaire IDs, or deployment addresses changed.
+- README, this specification, and the ignored `AGENTS.md` session log record the integrated behavior and verification boundary.
 
 ## 15. Acceptance criteria
 
 ### Data safety
 
 - When practical, available device capacity is checked before recording; clearly insufficient capacity blocks recording with a non-destructive warning.
+- The implemented preflight uses 100 MB as the conservative initial threshold when iOS reports capacity; an unavailable capacity reading does not itself block field collection.
 - A nonempty `.m4a` exists before any Speech, LLM, cloud-session, or upload request.
 - After Stop, the app verifies that the `.m4a` is readable and nonzero and that the authoritative manifest was atomically persisted.
 - The app never resets to the next participant when audio verification or manifest persistence cannot be confirmed; it keeps the current session recoverable until the save succeeds or the interviewer explicitly confirms deletion.
@@ -588,6 +590,13 @@ Warnings must state when the item is unuploaded and that the action deletes the 
 - Existing `session.json` packages remain readable, shareable, aggregatable, cacheable, and uploadable.
 - Missing/device/place location is represented accurately; a MapKit place is preserved in the draft, final package, export, Dashboard, and map views without entering or being labeled as device-GPS trajectory data.
 - Explicit deletion always requires confirmation and clearly identifies the risk to unuploaded data.
+
+### Status truthfulness
+
+- A locally safe recording is labeled as saved locally even when later work is pending.
+- **Uploaded** appears only after a validated server response has atomically updated the manifest to `upload_status = uploaded`.
+- **Analysis complete** is never inferred merely from the existence of audio or a local draft.
+- Retrying or failing a network stage cannot erase a previously persisted transcript, package, or original recording.
 
 ## 16. Test plan
 
@@ -623,6 +632,12 @@ Warnings must state when the item is unuploaded and that the action deletes the 
 - Confirm `requiresOnDeviceRecognition` prevents network fallback when explicitly selected.
 - Test airplane mode, denied Location permission, disabled Location Services, indoor low accuracy, and restored connectivity.
 - Inspect the Files-visible session folder after every forced failure.
+- Create more than 50 unuploaded sessions and confirm all remain protected while uploaded sessions alone remain eligible for the configured age/count cleanup.
+- Force insufficient-capacity and zero-byte/unreadable-audio outcomes and confirm the UI blocks reset until the user explicitly discards.
+
+### Final integration verification boundary
+
+Automated tests cover manifest encoding/defaults, lifecycle/status truthfulness, all four GPS/network state combinations as persisted-state matrices, location classification, retention protection beyond 50 sessions, retry/backoff/manual override, network/server failure despite path hints, duplicate suppression, response-loss idempotency, relaunch scanning, and place-versus-GPS server indexing. Simulator unit tests and a generic simulator build verify compilation and non-UI state behavior. The GPS/Speech permission sheets, device storage reporting, actual radio loss, process termination timing, accessibility/layout, and a live GCP/MySQL upload must still be exercised manually on a signed physical iPhone or iPad.
 
 ## 17. Risks and open questions
 

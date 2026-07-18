@@ -368,6 +368,86 @@ struct LocalSessionManifest: Codable {
     }
 }
 
+struct LocalSessionStatusSummary: Equatable {
+    let primary: String
+    let messages: [String]
+    let recordingIsSafeLocally: Bool
+    let canRetryNow: Bool
+    let retryScheduledAt: TimeInterval?
+
+    static func derive(from manifest: LocalSessionManifest, hasFinalPackage: Bool) -> Self {
+        var messages: [String] = []
+        let recordingIsSafeLocally = manifest.audioStatus == .recordedLocally
+        if recordingIsSafeLocally {
+            messages.append("Recording saved locally")
+        }
+
+        switch (manifest.locationSource, manifest.locationStatus, manifest.locationQuality) {
+        case (.placeSearch, _, _):
+            messages.append("Address selected manually")
+        case (.deviceGPS, .lowAccuracy, _), (.deviceGPS, _, .low):
+            messages.append("Low-accuracy GPS")
+        case (.none, _, _) where recordingIsSafeLocally:
+            messages.append("Location missing")
+        default:
+            break
+        }
+
+        let primary: String
+        let retryableStage: Bool
+        if manifest.uploadStatus == .uploaded {
+            primary = "Uploaded"
+            retryableStage = false
+        } else if manifest.audioStatus != .recordedLocally {
+            primary = "Failed — action required"
+            if manifest.audioStatus == .preparing || manifest.audioStatus == .recording {
+                messages.append("Recording was not finalized")
+            }
+            retryableStage = false
+        } else if manifest.transcriptionStatus != .completed {
+            let failed = manifest.transcriptionStatus == .failed || manifest.transcriptionStatus == .pendingRetry
+            primary = failed ? "Failed — action required" : "Waiting for transcription"
+            if failed { messages.append("Waiting for transcription") }
+            retryableStage = manifest.transcriptionStatus != .inProgress
+        } else if manifest.analysisStatus != .completed {
+            let failed = manifest.analysisStatus == .failed || manifest.analysisStatus == .pendingRetry
+            primary = failed ? "Failed — action required" : "Waiting for AI analysis"
+            if failed { messages.append("Waiting for AI analysis") }
+            retryableStage = manifest.analysisStatus != .inProgress
+        } else if manifest.clarificationStatus == .pending {
+            primary = "Clarification required"
+            retryableStage = false
+        } else if hasFinalPackage {
+            if manifest.uploadStatus == .failed {
+                primary = "Failed — action required"
+                messages.append("Waiting for upload")
+            } else {
+                primary = "Waiting for upload"
+            }
+            retryableStage = manifest.uploadStatus != .inProgress
+        } else {
+            primary = "Failed — action required"
+            messages.append("Final package missing")
+            retryableStage = false
+        }
+
+        if !messages.contains(primary) {
+            messages.append(primary)
+        }
+        if manifest.retry.nextRetryAt != nil, manifest.uploadStatus != .uploaded {
+            messages.append("Retry scheduled")
+        }
+
+        return Self(
+            primary: primary,
+            messages: messages,
+            recordingIsSafeLocally: recordingIsSafeLocally,
+            canRetryNow: recordingIsSafeLocally && retryableStage,
+            retryScheduledAt: manifest.retry.nextRetryAt
+        )
+    }
+}
+
 enum LocalSessionRetentionState {
     case emptyMetadataOnly
     case protected
@@ -433,7 +513,7 @@ enum LocalSessionManifestStore {
         let hasSessionPackage = files.contains { $0.lastPathComponent == "session.json" }
         let hasManifest = files.contains { $0.lastPathComponent == fileName }
 
-        if audioFiles.isEmpty && !hasSessionPackage && !hasManifest {
+        if audioFiles.isEmpty && !hasSessionPackage {
             return .emptyMetadataOnly
         }
 

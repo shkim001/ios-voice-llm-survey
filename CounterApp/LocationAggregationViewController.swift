@@ -398,7 +398,7 @@ class LocationAggregationViewController: UIViewController {
         let fileURL = exportsDirectory.appendingPathComponent(fileName)
         
         do {
-            try jsonDataEncoded.write(to: fileURL)
+            try jsonDataEncoded.write(to: fileURL, options: [.atomic])
             
             // Show share sheet
             let activityViewController = UIActivityViewController(

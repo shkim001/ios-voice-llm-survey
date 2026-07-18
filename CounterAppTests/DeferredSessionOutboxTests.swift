@@ -204,6 +204,31 @@ struct DeferredSessionOutboxTests {
         #expect(api.uploadCallCount == 0)
     }
 
+    @Test func retryNowTargetsOnlyRequestedLocalSession() async throws {
+        let first = try makeReadyFixture()
+        defer { try? FileManager.default.removeItem(at: first.root) }
+        let secondDirectory = first.root.appendingPathComponent("second", isDirectory: true)
+        try FileManager.default.createDirectory(at: secondDirectory, withIntermediateDirectories: true)
+        try Data([0x01]).write(to: secondDirectory.appendingPathComponent("recording.m4a"))
+        try Data("{}".utf8).write(to: secondDirectory.appendingPathComponent("session.json"))
+        var second = LocalSessionManifest(localSessionId: "second", audioFileName: "recording.m4a")
+        second.audioStatus = .recordedLocally
+        second.transcriptionStatus = .completed
+        second.analysisStatus = .completed
+        second.clarificationStatus = .completed
+        second.uploadStatus = .pending
+        try LocalSessionManifestStore.save(second, to: secondDirectory)
+
+        let api = MockDeferredAPI(uploadResults: [.success(validReceipt())])
+        let outbox = makeOutbox(root: first.root, api: api, clock: MutableClock(11_000))
+
+        let result = await outbox.retryNow(localSessionId: first.localSessionId)
+
+        #expect(result.uploadedSessionIds == [first.localSessionId])
+        #expect(api.uploadCallCount == 1)
+        #expect(try LocalSessionManifestStore.load(from: secondDirectory).uploadStatus == .pending)
+    }
+
     private func makeOutbox(
         root: URL,
         api: MockDeferredAPI,

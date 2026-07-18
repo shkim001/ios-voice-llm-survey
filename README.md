@@ -111,6 +111,7 @@ Open **Settings** (gear) from the main screen.
 When the Survey API is configured:
 
 - Recording creates a local `SurveySessions/<local-session-id>/` folder and atomic `session_state.json` when audio is about to be saved; unuploaded audio and pending work are protected from automatic retention cleanup.
+- When capacity information is available, recording is blocked below a 100 MB safety threshold. Stop verifies that the original `.m4a` is readable and nonzero before the interview can reset or begin processing.
 - Before recording, the app requires an interviewer profile. If the Survey API is configured, the app resolves/registers the interviewer with `POST /interviewers/resolve`; otherwise it stores the profile locally.
 - After **Analyze Answers** from the recording review flow, the app writes `session.json` into that local session folder.
 - Each `session.json` includes `interviewer_info` with `interviewer_id`, `name`, `email`, and `identity_scope`.
@@ -283,14 +284,17 @@ In app **Settings**:
 The iOS app includes a native **Dashboard** button on the main screen. It is intentionally data-light:
 
 - The dashboard opens immediately with sessions already available on the device.
-- Local sessions come from `Documents/SurveySessions/<local-session-id>/session.json`.
+- Local sessions come from `Documents/SurveySessions/<local-session-id>/session_state.json` and/or `session.json`, so recordings awaiting transcription or analysis remain visible after relaunch.
+- Rows and detail views derive truthful status from the manifest: locally saved recording, missing/low-accuracy/manual location, pending transcription/analysis/clarification/upload, scheduled retry, uploaded, or action-required failure. Local saving alone is never labeled **Uploaded** or **Analysis complete**.
+- A pending local session shows **Retry Now** when it has eligible recoverable work. Manual retry bypasses its scheduled backoff but remains protected against duplicate concurrent processing.
+- Detail views explicitly say when the original recording is safe on the device. They preserve nullable/pending location state and expose a disabled future location-editing entry point without mislabeling searched places as GPS.
 - Session rows and detail pages show the interviewer saved in `interviewer_info`.
 - Tapping the dashboard refresh button calls `GET /admin/sessions` and fetches only the lightweight server session list.
 - Server-only sessions appear under **Available on server**.
 - Tapping one server-only row then calls `GET /admin/sessions/{session_id}` to download that one full `session.json`.
 - Downloaded server packages are cached under `Documents/DashboardCache/<server-session-id>/session.json`.
 - Cached server packages appear under **Ready on this device** and can be opened again without another full download.
-- Detail pages can delete the device-local copy. For local sessions this removes the `SurveySessions/<local-session-id>/` folder from the iPad; for cached server sessions this removes only the `DashboardCache/<server-session-id>/` copy. It does not delete the uploaded server package.
+- Detail pages can delete the device-local copy only after confirmation. For local sessions this removes the `SurveySessions/<local-session-id>/` folder from the iPad and warns when it may be the only unuploaded copy; for cached server sessions this removes only the `DashboardCache/<server-session-id>/` copy. It does not delete the uploaded server package.
 
 The dashboard uses the same **Survey API Base URL** and **Survey API Key** configured in app Settings. There is no separate admin API key.
 
