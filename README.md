@@ -268,7 +268,7 @@ python3 scripts/backfill_analysis_answers.py
 | `POST` | `/admin/questionnaires/{questionnaire_id}/versions/{version}/publish` | Admin only: publish a draft questionnaire version |
 | `POST` | `/admin/questionnaires/{questionnaire_id}/versions/{version}/archive` | Admin only: archive a questionnaire version |
 | `DELETE` | `/admin/questionnaires/{questionnaire_id}/versions/{version}` | Admin only: delete a questionnaire version; `force=true` clears SQL references for test cleanup |
-| `GET` | `/admin/sessions` | Admin only: list uploaded session packages |
+| `GET` | `/admin/sessions` | Admin only: list uploaded session packages, newest interview recording start first |
 | `GET` | `/admin/sessions/{session_id}` | Admin only: return the stored `session.json` for one package |
 | `PUT` | `/admin/sessions/{session_id}/location` | Admin only: add or revise a separate location override when the original package has no location |
 | `DELETE` | `/admin/sessions/{session_id}` | Admin only: delete one uploaded package folder plus related MySQL rows |
@@ -303,7 +303,7 @@ The iOS app includes a native **Dashboard** button on the main screen. It is int
 - Sequential batch transcription retains partial Speech segments until each recording reaches its final result, then fully releases that request before starting the next recording. This prevents a final callback containing only the last answer from replacing the earlier interview transcript.
 - Users never choose between retry and re-transcription. **Retry Now** and **Retry All** inspect durable state automatically: transcripts from before the corrected cumulative Speech pipeline are rebuilt once from the original `.m4a`; current transcripts resume at analysis; human clarification is preserved; and finalized current packages retry upload only.
 - When a batch retry completes analysis without needing clarification, durable processing atomically creates the same schema-v2 `session.json` package used by the interactive flow and continues directly to the existing idempotent upload path. A missing final package or pending clarification always remains actionable in the session detail view.
-- Detail views explicitly say when the original recording is safe on the device. They preserve nullable/pending location state and expose a disabled future location-editing entry point without mislabeling searched places as GPS.
+- Detail views explicitly say when the original recording is safe on the device and preserve nullable/pending location state without mislabeling searched places as GPS. Location correction is handled by the separate authenticated web admin dashboard.
 - Session rows and detail pages show the interviewer saved in `interviewer_info`.
 - Tapping the dashboard refresh button calls `GET /admin/sessions` and fetches only the lightweight server session list.
 - Server-only sessions appear under **Available on server**.

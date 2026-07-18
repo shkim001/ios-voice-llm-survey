@@ -1122,7 +1122,6 @@ final class LocalSessionDetailViewController: UITableViewController {
     private enum DetailAction {
         case map
         case retry
-        case locationEditing
         case share
         case delete
     }
@@ -1223,11 +1222,6 @@ final class LocalSessionDetailViewController: UITableViewController {
                 content.text = "Retry Now"
                 content.secondaryText = "Resume this saved interview from its earliest incomplete stage."
                 content.textProperties.color = .systemBlue
-            case .locationEditing:
-                content.text = "Edit Location (future)"
-                content.secondaryText = "The current location source and null/pending coordinates are preserved for a future editor."
-                content.textProperties.color = .secondaryLabel
-                cell.selectionStyle = .none
             case .share:
                 content.text = "Share session.json"
                 content.secondaryText = session.packageURL?.lastPathComponent
@@ -1275,8 +1269,6 @@ final class LocalSessionDetailViewController: UITableViewController {
             )
         case .retry:
             retryNow()
-        case .locationEditing:
-            break
         case .share:
             shareSessionJSON(sourceView: tableView.cellForRow(at: indexPath) ?? tableView)
         case .delete:
@@ -1288,9 +1280,6 @@ final class LocalSessionDetailViewController: UITableViewController {
         var rows: [DetailAction] = [.map]
         if session.source == .local, session.statusSummary.canRetryNow {
             rows.append(.retry)
-        }
-        if session.source == .local {
-            rows.append(.locationEditing)
         }
         if session.packageURL != nil {
             rows.append(.share)

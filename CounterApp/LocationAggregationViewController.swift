@@ -335,7 +335,9 @@ class LocationAggregationViewController: UIViewController {
                     surveyDict["respondent_info"] = [
                         "name": respondentInfo.name ?? "",
                         "age": respondentInfo.age ?? 0,
+                        "age_range": respondentInfo.ageRange ?? "",
                         "gender": respondentInfo.gender ?? "",
+                        "race": respondentInfo.race ?? "",
                         "phone": respondentInfo.phone ?? "",
                         "location": respondentInfo.location ?? ""
                     ]

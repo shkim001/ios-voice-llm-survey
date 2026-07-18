@@ -86,15 +86,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             action: #selector(settingsButtonTapped)
         )
 
-        // Add questionnaire button to navigation bar
-        let questionnaireButton = UIBarButtonItem(
-            image: UIImage(systemName: "doc.text"),
-            style: .plain,
-            target: self,
-            action: #selector(questionnaireButtonTapped)
-        )
-
-        navigationItem.rightBarButtonItems = [settingsButton, questionnaireButton]
+        navigationItem.rightBarButtonItems = [settingsButton]
         navigationItem.leftBarButtonItem = UIBarButtonItem(
             image: UIImage(systemName: "ellipsis.circle"),
             style: .plain,
@@ -2005,7 +1997,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         if let info = respondentInfo {
             var respondentMetadata: [String: Any] = [
                 "is_anonymous": info.isAnonymous,
+                "age_range": info.ageRange ?? "",
                 "gender": info.gender,
+                "race": info.race ?? "",
                 "location": info.location
             ]
             if let name = info.name {
@@ -2492,7 +2486,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("is_anonymous", jsonBool(info.isAnonymous)),
             ("name", jsonString(info.name)),
             ("age", jsonNumber(info.age)),
+            ("age_range", jsonString(info.ageRange)),
             ("gender", jsonString(info.gender)),
+            ("race", jsonString(info.race)),
             ("phone", jsonString(info.phone)),
             ("location", jsonString(info.location))
         ], indent: indent)
@@ -3327,14 +3323,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     // MARK: - Settings & API Key Management
     @objc private func settingsButtonTapped() {
         showAPIKeySettings()
-    }
-
-    @objc private func questionnaireButtonTapped() {
-        let questionnaireVC = QuestionnaireViewController(transitionStyle: .scroll, navigationOrientation: .horizontal)
-        questionnaireVC.modalPresentationStyle = .fullScreen
-
-        let navController = UINavigationController(rootViewController: questionnaireVC)
-        present(navController, animated: true)
     }
 
     private func checkAPIKeyStatus() {

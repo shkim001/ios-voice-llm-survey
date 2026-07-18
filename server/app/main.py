@@ -1069,7 +1069,7 @@ def admin_list_sessions(_: None = Depends(verify_api_key)):
                     admin_location_label, admin_formatted_address,
                     admin_location_lat, admin_location_lon, admin_location_updated_at
                 FROM session_packages
-                ORDER BY uploaded_at DESC
+                ORDER BY recorded_at_ms DESC, uploaded_at DESC
                 LIMIT 500
                 """
             )

@@ -175,7 +175,9 @@ struct RespondentInfo: Codable {
     let isAnonymous: Bool
     let name: String?
     let age: Int?
+    let ageRange: String?
     let gender: String
+    let race: String?
     let phone: String?
     let location: String
 
@@ -183,9 +185,63 @@ struct RespondentInfo: Codable {
         case isAnonymous = "is_anonymous"
         case name
         case age
+        case ageRange = "age_range"
         case gender
+        case race
         case phone
         case location
+    }
+
+    init(
+        isAnonymous: Bool,
+        name: String?,
+        age: Int?,
+        ageRange: String?,
+        gender: String,
+        race: String?,
+        phone: String?,
+        location: String
+    ) {
+        self.isAnonymous = isAnonymous
+        self.name = name
+        self.age = age
+        self.ageRange = ageRange
+        self.gender = gender
+        self.race = race
+        self.phone = phone
+        self.location = location
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        isAnonymous = try container.decodeIfPresent(Bool.self, forKey: .isAnonymous) ?? false
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        age = try container.decodeIfPresent(Int.self, forKey: .age)
+        ageRange = try container.decodeIfPresent(String.self, forKey: .ageRange)
+            ?? age.flatMap(Self.standardAgeRangeLabel(for:))
+        gender = try container.decodeIfPresent(String.self, forKey: .gender) ?? "Unknown"
+        race = try container.decodeIfPresent(String.self, forKey: .race)
+        phone = try container.decodeIfPresent(String.self, forKey: .phone)
+        location = try container.decodeIfPresent(String.self, forKey: .location) ?? "Unknown Location"
+    }
+
+    private static func standardAgeRangeLabel(for age: Int) -> String? {
+        switch age {
+        case ..<18:
+            return "Under 18"
+        case 18...24:
+            return "18-24"
+        case 25...34:
+            return "25-34"
+        case 35...44:
+            return "35-44"
+        case 45...54:
+            return "45-54"
+        case 55...64:
+            return "55-64"
+        default:
+            return "65+"
+        }
     }
 }
 
@@ -246,9 +302,21 @@ struct ExportedMatchedQuestion: Decodable {
 struct ExportedRespondentInfo: Decodable {
     let name: String?
     let age: Int?
+    let ageRange: String?
     let gender: String?
+    let race: String?
     let phone: String?
     let location: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case age
+        case ageRange = "age_range"
+        case gender
+        case race
+        case phone
+        case location
+    }
 }
 
 // MARK: - POE API Response Models

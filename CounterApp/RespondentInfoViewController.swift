@@ -6,8 +6,19 @@ class RespondentInfoViewController: UIViewController {
     var onInfoSubmitted: ((RespondentInfo) -> Void)?
     var onCancel: (() -> Void)?
     private var activeTextField: UITextField?
-    private let allowedAgeRange = 0...100
-    private var isAnonymousSurvey = false
+    private let ageRanges = ["Under 18", "18-24", "25-34", "35-44", "45-54", "55-64", "65+"]
+    private let raceOptions = [
+        "American Indian or Alaska Native",
+        "Asian",
+        "Black or African American",
+        "Hispanic, Latino, or Spanish origin",
+        "Middle Eastern or North African",
+        "Native Hawaiian or Other Pacific Islander",
+        "White"
+    ]
+    private var selectedAgeRangeIndex: Int?
+    private var selectedRaceIndex: Int?
+    private var isAnonymousSurvey = true
     
     // MARK: - UI Elements
     private let scrollView: UIScrollView = {
@@ -66,25 +77,17 @@ class RespondentInfoViewController: UIViewController {
         return button
     }()
     
-    private let ageTextField: UITextField = {
-        let textField = UITextField()
-        textField.translatesAutoresizingMaskIntoConstraints = false
-        textField.placeholder = "Age"
-        textField.borderStyle = .roundedRect
-        textField.font = UIFont.systemFont(ofSize: 16)
-        textField.keyboardType = .numberPad
-        return textField
-    }()
-
-    private let ageWarningLabel: UILabel = {
-        let label = UILabel()
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.text = "Age must be 100 or younger"
-        label.font = UIFont.systemFont(ofSize: 13)
-        label.textColor = .systemRed
-        label.numberOfLines = 0
-        label.isHidden = true
-        return label
+    private let ageRangeButton: UIButton = {
+        let button = UIButton(type: .system)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.contentHorizontalAlignment = .leading
+        button.setTitle("Select age range", for: .normal)
+        button.setTitleColor(.placeholderText, for: .normal)
+        button.titleLabel?.font = UIFont.systemFont(ofSize: 16)
+        button.backgroundColor = .secondarySystemBackground
+        button.layer.cornerRadius = 8
+        button.contentEdgeInsets = UIEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
+        return button
     }()
     
     private let genderSegmentedControl: UISegmentedControl = {
@@ -103,6 +106,20 @@ class RespondentInfoViewController: UIViewController {
         textField.font = UIFont.systemFont(ofSize: 16)
         textField.keyboardType = .phonePad
         return textField
+    }()
+
+    private let raceButton: UIButton = {
+        let button = UIButton(type: .system)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.contentHorizontalAlignment = .leading
+        button.setTitle("Select race", for: .normal)
+        button.setTitleColor(.placeholderText, for: .normal)
+        button.titleLabel?.font = UIFont.systemFont(ofSize: 16)
+        button.titleLabel?.numberOfLines = 0
+        button.backgroundColor = .secondarySystemBackground
+        button.layer.cornerRadius = 8
+        button.contentEdgeInsets = UIEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
+        return button
     }()
     
     private let locationTextField: UITextField = {
@@ -126,8 +143,9 @@ class RespondentInfoViewController: UIViewController {
     }()
 
     private lazy var nameLabel = createLabel(text: "Name *")
-    private lazy var ageLabel = createLabel(text: "Age *")
+    private lazy var ageLabel = createLabel(text: "Age range *")
     private lazy var phoneLabel = createLabel(text: "Phone Number *")
+    private lazy var raceLabel = createLabel(text: "Race *")
     
     // MARK: - Lifecycle
     override func viewDidLoad() {
@@ -136,6 +154,7 @@ class RespondentInfoViewController: UIViewController {
         setupConstraints()
         setupKeyboardObservers()
         setupTextFieldDelegates()
+        updateAnonymousSurveyUI()
     }
     
     override func viewWillDisappear(_ animated: Bool) {
@@ -173,10 +192,11 @@ class RespondentInfoViewController: UIViewController {
         stackView.addArrangedSubview(nameLabel)
         stackView.addArrangedSubview(nameTextField)
         stackView.addArrangedSubview(ageLabel)
-        stackView.addArrangedSubview(ageTextField)
-        stackView.addArrangedSubview(ageWarningLabel)
+        stackView.addArrangedSubview(ageRangeButton)
         stackView.addArrangedSubview(genderLabel)
         stackView.addArrangedSubview(genderSegmentedControl)
+        stackView.addArrangedSubview(raceLabel)
+        stackView.addArrangedSubview(raceButton)
         stackView.addArrangedSubview(phoneLabel)
         stackView.addArrangedSubview(phoneTextField)
         stackView.addArrangedSubview(locationLabel)
@@ -186,8 +206,8 @@ class RespondentInfoViewController: UIViewController {
         // Add button action
         submitButton.addTarget(self, action: #selector(submitButtonTapped), for: .touchUpInside)
         anonymousButton.addTarget(self, action: #selector(anonymousButtonTapped), for: .touchUpInside)
-        ageTextField.addTarget(self, action: #selector(ageTextDidChange), for: .editingChanged)
-        stackView.setCustomSpacing(6, after: ageTextField)
+        ageRangeButton.addTarget(self, action: #selector(ageRangeButtonTapped), for: .touchUpInside)
+        raceButton.addTarget(self, action: #selector(raceButtonTapped), for: .touchUpInside)
         
         // Add tap gesture to dismiss keyboard
         let tapGesture = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
@@ -197,7 +217,6 @@ class RespondentInfoViewController: UIViewController {
     
     private func setupTextFieldDelegates() {
         nameTextField.delegate = self
-        ageTextField.delegate = self
         phoneTextField.delegate = self
         locationTextField.delegate = self
         
@@ -207,7 +226,6 @@ class RespondentInfoViewController: UIViewController {
         let doneButton = UIBarButtonItem(barButtonSystemItem: .done, target: self, action: #selector(dismissKeyboard))
         toolbar.setItems([UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil), doneButton], animated: false)
         
-        ageTextField.inputAccessoryView = toolbar
         phoneTextField.inputAccessoryView = toolbar
     }
     
@@ -293,8 +311,9 @@ class RespondentInfoViewController: UIViewController {
             stackView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20),
             
             nameTextField.heightAnchor.constraint(equalToConstant: 44),
-            ageTextField.heightAnchor.constraint(equalToConstant: 44),
+            ageRangeButton.heightAnchor.constraint(equalToConstant: 44),
             genderSegmentedControl.heightAnchor.constraint(equalToConstant: 32),
+            raceButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
             phoneTextField.heightAnchor.constraint(equalToConstant: 44),
             locationTextField.heightAnchor.constraint(equalToConstant: 44),
             submitButton.heightAnchor.constraint(equalToConstant: 50)
@@ -305,22 +324,19 @@ class RespondentInfoViewController: UIViewController {
     @objc private func submitButtonTapped() {
         let nameText = nameTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let phoneText = phoneTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let ageText = ageTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         guard isAnonymousSurvey || !nameText.isEmpty else {
             showAlert(message: "Please enter name")
             return
         }
 
-        let age = Int(ageText)
-        guard isAnonymousSurvey || (!ageText.isEmpty && age != nil) else {
-            showAlert(message: "Please enter a valid age")
+        guard let selectedAgeRangeIndex else {
+            showAlert(message: "Please select age range")
             return
         }
 
-        guard isAnonymousSurvey || allowedAgeRange.contains(age ?? -1) else {
-            updateAgeWarning()
-            showAlert(message: "Please enter an age from \(allowedAgeRange.lowerBound) to \(allowedAgeRange.upperBound)")
+        guard let selectedRaceIndex else {
+            showAlert(message: "Please select race")
             return
         }
         
@@ -337,12 +353,16 @@ class RespondentInfoViewController: UIViewController {
         
         let genderOptions = ["Male", "Female", "Other", "Prefer not to say"]
         let gender = genderOptions[genderSegmentedControl.selectedSegmentIndex]
+        let ageRange = ageRanges[selectedAgeRangeIndex]
+        let race = raceOptions[selectedRaceIndex]
         
         let info = RespondentInfo(
             isAnonymous: isAnonymousSurvey,
             name: isAnonymousSurvey ? nil : nameText,
-            age: isAnonymousSurvey ? nil : age,
+            age: nil,
+            ageRange: ageRange,
             gender: gender,
+            race: race,
             phone: isAnonymousSurvey ? nil : phoneText,
             location: location
         )
@@ -363,8 +383,26 @@ class RespondentInfoViewController: UIViewController {
         updateAnonymousSurveyUI()
     }
 
-    @objc private func ageTextDidChange() {
-        updateAgeWarning()
+    @objc private func ageRangeButtonTapped() {
+        showOptionPicker(
+            title: "Age Range",
+            options: ageRanges,
+            selectedIndex: selectedAgeRangeIndex
+        ) { [weak self] index in
+            self?.selectedAgeRangeIndex = index
+            self?.updateSelectionButtons()
+        }
+    }
+
+    @objc private func raceButtonTapped() {
+        showOptionPicker(
+            title: "Race",
+            options: raceOptions,
+            selectedIndex: selectedRaceIndex
+        ) { [weak self] index in
+            self?.selectedRaceIndex = index
+            self?.updateSelectionButtons()
+        }
     }
 
     private func updateAnonymousSurveyUI() {
@@ -375,28 +413,53 @@ class RespondentInfoViewController: UIViewController {
 
         nameLabel.isHidden = isAnonymousSurvey
         nameTextField.isHidden = isAnonymousSurvey
-        ageLabel.isHidden = isAnonymousSurvey
-        ageTextField.isHidden = isAnonymousSurvey
-        ageWarningLabel.isHidden = true
         phoneLabel.isHidden = isAnonymousSurvey
         phoneTextField.isHidden = isAnonymousSurvey
 
         if isAnonymousSurvey {
             nameTextField.text = nil
-            ageTextField.text = nil
             phoneTextField.text = nil
-            ageTextField.textColor = .label
             activeTextField?.resignFirstResponder()
         }
     }
 
-    private func updateAgeWarning() {
-        let ageText = ageTextField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let age = Int(ageText)
-        let shouldShowWarning = age.map { $0 > allowedAgeRange.upperBound } ?? false
+    private func updateSelectionButtons() {
+        if let selectedAgeRangeIndex {
+            ageRangeButton.setTitle(ageRanges[selectedAgeRangeIndex], for: .normal)
+            ageRangeButton.setTitleColor(.label, for: .normal)
+        } else {
+            ageRangeButton.setTitle("Select age range", for: .normal)
+            ageRangeButton.setTitleColor(.placeholderText, for: .normal)
+        }
 
-        ageWarningLabel.isHidden = !shouldShowWarning
-        ageTextField.textColor = shouldShowWarning ? .systemRed : .label
+        if let selectedRaceIndex {
+            raceButton.setTitle(raceOptions[selectedRaceIndex], for: .normal)
+            raceButton.setTitleColor(.label, for: .normal)
+        } else {
+            raceButton.setTitle("Select race", for: .normal)
+            raceButton.setTitleColor(.placeholderText, for: .normal)
+        }
+    }
+
+    private func showOptionPicker(
+        title: String,
+        options: [String],
+        selectedIndex: Int?,
+        onSelect: @escaping (Int) -> Void
+    ) {
+        let alert = UIAlertController(title: title, message: nil, preferredStyle: .actionSheet)
+        for (index, option) in options.enumerated() {
+            let prefix = index == selectedIndex ? "✓ " : ""
+            alert.addAction(UIAlertAction(title: "\(prefix)\(option)", style: .default) { _ in
+                onSelect(index)
+            })
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = title == "Age Range" ? ageRangeButton : raceButton
+            popover.sourceRect = (title == "Age Range" ? ageRangeButton : raceButton).bounds
+        }
+        present(alert, animated: true)
     }
     
     private func showAlert(message: String) {
@@ -420,8 +483,6 @@ extension RespondentInfoViewController: UITextFieldDelegate {
         // Move to next field or dismiss keyboard
         switch textField {
         case nameTextField:
-            ageTextField.becomeFirstResponder()
-        case ageTextField:
             phoneTextField.becomeFirstResponder()
         case phoneTextField:
             locationTextField.becomeFirstResponder()

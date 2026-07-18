@@ -374,6 +374,7 @@ struct LocalSessionManifest: Codable {
         cloudSessionId = try container.decodeIfPresent(String.self, forKey: .cloudSessionId)
         retry = try container.decodeIfPresent(LocalSessionRetryMetadata.self, forKey: .retry) ?? LocalSessionRetryMetadata()
     }
+
 }
 
 struct LocalSessionStatusSummary: Equatable {
@@ -483,6 +484,25 @@ enum LocalSessionManifestStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(manifest)
         try data.write(to: url(in: directoryURL), options: [.atomic])
+    }
+
+    private static func standardAgeRangeLabel(for age: Int) -> String? {
+        switch age {
+        case ..<18:
+            return "Under 18"
+        case 18...24:
+            return "18-24"
+        case 25...34:
+            return "25-34"
+        case 35...44:
+            return "35-44"
+        case 45...54:
+            return "45-54"
+        case 55...64:
+            return "55-64"
+        default:
+            return "65+"
+        }
     }
 
     static func update(
@@ -643,7 +663,10 @@ enum LocalSessionManifestStore {
                         isAnonymous: respondent["is_anonymous"] as? Bool ?? false,
                         name: nonEmptyString(respondent["name"]),
                         age: intValue(respondent["age"]),
+                        ageRange: nonEmptyString(respondent["age_range"])
+                            ?? intValue(respondent["age"]).flatMap(Self.standardAgeRangeLabel(for:)),
                         gender: nonEmptyString(respondent["gender"]) ?? "Unknown",
+                        race: nonEmptyString(respondent["race"]),
                         phone: nonEmptyString(respondent["phone"]),
                         location: nonEmptyString(respondent["location"])
                             ?? manifest.locationLabel
@@ -682,7 +705,10 @@ enum LocalSessionManifestStore {
                     isAnonymous: respondent["is_anonymous"] as? Bool ?? false,
                     name: nonEmptyString(respondent["name"]),
                     age: intValue(respondent["age"]),
+                    ageRange: nonEmptyString(respondent["age_range"])
+                        ?? intValue(respondent["age"]).flatMap(Self.standardAgeRangeLabel(for:)),
                     gender: nonEmptyString(respondent["gender"]) ?? "Unknown",
+                    race: nonEmptyString(respondent["race"]),
                     phone: nonEmptyString(respondent["phone"]),
                     location: nonEmptyString(respondent["location"])
                         ?? manifest.locationLabel
