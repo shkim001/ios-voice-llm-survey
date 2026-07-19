@@ -290,6 +290,7 @@ python3 scripts/backfill_analysis_answers.py
 | `DELETE` | `/admin/questionnaires/{questionnaire_id}/versions/{version}` | Admin only: delete a questionnaire version; `force=true` clears SQL references for test cleanup |
 | `GET` | `/admin/sessions` | Admin only: list uploaded session packages, newest interview recording start first |
 | `GET` | `/admin/sessions/{session_id}` | Admin only: return the stored `session.json` for one package |
+| `GET` | `/admin/sessions/{session_id}/audio` | Admin only: stream the original package audio inline, or download it with `?download=true` |
 | `PUT` | `/admin/sessions/{session_id}/location` | Admin only: add or revise a separate location override when the original package has no location |
 | `DELETE` | `/admin/sessions/{session_id}` | Admin only: delete one uploaded package folder plus related MySQL rows |
 | `POST` | `/interviewers/resolve` | Resolve/register interviewer name and normalized email; email is used as `interviewer_id` |

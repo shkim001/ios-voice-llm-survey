@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import hashlib
+import mimetypes
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,6 +16,7 @@ from pymysql.err import IntegrityError, MySQLError, OperationalError
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -1194,6 +1196,52 @@ def admin_get_session(session_id: str, _: None = Depends(verify_api_key)):
     package_data = read_package_json(row["json_path"])
     package_data["admin_location_override"] = admin_location_override_from_row(row)
     return package_data
+
+
+@app.get("/admin/sessions/{session_id}/audio")
+def admin_get_session_audio(
+    session_id: str,
+    download: bool = False,
+    _: None = Depends(verify_api_key),
+):
+    try:
+        session_bytes = uuid_to_bytes(UUID(hex=session_id))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from e
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT audio_path, audio_original_filename
+                FROM session_packages
+                WHERE session_id = %s
+                """,
+                (session_bytes,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="session package not found")
+
+    audio_path = safe_package_path(row.get("audio_path"))
+    if audio_path is None or not audio_path.is_file():
+        raise HTTPException(status_code=404, detail="audio file not found on server")
+
+    original_filename = sanitize_filename(
+        row.get("audio_original_filename") or audio_path.name
+    )
+    media_type = (
+        "audio/mp4"
+        if audio_path.suffix.lower() == ".m4a"
+        else mimetypes.guess_type(original_filename)[0] or "application/octet-stream"
+    )
+    return FileResponse(
+        audio_path,
+        media_type=media_type,
+        filename=original_filename,
+        content_disposition_type="attachment" if download else "inline",
+    )
 
 
 @app.put("/admin/sessions/{session_id}/location")
