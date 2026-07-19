@@ -41,6 +41,7 @@ enum LocalSessionLocationStatus: String, LocalSessionDefaultingStatus {
 enum LocalSessionLocationSource: String, LocalSessionDefaultingStatus {
     case deviceGPS = "device_gps"
     case placeSearch = "place_search"
+    case savedSurveyLocation = "saved_survey_location"
     case none
 
     static let decodingFallback: Self = .none
@@ -169,7 +170,7 @@ struct LocalSessionRetryMetadata: Codable {
 }
 
 struct LocalSessionManifest: Codable {
-    static let currentSchemaVersion = 5
+    static let currentSchemaVersion = 6
     static let currentTranscriptionPipelineVersion = 2
 
     var schemaVersion: Int
@@ -186,6 +187,7 @@ struct LocalSessionManifest: Codable {
     var questionnaireVersion: String?
     var questionnaireHash: String?
     var questionnaireSnapshot: Questionnaire?
+    var locationInfo: SessionLocationInfo?
     var locationStatus: LocalSessionLocationStatus
     var locationSource: LocalSessionLocationSource
     var locationQuality: LocalSessionLocationQuality
@@ -225,6 +227,7 @@ struct LocalSessionManifest: Codable {
         case questionnaireVersion = "questionnaire_version"
         case questionnaireHash = "questionnaire_hash"
         case questionnaireSnapshot = "questionnaire_snapshot"
+        case locationInfo = "location_info"
         case locationStatus = "location_status"
         case locationSource = "location_source"
         case locationQuality = "location_quality"
@@ -257,6 +260,7 @@ struct LocalSessionManifest: Codable {
         interviewerSnapshot: InterviewerProfile? = nil,
         respondentSnapshot: RespondentInfo? = nil,
         questionnaireSnapshot: Questionnaire? = nil,
+        locationInfo: SessionLocationInfo? = nil,
         locationStatus: LocalSessionLocationStatus = .pending,
         locationSource: LocalSessionLocationSource = .none,
         locationQuality: LocalSessionLocationQuality = .unknown,
@@ -281,6 +285,7 @@ struct LocalSessionManifest: Codable {
         questionnaireVersion = questionnaireSnapshot?.version
         questionnaireHash = questionnaireSnapshot?.hash
         self.questionnaireSnapshot = questionnaireSnapshot
+        self.locationInfo = locationInfo
         self.locationStatus = locationStatus
         self.locationSource = locationSource
         self.locationQuality = locationQuality
@@ -326,6 +331,7 @@ struct LocalSessionManifest: Codable {
         questionnaireId = questionnaireId ?? questionnaireSnapshot?.id
         questionnaireVersion = questionnaireVersion ?? questionnaireSnapshot?.version
         questionnaireHash = questionnaireHash ?? questionnaireSnapshot?.hash
+        locationInfo = try container.decodeIfPresent(SessionLocationInfo.self, forKey: .locationInfo)
         locationStatus = try container.decodeIfPresent(LocalSessionLocationStatus.self, forKey: .locationStatus) ?? .pending
         locationSource = try container.decodeIfPresent(LocalSessionLocationSource.self, forKey: .locationSource) ?? .none
         locationQuality = try container.decodeIfPresent(LocalSessionLocationQuality.self, forKey: .locationQuality) ?? .unknown
@@ -392,10 +398,14 @@ struct LocalSessionStatusSummary: Equatable {
         }
 
         switch (manifest.locationSource, manifest.locationStatus, manifest.locationQuality) {
+        case (.savedSurveyLocation, _, _):
+            messages.append("Fixed survey location")
         case (.placeSearch, _, _):
             messages.append("Address selected manually")
         case (.deviceGPS, .lowAccuracy, _), (.deviceGPS, _, .low):
             messages.append("Low-accuracy GPS")
+        case (.none, _, _) where manifest.locationInfo?.mode == SurveyLocationMode.none:
+            messages.append("Location intentionally disabled")
         case (.none, _, _) where recordingIsSafeLocally:
             messages.append("Location missing")
         default:
@@ -682,6 +692,9 @@ enum LocalSessionManifestStore {
                 if let location = json["resolved_location"] as? [String: Any] {
                     applyResolvedLocation(location, to: &manifest)
                 }
+                if let locationInfo = json["location_info"] as? [String: Any] {
+                    manifest.locationInfo = decodeLocationInfo(locationInfo)
+                }
                 if let rawPoints = json["trajectory_points"] as? [[String: Any]] {
                     manifest.trajectoryPoints = rawPoints.compactMap(trajectoryPoint(from:))
                 }
@@ -733,6 +746,9 @@ enum LocalSessionManifestStore {
             if let location = json["location"] as? [String: Any] {
                 applyResolvedLocation(location, to: &manifest)
             }
+            if let locationInfo = json["location_info"] as? [String: Any] {
+                manifest.locationInfo = decodeLocationInfo(locationInfo)
+            }
             manifest.transcription = nonEmptyString(json["transcription"])
             if manifest.transcription != nil {
                 manifest.transcriptionStatus = .completed
@@ -777,6 +793,12 @@ enum LocalSessionManifestStore {
             latitude: doubleValue(raw["latitude"]),
             longitude: doubleValue(raw["longitude"])
         )
+    }
+
+    private static func decodeLocationInfo(_ raw: [String: Any]) -> SessionLocationInfo? {
+        guard JSONSerialization.isValidJSONObject(raw),
+              let data = try? JSONSerialization.data(withJSONObject: raw) else { return nil }
+        return try? JSONDecoder().decode(SessionLocationInfo.self, from: data)
     }
 
     private static func trajectoryPoint(from raw: [String: Any]) -> TrajectoryPoint? {

@@ -1,6 +1,6 @@
 # Questionnaire LLM iOS App
 
-A Swift iOS app for field researchers to collect location-based street assessments. Participants record spoken responses; the app attempts a fresh GPS point but can use a searched place or no location, transcribes audio, matches answers to survey questions with an LLM, and durably uploads one complete interview package to a backend (FastAPI + MySQL / Cloud SQL).
+A Swift iOS app for field researchers to collect location-based street assessments. Participants record spoken responses; the interviewer can use device GPS, an offline saved fixed survey location, or intentionally collect no location. The app transcribes audio, matches answers to survey questions with an LLM, and durably uploads one complete interview package to a backend (FastAPI + MySQL / Cloud SQL).
 
 ## Architecture
 
@@ -100,6 +100,24 @@ Open **Settings** (gear) from the main screen.
 
 **Public OpenAI / Gemini:** leave Custom LLM Base URL empty and use a real API key for the selected provider.
 
+### Location Mode
+
+The main screen always shows the active location behavior. Tap that status card, or open **Settings → Location Mode and Saved Locations**, to choose:
+
+| Mode | Interview behavior |
+|------|--------------------|
+| **Device Location** | Preserves the existing flow: request fresh GPS, sample a trajectory about every 15 seconds when available, and offer retry, disclosed low-accuracy GPS, Apple Maps place search, no-GPS recording, or cancellation after failure. |
+| **Fixed Survey Location** | Prefills the respondent form's Survey Location field with the selected saved place, then uses its device-local snapshot without requesting GPS, showing location-failure prompts, or starting trajectory tracking. |
+| **No Location** | Starts without GPS or trajectory tracking and explicitly records that collection was intentionally disabled. |
+
+**Manage Saved Locations** supports any number of places. Additions use native MapKit autocomplete for points of interest and street addresses, resolve ambiguous matches through an explicit chooser, then show the place name, formatted address, map pin, and save action. Apple Maps search requires connectivity. Manual entry accepts a name, exact street address, and optional latitude/longitude. When coordinates are blank, the app searches MapKit using the typed address itself, requires the interviewer to choose among ambiguous address matches, and shows a map confirmation before saving resolved coordinates and the MapKit identifier. If lookup fails or the device is offline, the interviewer can explicitly save an address-only location; it remains usable offline and is never assigned fabricated coordinates.
+
+When an address-only place is active in Fixed Survey Location mode, every later attempt to begin an interview retries that exact address through Apple Maps before questionnaire/respondent intake and before the session location snapshot is created. A single result opens map confirmation; multiple results require the interviewer to choose the correct result and then confirm its pin. Confirmation updates the same saved place with coordinates and its MapKit identifier, so that interview and later interviews can render the point. If lookup is still unavailable, the interviewer can try again, continue with the truthful address-only location, or cancel the interview; a later interview attempt will retry again.
+
+Both `session_state.json` and `session.json` freeze the selected `location_info` snapshot. Dashboards show fixed-location name and address even when coordinates are unavailable; only map-pin rendering requires coordinates.
+
+Fixed-mode interviews copy the selected location into the durable session manifest before recording. Later edits or deletion of the saved preference do not change earlier sessions. Deleting the active place leaves Fixed Survey Location invalid and blocks interview start until another saved place or another mode is selected; it never silently switches back to GPS.
+
 ### Survey API (cloud persistence)
 
 | Setting | When to use |
@@ -118,7 +136,7 @@ When the Survey API is configured:
 - If any matched answer has medium/low confidence or needs clarification, the interviewer can select or type a final answer before the package is saved.
 - If the Survey API is configured, the app uploads `session.json` and the original `.m4a` together to `POST /sessions/{id}/package`. Launch, foreground, and satisfied network-path callbacks only discover saved work and ask before opening the Dashboard; they do not silently process old sessions. The interviewer can process one session from its detail page or select several eligible sessions for sequential processing.
 - The server stores both files under one VM folder, writes a package index row to MySQL, indexes interviewer fields, and extracts matched answers into `analysis_answers` for easier counting/filtering.
-- GPS failure no longer blocks recording: the interviewer can retry, accept a disclosed low-accuracy point, record without GPS, search with native MapKit, or cancel. Device-GPS trajectory sampling continues about every 15 seconds when GPS is available.
+- In Device Location mode, GPS failure does not block recording: the interviewer can retry, accept a disclosed low-accuracy point, record without GPS, search with native MapKit, or cancel. Device-GPS trajectory sampling continues about every 15 seconds when GPS is available.
 - `NWPathMonitor` only triggers pending-work discovery; actual user-approved Speech, LLM, HTTP, and server responses determine success. iOS does not guarantee processing while the app is suspended or terminated because this phase does not add a background-task mechanism.
 - Retry and location work are foreground-only. The app does not declare a background execution mode; a reachability callback received while inactive is ignored until a later foreground trigger.
 
@@ -335,7 +353,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 
 ## Usage workflow
 
-1. **Start Interview** — configure the current interviewer if needed, submit respondent info, and attempt fresh GPS. Respondent intake collects age range, gender, and race; non-anonymous respondents can also provide a name and optional email. Phone numbers are not collected. If GPS is unavailable or insufficient, retry, accept the disclosed low accuracy, search for a place, record without GPS, or cancel; recording is not unconditionally blocked.
+1. **Start Interview** — configure the current interviewer if needed, confirm the visible Location Mode, and submit respondent info. Device Location attempts fresh GPS and preserves the existing fallback flow. Fixed Survey Location and No Location skip GPS prompts and trajectory tracking.
 2. **Review Recording** — after Stop & Review, play the audio without closing the review popup, then analyze or discard the recording.
 3. **Analyze Answers** — from the review popup, transcribes the recording (English locale), sends the transcript to the configured LLM, and shows matched questions and extracted answers.
 4. **Clarify Answers** — for medium/low-confidence answers or answers marked as needing clarification, select or type the final answer and optionally add a note. The JSON keeps both the original LLM answer and the manual correction.
@@ -346,7 +364,7 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 
 If Survey API is configured, the outbox uploads the complete session package after any required clarification is resolved. It creates/reuses a cloud session keyed by the local session ID, persists those IDs, and marks upload complete only after validating the server response. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, and `analysis_answers` stores one extracted row per matched question.
 
-The generated schema-v3 `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/GPS context comes next, and the transcript plus matched answers appear at the bottom. The v3 respondent shape uses optional `email` and does not emit `phone`. Coordinate objects always place `lat` and `lon` next to each other. Interview paths are saved in `trajectory_points`; each point includes both `ts_ms` and readable UTC `captured_at`.
+The generated schema-v3 `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/location context comes next, and the transcript plus matched answers appear at the bottom. The v3 respondent shape uses optional `email` and does not emit `phone`. Every new package adds a typed `location_info` snapshot with `mode`, `collection_method`, place identity/address when applicable, and nullable coordinates. Older packages without `location_info` remain readable. Device interview paths are saved in `trajectory_points`; fixed and intentionally disabled sessions use an empty trajectory and explain why in `location_info` rather than creating fake points.
 
 ---
 
@@ -361,6 +379,8 @@ ios-voice-llm-survey/
 │   ├── SurveyAPIClient.swift          # FastAPI client
 │   ├── DeferredSessionOutbox.swift     # Folder scanner, backoff, cloud identity + package retry
 │   ├── LocalSessionManifest.swift      # Atomic session_state.json recovery model
+│   ├── SurveyLocationSettings.swift    # Location modes, saved-place model, UserDefaults store
+│   ├── SurveyLocationViewControllers.swift # UIKit settings, MapKit search/confirmation, manual entry
 │   ├── TrajectoryTracker.swift        # Fresh GPS attempt, quality mapping, and trajectory sampling
 │   ├── SessionManager.swift           # Local session folders
 │   ├── MapViewController.swift        # Map-first entry (optional)

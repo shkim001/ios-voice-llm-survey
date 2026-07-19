@@ -67,6 +67,7 @@ enum DurableSessionPackageFinalizer {
             interviewerInfo: manifest.interviewerSnapshot,
             respondentInfo: manifest.respondentSnapshot,
             locationLabel: label,
+            locationInfo: manifest.locationInfo,
             location: location,
             audio: AudioSnapshot(
                 fileName: audioFileName,
@@ -121,6 +122,7 @@ enum DurableSessionPackageFinalizer {
         let interviewerInfo: InterviewerProfile?
         let respondentInfo: RespondentInfo?
         let locationLabel: String?
+        let locationInfo: SessionLocationInfo?
         let location: LocationSnapshot
         let audio: AudioSnapshot
         let recordingStartTrajectoryPoint: TrajectorySnapshot?
@@ -137,6 +139,7 @@ enum DurableSessionPackageFinalizer {
             case interviewerInfo = "interviewer_info"
             case respondentInfo = "respondent_info"
             case locationLabel = "location_label"
+            case locationInfo = "location_info"
             case location
             case audio
             case recordingStartTrajectoryPoint = "recording_start_trajectory_point"

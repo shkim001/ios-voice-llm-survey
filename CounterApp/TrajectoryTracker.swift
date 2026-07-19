@@ -192,6 +192,12 @@ final class TrajectoryTracker: NSObject, CLLocationManagerDelegate {
         return interviewPoints
     }
 
+    var lastKnownCoordinate: CLLocationCoordinate2D? {
+        guard let location = lastKnownLocation,
+              CLLocationCoordinate2DIsValid(location.coordinate) else { return nil }
+        return location.coordinate
+    }
+
     // MARK: - CLLocationManagerDelegate
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {

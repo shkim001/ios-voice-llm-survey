@@ -77,7 +77,8 @@ def safe_json_summary(data: dict) -> dict:
 
     return {
         "local_session_id": data.get("local_session_id") or data.get("session_id"),
-        "location_label": package_location.get("label") or respondent_info.get("location"),
+        "location_label": package_location.get("label")
+        or (None if package_location.get("mode") == "none" else respondent_info.get("location")),
         "interviewer_id": interviewer_info.get("interviewer_id") or interviewer_info.get("email"),
         "interviewer_name": interviewer_info.get("name"),
         "interviewer_email": interviewer_info.get("email"),
@@ -133,25 +134,53 @@ def _float_or_none(value: Any) -> float | None:
 
 
 def package_location_summary(data: dict) -> dict[str, Any]:
+    location_info = _nested_dict(data, "location_info")
     location = _nested_dict(data, "location")
-    latitude = _float_or_none(location.get("latitude", location.get("lat")))
-    longitude = _float_or_none(location.get("longitude", location.get("lon", location.get("lng"))))
+    mode = _string_value(location_info, "mode")
+    collection_method = _string_value(location_info, "collection_method")
+    latitude = _float_or_none(location_info.get("latitude"))
+    longitude = _float_or_none(location_info.get("longitude"))
+    if latitude is None:
+        latitude = _float_or_none(location.get("latitude", location.get("lat")))
+    if longitude is None:
+        longitude = _float_or_none(
+            location.get("longitude", location.get("lon", location.get("lng")))
+        )
     trajectory_points = _list_value(data, "trajectory_points", "trajectory", "gps", "coordinates")
 
-    if (latitude is None or longitude is None) and trajectory_points:
+    if mode == "none":
+        latitude = None
+        longitude = None
+    elif (latitude is None or longitude is None) and trajectory_points:
         first_point = trajectory_points[0] if isinstance(trajectory_points[0], dict) else {}
         latitude = _float_or_none(first_point.get("lat", first_point.get("latitude")))
         longitude = _float_or_none(
             first_point.get("lon", first_point.get("lng", first_point.get("longitude")))
         )
 
+    intentionally_disabled = mode == "none"
+    label = None if intentionally_disabled else (
+        _string_value(location_info, "location_name")
+        or _string_value(location, "label")
+        or _string_value(data, "location_label")
+    )
+    formatted_address = None if intentionally_disabled else (
+        _string_value(location_info, "formatted_address")
+        or _string_value(location, "formatted_address", "formattedAddress", "address")
+    )
+    status = _string_value(location, "status")
+    if not status and intentionally_disabled:
+        status = "unavailable"
+
     return {
-        "label": _string_value(location, "label") or _string_value(data, "location_label"),
-        "formatted_address": _string_value(location, "formatted_address", "formattedAddress", "address"),
+        "mode": mode,
+        "collection_method": collection_method,
+        "label": label,
+        "formatted_address": formatted_address,
         "latitude": latitude,
         "longitude": longitude,
-        "source": _string_value(location, "source"),
-        "status": _string_value(location, "status"),
+        "source": collection_method or _string_value(location, "source"),
+        "status": status,
     }
 
 
@@ -159,7 +188,7 @@ def original_package_has_location(data: dict) -> bool:
     location = package_location_summary(data)
     source = (location.get("source") or "").strip().lower()
     has_coordinates = location.get("latitude") is not None and location.get("longitude") is not None
-    if source == "none":
+    if location.get("mode") == "none" or source in {"none", "intentionally_not_collected"}:
         return has_coordinates
     return bool(
         location.get("label")
@@ -344,6 +373,8 @@ def admin_json_summary(data: dict) -> dict:
         "location_lon": location.get("longitude"),
         "location_source": location.get("source"),
         "location_status": location.get("status"),
+        "location_mode": location.get("mode"),
+        "location_collection_method": location.get("collection_method"),
         "questionnaire_id": questionnaire.get("id"),
         "questionnaire_version": questionnaire.get("version"),
         "questionnaire_title": questionnaire.get("title") or _string_value(metadata, "questionnaire_title"),
@@ -1092,6 +1123,9 @@ def admin_list_sessions(_: None = Depends(verify_api_key)):
             "latitude": json_summary.get("location_lat"),
             "longitude": json_summary.get("location_lon"),
             "source": json_summary.get("location_source"),
+            "mode": json_summary.get("location_mode"),
+            "collection_method": json_summary.get("location_collection_method"),
+            "status": json_summary.get("location_status"),
         }
 
         sessions.append(
@@ -1114,6 +1148,9 @@ def admin_list_sessions(_: None = Depends(verify_api_key)):
                 "location_lat": effective_location.get("latitude"),
                 "location_lon": effective_location.get("longitude"),
                 "location_source": effective_location.get("source"),
+                "location_mode": effective_location.get("mode"),
+                "location_collection_method": effective_location.get("collection_method"),
+                "location_status": effective_location.get("status"),
                 "location_is_admin_override": admin_location is not None,
                 "questionnaire_id": json_summary.get("questionnaire_id") or row.get("questionnaire_id"),
                 "questionnaire_version": json_summary.get("questionnaire_version") or row.get("questionnaire_version"),

@@ -5,6 +5,7 @@ class RespondentInfoViewController: UIViewController {
     // MARK: - Properties
     var onInfoSubmitted: ((RespondentInfo) -> Void)?
     var onCancel: (() -> Void)?
+    var initialSurveyLocation: String?
     private var activeTextField: UITextField?
     private let ageRanges = ["Under 18", "18-24", "25-34", "35-44", "45-54", "55-64", "65+"]
     private let raceOptions = [
@@ -159,6 +160,7 @@ class RespondentInfoViewController: UIViewController {
         setupKeyboardObservers()
         setupTextFieldDelegates()
         updateAnonymousSurveyUI()
+        applyInitialSurveyLocation()
     }
     
     override func viewWillDisappear(_ animated: Bool) {
@@ -223,6 +225,13 @@ class RespondentInfoViewController: UIViewController {
         nameTextField.delegate = self
         emailTextField.delegate = self
         locationTextField.delegate = self
+    }
+
+    private func applyInitialSurveyLocation() {
+        let value = initialSurveyLocation?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !value.isEmpty {
+            locationTextField.text = value
+        }
     }
     
     private func setupKeyboardObservers() {

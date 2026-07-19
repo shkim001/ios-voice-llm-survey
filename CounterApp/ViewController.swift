@@ -10,6 +10,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     @IBOutlet weak var aggregateButton: UIButton!
     private var dashboardButton: UIButton?
     private var audioFilesButton: UIButton?
+    private var locationModeButton: UIButton?
 
     // Recording state
     private var isRecording = false
@@ -64,6 +65,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        updateLocationModeStatus()
         resetInactivityTimer()
         offerRecoverableInterviewIfNeeded()
     }
@@ -106,6 +108,18 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
 
         // Check API key status
         checkAPIKeyStatus()
+
+        let locationButton = UIButton(type: .system)
+        locationButton.translatesAutoresizingMaskIntoConstraints = false
+        locationButton.contentHorizontalAlignment = .leading
+        locationButton.addTarget(self, action: #selector(locationModeButtonTapped), for: .touchUpInside)
+        locationButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 62).isActive = true
+        if let stack = statusLabel.superview as? UIStackView,
+           let statusIndex = stack.arrangedSubviews.firstIndex(of: statusLabel) {
+            stack.insertArrangedSubview(locationButton, at: statusIndex + 1)
+        }
+        locationModeButton = locationButton
+        updateLocationModeStatus()
 
         // Setup record button
         setupButton(recordButton, title: "Start Interview", backgroundColor: .systemRed)
@@ -191,14 +205,16 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             interviewerCheckedOptionCodesByQuestionId = [:]
             interviewTrajectoryPoints = []
 
-            selectQuestionnaireIfNeeded { [weak self] in
-                self?.showRespondentInfoForm { [weak self] info in
-                    guard let self = self else { return }
-                    self.respondentInfo = info
+            resolveFixedLocationIfNeededBeforeInterview { [weak self] in
+                self?.selectQuestionnaireIfNeeded { [weak self] in
+                    self?.showRespondentInfoForm { [weak self] info in
+                        guard let self = self else { return }
+                        self.respondentInfo = info
 
-                    // Start recording only after a fresh GPS point is captured.
-                    self.prepareAndStartRecording()
-                    self.resetInactivityTimer()
+                        // Start recording only after the selected location snapshot is durable.
+                        self.prepareAndStartRecording()
+                        self.resetInactivityTimer()
+                    }
                 }
             }
             animateButton(sender)
@@ -1291,6 +1307,19 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func prepareAndStartRecording() {
         guard !isRecording else { return }
 
+        let locationStore = SavedSurveyLocationStore.shared
+        let mode = locationStore.mode
+        let fixedLocation: SavedSurveyLocation?
+        if mode == .fixed {
+            guard let selected = locationStore.activeLocation else {
+                showMissingFixedLocation()
+                return
+            }
+            fixedLocation = selected
+        } else {
+            fixedLocation = nil
+        }
+
         do {
             try verifyRecordingStorageCapacity()
             let session = try SessionManager.shared.ensureCurrentSession()
@@ -1302,9 +1331,25 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 interviewerSnapshot: InterviewerProfileStore.shared.currentProfile,
                 respondentSnapshot: respondentInfo,
                 questionnaireSnapshot: questionnaireData?.questionnaire,
-                locationStatus: .acquiring,
-                locationSource: .none,
-                locationLabel: respondentInfo?.location
+                locationInfo: fixedLocation.map(SessionLocationInfo.fixed)
+                    ?? (mode == .none ? .intentionallyDisabled : .device(collectionMethod: "pending_core_location")),
+                locationStatus: mode == .device ? .acquiring : (mode == .fixed ? .available : .unavailable),
+                locationSource: mode == .fixed ? .savedSurveyLocation : .none,
+                locationQuality: .unknown,
+                locationCoordinates: LocalSessionCoordinateSnapshot(
+                    latitude: fixedLocation?.latitude,
+                    longitude: fixedLocation?.longitude
+                ),
+                locationLabel: fixedLocation?.name
+                    ?? (mode == .none ? "Location intentionally disabled" : respondentInfo?.location),
+                placeSnapshot: fixedLocation.map {
+                    LocalSessionPlaceSnapshot(
+                        displayLabel: $0.name,
+                        formattedAddress: $0.formattedAddress,
+                        latitude: $0.latitude,
+                        longitude: $0.longitude
+                    )
+                }
             )
             try LocalSessionManifestStore.save(manifest, to: session.directoryURL)
         } catch {
@@ -1313,6 +1358,25 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 message: "Recording was not started. \(error.localizedDescription)"
             )
             return
+        }
+
+        switch mode {
+        case .fixed:
+            do { _ = try locationStore.markActiveLocationUsed() }
+            catch {
+                showBlockingRecordingError(
+                    title: "Fixed Location Could Not Be Updated",
+                    message: "Recording was not started. \(error.localizedDescription)"
+                )
+                return
+            }
+            beginRecording(with: nil)
+            return
+        case .none:
+            beginRecording(with: nil)
+            return
+        case .device:
+            break
         }
 
         recordButton.isEnabled = false
@@ -1427,6 +1491,24 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             manifest.placeSnapshot = place
             manifest.locationLabel = place?.displayLabel ?? self.respondentInfo?.location
             manifest.trajectoryPoints = point.map { [$0] } ?? []
+            if source == .deviceGPS {
+                manifest.locationInfo = .device(
+                    collectionMethod: "core_location",
+                    name: manifest.locationLabel,
+                    latitude: point?.lat,
+                    longitude: point?.lon
+                )
+            } else if source == .placeSearch {
+                manifest.locationInfo = .device(
+                    collectionMethod: "mapkit_place_search",
+                    name: place?.displayLabel,
+                    address: place?.formattedAddress,
+                    latitude: place?.latitude,
+                    longitude: place?.longitude
+                )
+            } else {
+                manifest.locationInfo = .device(collectionMethod: "unavailable_after_device_attempt")
+            }
             manifest.retry.lastError = error
         }
     }
@@ -1992,6 +2074,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             location["latitude"] = (manifest.locationCoordinates.latitude as Any?) ?? NSNull()
             location["longitude"] = (manifest.locationCoordinates.longitude as Any?) ?? NSNull()
             metadata["resolved_location"] = location
+            if let locationInfo = manifest.locationInfo,
+               let locationInfoData = try? JSONEncoder().encode(locationInfo),
+               let locationInfoObject = try? JSONSerialization.jsonObject(with: locationInfoData) {
+                metadata["location_info"] = locationInfoObject
+            }
         }
 
         if let info = respondentInfo {
@@ -2076,6 +2163,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let interviewerInfo: InterviewerProfile?
         let respondentInfo: RespondentInfo?
         let locationLabel: String?
+        let locationInfo: SessionLocationInfo?
         let location: SessionPackageLocation
         let audio: SessionPackageAudio?
         let recordingStartTrajectoryPoint: SessionPackageTrajectoryPoint?
@@ -2092,6 +2180,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             case interviewerInfo = "interviewer_info"
             case respondentInfo = "respondent_info"
             case locationLabel = "location_label"
+            case locationInfo = "location_info"
             case location
             case audio
             case recordingStartTrajectoryPoint = "recording_start_trajectory_point"
@@ -2110,6 +2199,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             try container.encodeIfPresent(interviewerInfo, forKey: .interviewerInfo)
             try container.encodeIfPresent(respondentInfo, forKey: .respondentInfo)
             try container.encodeIfPresent(locationLabel, forKey: .locationLabel)
+            try container.encodeIfPresent(locationInfo, forKey: .locationInfo)
             try container.encode(location, forKey: .location)
             try container.encodeIfPresent(audio, forKey: .audio)
             try container.encodeIfPresent(recordingStartTrajectoryPoint, forKey: .recordingStartTrajectoryPoint)
@@ -2387,6 +2477,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             interviewerInfo: manifest?.interviewerSnapshot ?? InterviewerProfileStore.shared.currentProfile,
             respondentInfo: manifest?.respondentSnapshot ?? respondentInfo,
             locationLabel: location.label,
+            locationInfo: manifest?.locationInfo,
             location: location,
             audio: audio,
             recordingStartTrajectoryPoint: recordingStartPoint,
@@ -2406,6 +2497,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("interviewer_info", package.interviewerInfo.map { interviewerInfoJSON($0, indent: 1) }),
             ("respondent_info", package.respondentInfo.map { respondentInfoJSON($0, indent: 1) }),
             ("location_label", jsonString(package.locationLabel)),
+            ("location_info", package.locationInfo.map { locationInfoJSON($0, indent: 1) }),
             ("location", sessionPackageLocationJSON(package.location, indent: 1)),
             ("audio", package.audio.map { sessionPackageAudioJSON($0, indent: 1) }),
             ("recording_start_trajectory_point", package.recordingStartTrajectoryPoint.map { trajectoryPointJSON($0, indent: 1) }),
@@ -2513,6 +2605,19 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             ("latitude", jsonNumber(location.latitude) ?? "null"),
             ("longitude", jsonNumber(location.longitude) ?? "null"),
             ("horizontal_accuracy_m", jsonNumber(location.horizontalAccuracyM))
+        ], indent: indent)
+    }
+
+    private func locationInfoJSON(_ info: SessionLocationInfo, indent: Int) -> String {
+        orderedObject([
+            ("mode", jsonString(info.mode.rawValue)),
+            ("collection_method", jsonString(info.collectionMethod)),
+            ("saved_location_id", jsonString(info.savedLocationId?.uuidString)),
+            ("location_name", jsonString(info.locationName)),
+            ("formatted_address", jsonString(info.formattedAddress)),
+            ("map_item_identifier", jsonString(info.mapItemIdentifier)),
+            ("latitude", jsonNumber(info.latitude) ?? "null"),
+            ("longitude", jsonNumber(info.longitude) ?? "null")
         ], indent: indent)
     }
 
@@ -3325,6 +3430,190 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         showAPIKeySettings()
     }
 
+    @objc private func locationModeButtonTapped() {
+        showLocationSettings()
+    }
+
+    private func showLocationSettings() {
+        let controller = SurveyLocationSettingsViewController { [weak self] in
+            self?.updateLocationModeStatus()
+        }
+        navigationController?.pushViewController(controller, animated: true)
+    }
+
+    private func updateLocationModeStatus() {
+        guard let button = locationModeButton else { return }
+        let store = SavedSurveyLocationStore.shared
+        var configuration = UIButton.Configuration.gray()
+        configuration.image = UIImage(systemName: "location.circle.fill")
+        configuration.imagePadding = 10
+        configuration.cornerStyle = .medium
+        configuration.titleAlignment = .leading
+        switch store.mode {
+        case .device:
+            configuration.title = "Device Location"
+            configuration.subtitle = "Location will be collected at interview start"
+            configuration.baseForegroundColor = .systemBlue
+        case .fixed:
+            configuration.title = "Fixed Location — \(store.activeLocation?.name ?? "Selection Required")"
+            if let activeLocation = store.activeLocation {
+                configuration.subtitle = activeLocation.needsCoordinateResolution
+                    ? "Address saved; map point will retry before interview"
+                    : "Saved map point will be used"
+            } else {
+                configuration.subtitle = "Choose a saved location before starting"
+            }
+            configuration.baseForegroundColor = store.activeLocation == nil ? .systemRed : .systemGreen
+        case .none:
+            configuration.title = "No Location"
+            configuration.subtitle = "Location collection is disabled"
+            configuration.baseForegroundColor = .systemOrange
+        }
+        button.configuration = configuration
+        button.accessibilityHint = "Opens Location Mode settings"
+    }
+
+    private func showMissingFixedLocation() {
+        let alert = UIAlertController(
+            title: "Fixed Location Required",
+            message: "The previously selected saved location is no longer available. Choose another saved location, Device Location, or No Location before starting.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Location Settings", style: .default) { [weak self] _ in
+            self?.showLocationSettings()
+        })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
+    }
+
+    private func resolveFixedLocationIfNeededBeforeInterview(completion: @escaping () -> Void) {
+        let store = SavedSurveyLocationStore.shared
+        guard store.mode == .fixed else { completion(); return }
+        guard let location = store.activeLocation else {
+            showMissingFixedLocation()
+            return
+        }
+        guard location.needsCoordinateResolution else { completion(); return }
+        guard let address = location.formattedAddress?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !address.isEmpty else {
+            completion()
+            return
+        }
+
+        let progress = UIAlertController(
+            title: "Resolving Saved Address",
+            message: "Searching Apple Maps before this interview starts...",
+            preferredStyle: .alert
+        )
+        present(progress, animated: true)
+        Task { [weak self, weak progress] in
+            guard let self else { return }
+            let outcome = await ManualSurveyLocationAddressResolution.resolve(
+                typedAddress: address,
+                using: MapKitSurveyLocationAddressResolver()
+            )
+            progress?.dismiss(animated: true) { [weak self] in
+                self?.handleFixedLocationResolution(
+                    outcome,
+                    original: location,
+                    completion: completion
+                )
+            }
+        }
+    }
+
+    private func handleFixedLocationResolution(
+        _ outcome: ManualAddressResolutionOutcome,
+        original: SavedSurveyLocation,
+        completion: @escaping () -> Void
+    ) {
+        switch outcome {
+        case let .candidates(candidates):
+            if candidates.count == 1, let candidate = candidates.first {
+                confirmResolvedFixedLocation(candidate, original: original, completion: completion)
+                return
+            }
+            let chooser = UIAlertController(
+                title: "Choose the Exact Address",
+                message: "Apple Maps found more than one match. Select the correct location before the interview starts.",
+                preferredStyle: .actionSheet
+            )
+            for candidate in candidates.prefix(10) {
+                let title = [candidate.name, candidate.formattedAddress]
+                    .compactMap { $0 }
+                    .joined(separator: " — ")
+                chooser.addAction(UIAlertAction(title: title, style: .default) { [weak self] _ in
+                    self?.confirmResolvedFixedLocation(
+                        candidate,
+                        original: original,
+                        completion: completion
+                    )
+                })
+            }
+            chooser.addAction(UIAlertAction(title: "Cancel Interview", style: .cancel))
+            if let popover = chooser.popoverPresentationController {
+                popover.sourceView = locationModeButton ?? view
+                popover.sourceRect = locationModeButton?.bounds ?? CGRect(
+                    x: view.bounds.midX,
+                    y: view.bounds.midY,
+                    width: 1,
+                    height: 1
+                )
+            }
+            present(chooser, animated: true)
+        case .addressOnly:
+            let alert = UIAlertController(
+                title: "Map Point Still Unavailable",
+                message: "Apple Maps could not resolve this saved address. You can retry, continue offline with the truthful address-only location, or cancel this interview.",
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "Try Again", style: .default) { [weak self] _ in
+                self?.resolveFixedLocationIfNeededBeforeInterview(completion: completion)
+            })
+            alert.addAction(UIAlertAction(title: "Continue Address Only", style: .default) { _ in
+                completion()
+            })
+            alert.addAction(UIAlertAction(title: "Cancel Interview", style: .cancel))
+            present(alert, animated: true)
+        }
+    }
+
+    private func confirmResolvedFixedLocation(
+        _ candidate: SurveyLocationAddressCandidate,
+        original: SavedSurveyLocation,
+        completion: @escaping () -> Void
+    ) {
+        let controller = LocationConfirmationViewController(
+            candidate: candidate,
+            suggestedName: original.name,
+            original: original,
+            onCancel: { [weak self] in self?.dismiss(animated: true) },
+            onSave: { [weak self] resolved in
+                guard let self else { return }
+                do {
+                    try SavedSurveyLocationStore.shared.save(resolved, makeActive: true)
+                    self.dismiss(animated: true) {
+                        self.updateLocationModeStatus()
+                        completion()
+                    }
+                } catch {
+                    self.dismiss(animated: true) {
+                        let alert = UIAlertController(
+                            title: "Location Could Not Be Saved",
+                            message: error.localizedDescription,
+                            preferredStyle: .alert
+                        )
+                        alert.addAction(UIAlertAction(title: "OK", style: .default))
+                        self.present(alert, animated: true)
+                    }
+                }
+            }
+        )
+        let navigation = UINavigationController(rootViewController: controller)
+        navigation.modalPresentationStyle = .formSheet
+        present(navigation, animated: true)
+    }
+
     private func checkAPIKeyStatus() {
         let currentProvider = LLMService.shared.currentProvider
         if !LLMService.shared.hasAPIKey() {
@@ -3338,9 +3627,13 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let interviewer = InterviewerProfileStore.shared.currentProfile
         let alert = UIAlertController(
             title: "App Settings",
-            message: "Current LLM: \(LLMService.shared.currentProvider.displayName)\nCurrent interviewer: \(interviewer?.name ?? "Not set")",
+            message: "Current LLM: \(LLMService.shared.currentProvider.displayName)\nCurrent interviewer: \(interviewer?.name ?? "Not set")\nLocation Mode: \(SavedSurveyLocationStore.shared.mode.title)",
             preferredStyle: .alert
         )
+
+        alert.addAction(UIAlertAction(title: "Location Mode and Saved Locations", style: .default) { [weak self] _ in
+            self?.showLocationSettings()
+        })
 
         // Add API provider selection
         alert.addAction(UIAlertAction(title: "Select API Provider", style: .default) { [weak self] _ in
@@ -3900,6 +4193,10 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     // MARK: - Respondent Info Form
     private func showRespondentInfoForm(completion: @escaping (RespondentInfo) -> Void) {
         let infoVC = RespondentInfoViewController()
+        let locationStore = SavedSurveyLocationStore.shared
+        if locationStore.mode == .fixed {
+            infoVC.initialSurveyLocation = locationStore.activeLocation?.name
+        }
         infoVC.onInfoSubmitted = { [weak self] info in
             self?.dismiss(animated: true) {
                 completion(info)
