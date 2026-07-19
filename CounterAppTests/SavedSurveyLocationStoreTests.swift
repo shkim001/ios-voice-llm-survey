@@ -84,6 +84,74 @@ struct SavedSurveyLocationStoreTests {
         #expect(snapshot.mapItemIdentifier == "resolved-map-item")
     }
 
+    @Test func savedSessionRetryPersistsCoordinatesAndInvalidatesAddressOnlyPackage() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var unresolved = makeLocation()
+        unresolved.latitude = nil
+        unresolved.longitude = nil
+        unresolved.mapItemIdentifier = nil
+        var manifest = LocalSessionManifest(
+            localSessionId: "address-only-retry",
+            audioFileName: "recording.m4a",
+            locationInfo: .fixed(unresolved),
+            locationStatus: .available,
+            locationSource: .savedSurveyLocation,
+            locationCoordinates: LocalSessionCoordinateSnapshot(),
+            locationLabel: unresolved.name,
+            placeSnapshot: LocalSessionPlaceSnapshot(
+                displayLabel: unresolved.name,
+                formattedAddress: unresolved.formattedAddress,
+                latitude: nil,
+                longitude: nil
+            )
+        )
+        manifest.audioStatus = .recordedLocally
+        try LocalSessionManifestStore.save(manifest, to: directory)
+        try Data([0x01, 0x02]).write(to: directory.appendingPathComponent("recording.m4a"))
+        let packageURL = directory.appendingPathComponent("session.json")
+        try Data("{\"location_info\":{}}".utf8).write(to: packageURL)
+
+        let candidate = SurveyLocationAddressCandidate(
+            name: "Resolved Research Site",
+            formattedAddress: "535 W 114th St, New York, NY 10027",
+            latitude: 40.8063,
+            longitude: -73.9632,
+            mapItemIdentifier: "retry-map-item"
+        )
+        try LocalSessionManifestStore.resolveFixedLocationForRetry(
+            in: directory,
+            candidate: candidate,
+            confirmedName: "Research Site"
+        )
+
+        let updated = try LocalSessionManifestStore.load(from: directory)
+        #expect(updated.locationInfo?.latitude == 40.8063)
+        #expect(updated.locationInfo?.longitude == -73.9632)
+        #expect(updated.locationInfo?.mapItemIdentifier == "retry-map-item")
+        #expect(updated.locationCoordinates.latitude == 40.8063)
+        #expect(updated.locationCoordinates.longitude == -73.9632)
+        #expect(updated.placeSnapshot?.formattedAddress == candidate.formattedAddress)
+        #expect(updated.locationInfo?.savedLocationId == unresolved.id)
+        #expect(!FileManager.default.fileExists(atPath: packageURL.path))
+
+        let rebuiltURL = try DurableSessionPackageFinalizer.finalize(
+            sessionDirectoryURL: directory,
+            transcript: "Recovered interview transcript",
+            matchedQuestions: []
+        )
+        let rebuilt = try #require(
+            JSONSerialization.jsonObject(with: Data(contentsOf: rebuiltURL)) as? [String: Any]
+        )
+        let rebuiltLocation = try #require(rebuilt["location_info"] as? [String: Any])
+        #expect(rebuiltLocation["latitude"] as? Double == 40.8063)
+        #expect(rebuiltLocation["longitude"] as? Double == -73.9632)
+        #expect(rebuiltLocation["map_item_identifier"] as? String == "retry-map-item")
+    }
+
     @Test func locationAndModePersistenceRoundTrip() throws {
         let defaults = try temporaryDefaults()
         defer { defaults.removePersistentDomain(forName: defaultsSuiteName) }

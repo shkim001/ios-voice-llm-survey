@@ -109,6 +109,27 @@ struct SessionLocationInfo: Codable, Equatable {
         case longitude
     }
 
+    var hasValidCoordinate: Bool {
+        guard let latitude, let longitude else { return false }
+        return (-90...90).contains(latitude) && (-180...180).contains(longitude)
+    }
+
+    var needsCoordinateResolutionOnRetry: Bool {
+        guard mode == .fixed, !hasValidCoordinate else { return false }
+        return !(formattedAddress?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }
+
+    func resolved(with candidate: SurveyLocationAddressCandidate, confirmedName: String? = nil) -> Self {
+        var updated = self
+        let trimmedName = confirmedName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedName.isEmpty { updated.locationName = trimmedName }
+        updated.formattedAddress = candidate.formattedAddress
+        updated.mapItemIdentifier = candidate.mapItemIdentifier
+        updated.latitude = candidate.latitude
+        updated.longitude = candidate.longitude
+        return updated
+    }
+
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(mode, forKey: .mode)

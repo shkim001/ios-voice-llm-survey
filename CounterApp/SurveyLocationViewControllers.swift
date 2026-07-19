@@ -420,6 +420,7 @@ final class LocationConfirmationViewController: UIViewController {
     private let original: SavedSurveyLocation?
     private let onSave: (SavedSurveyLocation) -> Void
     private let onCancel: (() -> Void)?
+    private let saveButtonTitle: String
     private let nameField = UITextField()
     private let mapView = MKMapView()
 
@@ -427,6 +428,7 @@ final class LocationConfirmationViewController: UIViewController {
         mapItem: MKMapItem,
         original: SavedSurveyLocation? = nil,
         onCancel: (() -> Void)? = nil,
+        saveButtonTitle: String = "Save and Use as Fixed Location",
         onSave: @escaping (SavedSurveyLocation) -> Void
     ) {
         let coordinate = mapItem.placemark.coordinate
@@ -440,6 +442,7 @@ final class LocationConfirmationViewController: UIViewController {
         suggestedName = nil
         self.original = original
         self.onCancel = onCancel
+        self.saveButtonTitle = saveButtonTitle
         self.onSave = onSave
         super.init(nibName: nil, bundle: nil)
         title = "Confirm Location"
@@ -450,12 +453,14 @@ final class LocationConfirmationViewController: UIViewController {
         suggestedName: String?,
         original: SavedSurveyLocation? = nil,
         onCancel: (() -> Void)? = nil,
+        saveButtonTitle: String = "Save and Use as Fixed Location",
         onSave: @escaping (SavedSurveyLocation) -> Void
     ) {
         self.candidate = candidate
         self.suggestedName = suggestedName
         self.original = original
         self.onCancel = onCancel
+        self.saveButtonTitle = saveButtonTitle
         self.onSave = onSave
         super.init(nibName: nil, bundle: nil)
         title = "Confirm Address"
@@ -493,7 +498,7 @@ final class LocationConfirmationViewController: UIViewController {
 
         let saveButton = UIButton(type: .system)
         var configuration = UIButton.Configuration.filled()
-        configuration.title = "Save and Use as Fixed Location"
+        configuration.title = saveButtonTitle
         saveButton.configuration = configuration
         saveButton.addTarget(self, action: #selector(save), for: .touchUpInside)
 
@@ -730,6 +735,209 @@ final class ManualSurveyLocationViewController: UIViewController {
         let alert = UIAlertController(title: "Invalid Location", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
+    }
+}
+
+@MainActor
+enum SessionLocationRetryPresenter {
+    static func resolveIfNeeded(
+        in sessionDirectoryURL: URL,
+        from presenter: UIViewController,
+        resolver: SurveyLocationAddressResolving = MapKitSurveyLocationAddressResolver(),
+        completion: @escaping (Bool) -> Void
+    ) {
+        let manifest: LocalSessionManifest
+        do {
+            manifest = try LocalSessionManifestStore.load(from: sessionDirectoryURL)
+        } catch {
+            showPersistenceError(error, from: presenter, completion: completion)
+            return
+        }
+        guard let locationInfo = manifest.locationInfo,
+              locationInfo.needsCoordinateResolutionOnRetry,
+              let address = locationInfo.formattedAddress?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !address.isEmpty else {
+            completion(true)
+            return
+        }
+
+        let progress = UIAlertController(
+            title: "Finding Session Map Point",
+            message: "This saved session has an address but no coordinates. Searching Apple Maps before retrying processing...",
+            preferredStyle: .alert
+        )
+        presenter.present(progress, animated: true)
+        Task {
+            let outcome = await ManualSurveyLocationAddressResolution.resolve(
+                typedAddress: address,
+                using: resolver
+            )
+            progress.dismiss(animated: true) {
+                handle(
+                    outcome,
+                    locationInfo: locationInfo,
+                    sessionDirectoryURL: sessionDirectoryURL,
+                    presenter: presenter,
+                    resolver: resolver,
+                    completion: completion
+                )
+            }
+        }
+    }
+
+    private static func handle(
+        _ outcome: ManualAddressResolutionOutcome,
+        locationInfo: SessionLocationInfo,
+        sessionDirectoryURL: URL,
+        presenter: UIViewController,
+        resolver: SurveyLocationAddressResolving,
+        completion: @escaping (Bool) -> Void
+    ) {
+        switch outcome {
+        case let .candidates(candidates):
+            if candidates.count == 1, let candidate = candidates.first {
+                confirm(
+                    candidate,
+                    locationInfo: locationInfo,
+                    sessionDirectoryURL: sessionDirectoryURL,
+                    presenter: presenter,
+                    completion: completion
+                )
+                return
+            }
+            let chooser = UIAlertController(
+                title: "Choose the Session Address",
+                message: "Apple Maps found more than one match. Select and confirm the point that belongs to this saved interview.",
+                preferredStyle: .actionSheet
+            )
+            for candidate in candidates.prefix(10) {
+                let title = [candidate.name, candidate.formattedAddress]
+                    .compactMap { $0 }
+                    .joined(separator: " — ")
+                chooser.addAction(UIAlertAction(title: title, style: .default) { _ in
+                    confirm(
+                        candidate,
+                        locationInfo: locationInfo,
+                        sessionDirectoryURL: sessionDirectoryURL,
+                        presenter: presenter,
+                        completion: completion
+                    )
+                })
+            }
+            chooser.addAction(UIAlertAction(title: "Cancel Retry", style: .cancel) { _ in
+                completion(false)
+            })
+            if let popover = chooser.popoverPresentationController {
+                popover.sourceView = presenter.view
+                popover.sourceRect = CGRect(
+                    x: presenter.view.bounds.midX,
+                    y: presenter.view.bounds.midY,
+                    width: 1,
+                    height: 1
+                )
+                popover.permittedArrowDirections = []
+            }
+            presenter.present(chooser, animated: true)
+        case .addressOnly:
+            let alert = UIAlertController(
+                title: "Session Map Point Still Unavailable",
+                message: "Apple Maps could not resolve the saved address. You can try again, continue processing without a map point, or cancel this retry.",
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "Try Again", style: .default) { _ in
+                resolveIfNeeded(
+                    in: sessionDirectoryURL,
+                    from: presenter,
+                    resolver: resolver,
+                    completion: completion
+                )
+            })
+            alert.addAction(UIAlertAction(title: "Continue Without Map Point", style: .default) { _ in
+                completion(true)
+            })
+            alert.addAction(UIAlertAction(title: "Cancel Retry", style: .cancel) { _ in
+                completion(false)
+            })
+            presenter.present(alert, animated: true)
+        }
+    }
+
+    private static func confirm(
+        _ candidate: SurveyLocationAddressCandidate,
+        locationInfo: SessionLocationInfo,
+        sessionDirectoryURL: URL,
+        presenter: UIViewController,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let now = Date()
+        let original = SavedSurveyLocation(
+            id: locationInfo.savedLocationId ?? UUID(),
+            name: locationInfo.locationName ?? candidate.name ?? "Survey location",
+            formattedAddress: locationInfo.formattedAddress,
+            latitude: nil,
+            longitude: nil,
+            mapItemIdentifier: nil,
+            createdAt: now,
+            updatedAt: now,
+            lastUsedAt: nil
+        )
+        let controller = LocationConfirmationViewController(
+            candidate: candidate,
+            suggestedName: locationInfo.locationName,
+            original: original,
+            onCancel: {
+                presenter.dismiss(animated: true) { completion(false) }
+            },
+            saveButtonTitle: "Save Point and Retry Session",
+            onSave: { resolved in
+                do {
+                    try LocalSessionManifestStore.resolveFixedLocationForRetry(
+                        in: sessionDirectoryURL,
+                        candidate: candidate,
+                        confirmedName: resolved.name
+                    )
+                    updateSavedLocationIfPresent(
+                        id: locationInfo.savedLocationId,
+                        candidate: candidate,
+                        confirmedName: resolved.name
+                    )
+                    presenter.dismiss(animated: true) { completion(true) }
+                } catch {
+                    presenter.dismiss(animated: true) {
+                        showPersistenceError(error, from: presenter, completion: completion)
+                    }
+                }
+            }
+        )
+        let navigation = UINavigationController(rootViewController: controller)
+        navigation.modalPresentationStyle = .formSheet
+        presenter.present(navigation, animated: true)
+    }
+
+    private static func updateSavedLocationIfPresent(
+        id: UUID?,
+        candidate: SurveyLocationAddressCandidate,
+        confirmedName: String
+    ) {
+        guard let id,
+              let saved = SavedSurveyLocationStore.shared.locations.first(where: { $0.id == id }) else { return }
+        try? SavedSurveyLocationStore.shared.save(
+            saved.resolved(with: candidate, confirmedName: confirmedName)
+        )
+    }
+
+    private static func showPersistenceError(
+        _ error: Error,
+        from presenter: UIViewController,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let alert = UIAlertController(
+            title: "Session Location Could Not Be Saved",
+            message: error.localizedDescription,
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in completion(false) })
+        presenter.present(alert, animated: true)
     }
 }
 

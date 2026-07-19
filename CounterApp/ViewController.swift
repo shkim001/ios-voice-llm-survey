@@ -227,13 +227,15 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         animateButton(sender)
     }
 
-    private func runLLMRecognition() {
+    private func runLLMRecognition(
+        statusMessage: String = "Resuming saved interview processing...\nPlease wait"
+    ) {
         guard let recordingURL, let sessionDirectoryURL else {
             showMessage("No recording available. Please record first.")
             return
         }
         invalidateInactivityTimer()
-        statusLabel.text = "Resuming saved interview processing...\nPlease wait"
+        statusLabel.text = statusMessage
         statusLabel.textColor = .systemBlue
         Task { [weak self] in
             guard let self else { return }
@@ -447,6 +449,16 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func resumeRecoverableInterview(in directoryURL: URL) {
+        SessionLocationRetryPresenter.resolveIfNeeded(
+            in: directoryURL,
+            from: self
+        ) { [weak self] shouldContinue in
+            guard shouldContinue else { return }
+            self?.resumeRecoverableInterviewAfterLocationResolution(in: directoryURL)
+        }
+    }
+
+    private func resumeRecoverableInterviewAfterLocationResolution(in directoryURL: URL) {
         do {
             let session = try SessionManager.shared.resumeSession(at: directoryURL)
             var manifest = try LocalSessionManifestStore.load(from: directoryURL)
@@ -1941,7 +1953,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 self?.recordingReviewViewController = nil
                 self?.audioPlayer?.stop()
                 self?.audioPlayer = nil
-                self?.runLLMRecognition()
+                self?.runLLMRecognition(
+                    statusMessage: "Analyzing and uploading interview...\nPlease wait"
+                )
             }
         }
         review.onDiscard = { [weak self, weak review] in
@@ -1965,8 +1979,11 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
 
         do {
+            try prepareForAudiblePlayback()
             audioPlayer = try AVAudioPlayer(contentsOf: url)
             audioPlayer?.delegate = self
+            audioPlayer?.volume = 1.0
+            audioPlayer?.prepareToPlay()
             audioPlayer?.play()
             statusLabel.text = "Playing recording..."
             statusLabel.textColor = .systemPurple
@@ -1975,6 +1992,12 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             showMessage("Playback failed: \(error.localizedDescription)")
             return false
         }
+    }
+
+    private func prepareForAudiblePlayback() throws {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default)
+        try session.setActive(true)
     }
 
     private func confirmDiscardCurrentRecording(from presenter: UIViewController? = nil) {
@@ -3626,42 +3649,64 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func showAPIKeySettings() {
         let interviewer = InterviewerProfileStore.shared.currentProfile
         let alert = UIAlertController(
-            title: "App Settings",
+            title: "Settings",
             message: "Current LLM: \(LLMService.shared.currentProvider.displayName)\nCurrent interviewer: \(interviewer?.name ?? "Not set")\nLocation Mode: \(SavedSurveyLocationStore.shared.mode.title)",
             preferredStyle: .alert
         )
 
+        alert.addAction(UIAlertAction(title: "App Settings", style: .default) { [weak self] _ in
+            self?.showAppConfigurationSettings()
+        })
+        alert.addAction(UIAlertAction(title: "Interviewer Settings", style: .default) { [weak self] _ in
+            self?.showInterviewerSettings()
+        })
         alert.addAction(UIAlertAction(title: "Location Mode and Saved Locations", style: .default) { [weak self] _ in
             self?.showLocationSettings()
         })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
 
-        // Add API provider selection
+        present(alert, animated: true)
+    }
+
+    private func showAppConfigurationSettings() {
+        let alert = UIAlertController(
+            title: "App Settings",
+            message: "Current LLM: \(LLMService.shared.currentProvider.displayName)",
+            preferredStyle: .alert
+        )
+
         alert.addAction(UIAlertAction(title: "Select API Provider", style: .default) { [weak self] _ in
             self?.showAPIProviderSelection()
         })
-
-        // Add OpenAI API key configuration
         alert.addAction(UIAlertAction(title: "Configure OpenAI API Key", style: .default) { [weak self] _ in
             self?.showAPIKeyInput(for: .openai)
         })
-
-        // Add Gemini API key configuration
         alert.addAction(UIAlertAction(title: "Configure Gemini API Key", style: .default) { [weak self] _ in
             self?.showAPIKeyInput(for: .gemini)
         })
-
-        // Add custom LLM base URL configuration
         alert.addAction(UIAlertAction(title: "Configure Custom LLM Base URL", style: .default) { [weak self] _ in
             self?.showCustomLLMBaseURLInput()
         })
-
-        // Survey API configuration (Cloud SQL persistence)
         alert.addAction(UIAlertAction(title: "Configure Survey API Base URL", style: .default) { [weak self] _ in
             self?.showSurveyAPIBaseURLInput()
         })
         alert.addAction(UIAlertAction(title: "Configure Survey API Key", style: .default) { [weak self] _ in
             self?.showSurveyAPIKeyInput()
         })
+        alert.addAction(UIAlertAction(title: "Back", style: .cancel) { [weak self] _ in
+            self?.showAPIKeySettings()
+        })
+
+        present(alert, animated: true)
+    }
+
+    private func showInterviewerSettings() {
+        let interviewer = InterviewerProfileStore.shared.currentProfile
+        let alert = UIAlertController(
+            title: "Interviewer Settings",
+            message: "Current interviewer: \(interviewer?.name ?? "Not set")",
+            preferredStyle: .alert
+        )
 
         alert.addAction(UIAlertAction(title: "Configure Interviewer", style: .default) { [weak self] _ in
             self?.showInterviewerProfileInput()
@@ -3674,8 +3719,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 self?.showSavedInterviewerDeletion()
             })
         }
-
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Back", style: .cancel) { [weak self] _ in
+            self?.showAPIKeySettings()
+        })
 
         present(alert, animated: true)
     }

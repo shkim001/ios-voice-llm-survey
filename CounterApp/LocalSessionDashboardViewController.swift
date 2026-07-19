@@ -1101,6 +1101,43 @@ final class LocalSessionDashboardViewController: UITableViewController {
         retryAllButton.isEnabled = false
         setEditing(false, animated: true)
 
+        resolveLocationsBeforeProcessing(selectedSessions, index: 0, ready: [])
+    }
+
+    private func resolveLocationsBeforeProcessing(
+        _ sessionsToCheck: [LocalSessionDashboardSession],
+        index: Int,
+        ready: [LocalSessionDashboardSession]
+    ) {
+        guard index < sessionsToCheck.count else {
+            guard !ready.isEmpty else {
+                isBatchProcessing = false
+                updateBatchButtons()
+                showAlert(message: "Retry cancelled. No sessions were processed.")
+                return
+            }
+            performSelectedSessionProcessing(ready)
+            return
+        }
+
+        let session = sessionsToCheck[index]
+        SessionLocationRetryPresenter.resolveIfNeeded(
+            in: session.directoryURL,
+            from: self
+        ) { [weak self] shouldContinue in
+            guard let self else { return }
+            var nextReady = ready
+            if shouldContinue { nextReady.append(session) }
+            resolveLocationsBeforeProcessing(
+                sessionsToCheck,
+                index: index + 1,
+                ready: nextReady
+            )
+        }
+    }
+
+    private func performSelectedSessionProcessing(_ selectedSessions: [LocalSessionDashboardSession]) {
+
         Task { [weak self] in
             let ids = Set(selectedSessions.map(\.localSessionId))
             let summary = await DeferredSessionOutbox.shared.retryNow(localSessionIds: ids)
@@ -1448,6 +1485,16 @@ final class LocalSessionDetailViewController: UITableViewController {
             onProcessRequested(session)
             return
         }
+        SessionLocationRetryPresenter.resolveIfNeeded(
+            in: session.directoryURL,
+            from: self
+        ) { [weak self] shouldContinue in
+            guard shouldContinue else { return }
+            self?.performUploadOnlyRetry()
+        }
+    }
+
+    private func performUploadOnlyRetry() {
         navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Retrying…", style: .plain, target: nil, action: nil)
         Task { [weak self] in
             guard let self else { return }

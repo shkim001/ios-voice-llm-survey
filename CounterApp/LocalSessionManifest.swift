@@ -526,6 +526,49 @@ enum LocalSessionManifestStore {
         try save(manifest, to: directoryURL)
     }
 
+    static func resolveFixedLocationForRetry(
+        in directoryURL: URL,
+        candidate: SurveyLocationAddressCandidate,
+        confirmedName: String? = nil,
+        now: Date = Date()
+    ) throws {
+        let manifest = try load(from: directoryURL)
+        guard let current = manifest.locationInfo,
+              current.needsCoordinateResolutionOnRetry else { return }
+        let resolved = current.resolved(with: candidate, confirmedName: confirmedName)
+
+        try update(in: directoryURL, now: now) { value in
+            value.locationInfo = resolved
+            value.locationStatus = .available
+            value.locationSource = .savedSurveyLocation
+            value.locationQuality = .unknown
+            value.locationHorizontalAccuracyM = nil
+            value.locationCoordinates = LocalSessionCoordinateSnapshot(
+                latitude: candidate.latitude,
+                longitude: candidate.longitude
+            )
+            value.locationLabel = resolved.locationName
+            value.locationPoint = nil
+            value.placeSnapshot = LocalSessionPlaceSnapshot(
+                displayLabel: resolved.locationName ?? candidate.name ?? candidate.formattedAddress,
+                formattedAddress: candidate.formattedAddress,
+                latitude: candidate.latitude,
+                longitude: candidate.longitude
+            )
+            value.trajectoryPoints = []
+            if value.uploadStatus != .uploaded {
+                value.uploadStatus = .notReady
+            }
+        }
+
+        // session.json is derived from the manifest. Removing an older address-only
+        // package ensures the retry pipeline rebuilds it with the confirmed point.
+        let packageURL = directoryURL.appendingPathComponent("session.json")
+        if FileManager.default.fileExists(atPath: packageURL.path) {
+            try FileManager.default.removeItem(at: packageURL)
+        }
+    }
+
     static func resetDerivedProcessingForRetranscription(
         in directoryURL: URL,
         now: Date = Date()

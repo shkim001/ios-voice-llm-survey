@@ -163,14 +163,23 @@ final class AudioFilesViewController: UITableViewController, AVAudioPlayerDelega
         stopPlayback()
 
         do {
+            try prepareForAudiblePlayback()
             audioPlayer = try AVAudioPlayer(contentsOf: item.url)
             audioPlayer?.delegate = self
+            audioPlayer?.volume = 1.0
+            audioPlayer?.prepareToPlay()
             audioPlayer?.play()
             playingURL = item.url
             tableView.reloadData()
         } catch {
             showAlert(message: "Playback failed: \(error.localizedDescription)")
         }
+    }
+
+    private func prepareForAudiblePlayback() throws {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default)
+        try session.setActive(true)
     }
 
     private func stopPlayback() {
