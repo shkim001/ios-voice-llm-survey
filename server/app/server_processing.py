@@ -16,7 +16,7 @@ OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_TRANSCRIPTION_MODEL = os.environ.get(
     "OPENAI_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"
 ).strip()
-OPENAI_ANALYSIS_MODEL = os.environ.get("OPENAI_ANALYSIS_MODEL", "gpt-4o-mini").strip()
+OPENAI_ANALYSIS_MODEL = os.environ.get("OPENAI_ANALYSIS_MODEL", "gpt-4o").strip()
 OPENAI_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "180"))
 
 
@@ -88,16 +88,17 @@ def generate_system_prompt(questions: list[dict[str, Any]]) -> str:
         keyword_text = ", ".join(str(value) for value in keywords) if isinstance(keywords, list) else ""
         questions_text += f"Related keywords: {keyword_text}\n\n"
 
-    # Keep this prompt behavior-aligned with LLMService.generateSystemPrompt. The
-    # workflow migration intentionally does not redesign the prompt in this phase.
+    # Server processing owns the active prompt. Legacy on-device prompt code remains
+    # compiled for compatibility but is not used by the active interview workflow.
     return f'''You are an intelligent assistant that analyzes spoken responses about location/street assessments and maps them to survey questions.
 
 Your goal is to:
 1. Read the provided audio transcription from the user.
-2. Determine which survey question(s) the response corresponds to.
+2. Review every questionnaire question and determine which ones were actually asked in the transcript.
 3. Extract a clear, concise answer for each question that can be inferred from the response.
 4. Estimate the confidence level of your extraction.
-5. Output the result in a structured JSON format.
+5. Before finalizing, perform a second completeness pass comparing every spoken question against the output IDs.
+6. Output the result in a structured JSON format.
 
 Survey Questions:
 {questions_text}
@@ -107,12 +108,18 @@ Survey Questions:
 ### Instructions
 - This is a **Location/Street Assessment Survey** focusing on facilities, safety, and impressions.
 - You may detect **multiple questions** answered within a single spoken response.
-- Each detected question should be represented as one JSON object in the output list.
+- Review every supplied questionnaire question in ID order, even when its answer is very short, uncertain, or negative.
+- Each question that was asked in the transcript must be represented as one JSON object in the output list. Do not output main questions that were not asked.
+- Never omit a question because the respondent said "I don't know", "I'm not sure", "I don't understand", apologized, declined to answer, or gave only one or two words. Those are valid recorded responses.
+- Confidence describes confidence that you extracted the spoken response correctly. It does not describe how certain the respondent is about their opinion. A clearly spoken "I don't know" can have high extraction confidence.
+- Set `response_status` to `answered`, `respondent_unsure`, or `no_answer`. Use `respondent_unsure` for a clearly spoken lack of knowledge/understanding; use `no_answer` only when the question was asked but no usable response followed.
+- Copy an exact, verbatim question-and-answer excerpt into `supporting_transcript`. Never paraphrase this evidence.
+- Before returning JSON, scan the transcript one more time from beginning to end and confirm that every asked questionnaire question ID appears exactly once.
 - A questionnaire follow-up belongs inside its parent question's `"follow_up"` object. Never emit a second top-level object with the same `matched_question_id` for a follow-up.
 - When a configured follow-up is spoken in the transcript, set `"asked_in_transcript": true` and extract its answer independently from the parent answer.
 - When a configured follow-up is not spoken, still include the `"follow_up"` object with `"asked_in_transcript": false`, `"extracted_answer": null`, and `"clarification_needed": false`.
 - Never omit a spoken follow-up merely because the parent question already has an answer.
-- Look for keywords related to: seating, trees, landscaping, shelter, water fountains, restrooms, transit, trash, buildings, signage, lighting, speed limits, safety, accessibility.
+- Use the supplied question text and its related keywords as the authoritative matching criteria. Do not limit matching to examples from older questionnaires.
 - For yes/no questions, extract the clear answer (yes/no/not sure).
 - For impression questions, capture the user's assessment (safe/unsafe, appealing/unappealing, etc.).
 - For multiple-choice questions, select only from the listed option codes.
@@ -134,6 +141,9 @@ Return a single JSON array, where each element has the following structure:
     "matched_question_id": <question_id>,
     "matched_question": "<the question text>",
     "extracted_answer": "<user's extracted answer>",
+    "asked_in_transcript": true,
+    "response_status": "<answered/respondent_unsure/no_answer>",
+    "supporting_transcript": "<exact verbatim question-and-answer excerpt>",
     "selected_option_codes": ["1", "3"],
     "selected_option_labels": ["Option label for 1", "Option label for 3"],
     "confidence": "<high/medium/low>",
@@ -142,6 +152,8 @@ Return a single JSON array, where each element has the following structure:
       "question": "<configured follow-up question>",
       "asked_in_transcript": <true/false>,
       "extracted_answer": "<follow-up answer or null>",
+      "response_status": "<answered/respondent_unsure/no_answer/not_asked>",
+      "supporting_transcript": "<exact excerpt or null>",
       "confidence": "<high/medium/low>",
       "clarification_needed": <true/false>
     }}
@@ -155,6 +167,9 @@ Example Output (for location assessment responses):
     "matched_question_id": 1,
     "matched_question": "Are there places to sit?",
     "extracted_answer": "Yes, there are benches and seating areas",
+    "asked_in_transcript": true,
+    "response_status": "answered",
+    "supporting_transcript": "Are there places to sit? Yes, there are benches and seating areas.",
     "confidence": "high",
     "clarification_needed": false
   }},
@@ -162,6 +177,9 @@ Example Output (for location assessment responses):
     "matched_question_id": 2,
     "matched_question": "Are there shade trees?",
     "extracted_answer": "Yes, I can see several trees providing shade",
+    "asked_in_transcript": true,
+    "response_status": "answered",
+    "supporting_transcript": "Are there shade trees? Yes, I can see several trees providing shade.",
     "confidence": "high",
     "clarification_needed": false
   }}
@@ -201,7 +219,7 @@ def analyze_transcript(
                 ),
             },
         ],
-        "temperature": 0.3,
+        "temperature": 0.0,
     }
     with httpx.Client(timeout=OPENAI_REQUEST_TIMEOUT_SECONDS) as client:
         response = client.post(
@@ -268,23 +286,73 @@ def _question_text_matches(candidate: str, expected: str) -> bool:
 
 
 def transcript_contains_question(transcript: str, question_text: str) -> bool:
-    transcript_words = _normalized_words(transcript)
-    question_words = _normalized_words(question_text)
-    if not transcript_words or not question_words:
-        return False
-    transcript_text = " ".join(transcript_words)
-    question_text_normalized = " ".join(question_words)
-    if question_text_normalized in transcript_text:
-        return True
-    window_size = len(question_words)
-    minimum = max(1, window_size - 2)
-    maximum = min(len(transcript_words), window_size + 2)
-    for size in range(minimum, maximum + 1):
-        for start in range(0, len(transcript_words) - size + 1):
-            window = " ".join(transcript_words[start : start + size])
-            if SequenceMatcher(None, window, question_text_normalized).ratio() >= 0.84:
-                return True
-    return False
+    return _best_fuzzy_text_span(transcript, question_text, minimum_score=0.78) is not None
+
+
+def _infer_response_status(answer: str | None) -> str:
+    cleaned = answer.strip() if isinstance(answer, str) else ""
+    if not cleaned:
+        return "no_answer"
+    normalized = " ".join(_normalized_words(cleaned))
+    unsure_phrases = (
+        "i don t know",
+        "i don t quite know",
+        "i do not know",
+        "i do not quite know",
+        "not sure",
+        "don t understand",
+        "do not understand",
+        "don t quite get",
+        "do not quite get",
+        "can t answer",
+        "cannot answer",
+        "no opinion",
+    )
+    if any(phrase in normalized for phrase in unsure_phrases):
+        return "respondent_unsure"
+    return "answered"
+
+
+def _normalized_response_status(raw_status: Any, answer: str | None) -> str:
+    status = str(raw_status or "").strip().lower()
+    if status in {"answered", "respondent_unsure", "no_answer"}:
+        return status
+    return _infer_response_status(answer)
+
+
+def _yes_no_polarity(value: str) -> str | None:
+    normalized = " ".join(_normalized_words(value))
+    if not normalized:
+        return None
+    tokens = set(normalized.split())
+    polarities: set[str] = set()
+    if tokens.intersection({"yes", "yeah", "yep"}):
+        polarities.add("yes")
+    if tokens.intersection({"no", "nope"}):
+        polarities.add("no")
+    if any(
+        phrase in normalized
+        for phrase in (
+            "not sure",
+            "i don t know",
+            "i do not know",
+            "don t know",
+            "do not know",
+        )
+    ):
+        polarities.add("not_sure")
+    return next(iter(polarities)) if len(polarities) == 1 else None
+
+
+def _yes_no_evidence_polarity(transcript: str, question_text: str) -> str | None:
+    question_span = _best_fuzzy_text_span(transcript, question_text)
+    if question_span is None:
+        return None
+    answer_after_question = transcript[question_span[1] :]
+    # A direct yes/no response should occur immediately after the question. Keeping
+    # this window short prevents a later question's answer from being misattributed.
+    answer_window = " ".join(answer_after_question.split()[:5])
+    return _yes_no_polarity(answer_window)
 
 
 def _follow_up_result(
@@ -308,6 +376,11 @@ def _follow_up_result(
         "question": question_text,
         "asked_in_transcript": asked,
         "extracted_answer": extracted,
+        "response_status": (
+            _normalized_response_status(raw.get("response_status"), extracted)
+            if asked
+            else "not_asked"
+        ),
         "confidence": confidence,
         "clarification_needed": clarification_needed,
     }
@@ -353,8 +426,43 @@ def validate_matches(
             match["matched_question_id"] = question_id
         match["matched_question"] = str(match.get("matched_question") or question.get("question") or "")
         match["extracted_answer"] = str(match.get("extracted_answer") or "")
+        match["asked_in_transcript"] = bool(match.get("asked_in_transcript")) or (
+            transcript_contains_question(transcript, str(question.get("question") or ""))
+            if transcript
+            else bool(match["extracted_answer"])
+        )
+        match["response_status"] = _normalized_response_status(
+            match.get("response_status"),
+            match["extracted_answer"],
+        )
         match["confidence"] = str(match.get("confidence") or "low").lower()
         match["clarification_needed"] = bool(match.get("clarification_needed"))
+        if match["response_status"] == "no_answer":
+            match["confidence"] = "low"
+            match["clarification_needed"] = True
+        if transcript:
+            evidence = transcript_snippet(transcript, match, questions)
+            if not evidence.startswith("Relevant transcript segment could not"):
+                match["supporting_transcript"] = evidence
+            else:
+                match["supporting_transcript"] = None
+                match["confidence"] = "low"
+                match["clarification_needed"] = True
+
+        if str(question.get("type", "")).lower() == "yes-no" and transcript:
+            extracted_polarity = _yes_no_polarity(match["extracted_answer"])
+            evidence_polarity = _yes_no_evidence_polarity(
+                transcript,
+                str(question.get("question") or ""),
+            )
+            if (
+                extracted_polarity is not None
+                and evidence_polarity is not None
+                and extracted_polarity != evidence_polarity
+            ):
+                match["confidence"] = "low"
+                match["clarification_needed"] = True
+                match["validation_issue"] = "yes_no_answer_evidence_contradiction"
 
         if str(question.get("type", "")).lower() == "multiple-choice":
             options = [item for item in question.get("options", []) if isinstance(item, dict)]
@@ -390,6 +498,21 @@ def validate_matches(
             raw_follow_up,
             asked_in_transcript=transcript_contains_question(transcript, configured_follow_up),
         )
+        follow_up = match["follow_up"]
+        if follow_up["asked_in_transcript"] and transcript:
+            evidence = transcript_snippet(
+                transcript,
+                match,
+                questions,
+                question_text=configured_follow_up,
+            )
+            follow_up["supporting_transcript"] = (
+                evidence
+                if not evidence.startswith("Relevant transcript segment could not")
+                else None
+            )
+        else:
+            follow_up["supporting_transcript"] = None
 
     checked = checked_codes_by_question_id or {}
     by_id = {str(match.get("matched_question_id")): match for match in normalized}
@@ -436,6 +559,122 @@ def validate_matches(
     return normalized
 
 
+def spoken_questions_missing_from_matches(
+    transcript: str,
+    questions: list[dict[str, Any]],
+    matches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    matched_ids = {str(match.get("matched_question_id")) for match in matches}
+    return [
+        question
+        for question in questions
+        if str(question.get("id")) not in matched_ids
+        and transcript_contains_question(transcript, str(question.get("question") or ""))
+    ]
+
+
+def recover_omitted_question_matches(
+    transcript: str,
+    questions: list[dict[str, Any]],
+    matches: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, list[str]]:
+    missing_questions = spoken_questions_missing_from_matches(transcript, questions, matches)
+    missing_ids = [str(question.get("id")) for question in missing_questions]
+    if not missing_questions:
+        return matches, None, []
+
+    recovery_sections: list[str] = []
+    for question in missing_questions:
+        question_id = question.get("id")
+        segment = transcript_snippet(
+            transcript,
+            {"matched_question_id": question_id},
+            questions,
+        )
+        recovery_sections.append(
+            f"Question {question_id} relevant transcript segment:\n{segment}"
+        )
+    recovery_transcript = "\n\n".join(recovery_sections)
+    raw_recovered, recovery_response = analyze_transcript(
+        recovery_transcript,
+        missing_questions,
+    )
+    recovered = validate_matches(
+        raw_recovered,
+        questions,
+        transcript=transcript,
+    )
+
+    missing_id_set = set(missing_ids)
+    recovered_by_id = {
+        str(match.get("matched_question_id")): match
+        for match in recovered
+        if str(match.get("matched_question_id")) in missing_id_set
+    }
+    combined = list(matches)
+    for question in missing_questions:
+        question_id = str(question.get("id"))
+        recovered_match = recovered_by_id.get(question_id)
+        if recovered_match is not None:
+            recovered_match["recovered_after_completeness_check"] = True
+            combined.append(recovered_match)
+            continue
+
+        try:
+            normalized_id: Any = int(question_id)
+        except ValueError:
+            normalized_id = question_id
+        evidence = transcript_snippet(
+            transcript,
+            {"matched_question_id": normalized_id},
+            questions,
+        )
+        placeholder: dict[str, Any] = {
+            "matched_question_id": normalized_id,
+            "matched_question": str(question.get("question") or ""),
+            "extracted_answer": "",
+            "asked_in_transcript": True,
+            "response_status": "no_answer",
+            "supporting_transcript": evidence,
+            "confidence": "low",
+            "clarification_needed": True,
+            "recovered_after_completeness_check": False,
+            "completeness_issue": "spoken_question_missing_after_targeted_retry",
+        }
+        configured_follow_up = question.get("follow_up")
+        if isinstance(configured_follow_up, str) and configured_follow_up.strip():
+            follow_up_asked = transcript_contains_question(transcript, configured_follow_up)
+            placeholder["follow_up"] = _follow_up_result(
+                configured_follow_up,
+                None,
+                asked_in_transcript=follow_up_asked,
+            )
+            placeholder["follow_up"]["supporting_transcript"] = (
+                transcript_snippet(
+                    transcript,
+                    placeholder,
+                    questions,
+                    question_text=configured_follow_up,
+                )
+                if follow_up_asked
+                else None
+            )
+        combined.append(placeholder)
+
+    question_text_by_id = {
+        str(question.get("id")): str(question.get("question") or "")
+        for question in questions
+    }
+
+    def transcript_order(match: dict[str, Any]) -> int:
+        question_text = question_text_by_id.get(str(match.get("matched_question_id")), "")
+        span = _best_fuzzy_text_span(transcript, question_text, minimum_score=0.78)
+        return span[0] if span is not None else len(transcript)
+
+    combined.sort(key=transcript_order)
+    return combined, recovery_response, missing_ids
+
+
 def needs_clarification(match: dict[str, Any]) -> bool:
     return _base_match_needs_clarification(match) or _follow_up_needs_clarification(match)
 
@@ -443,7 +682,11 @@ def needs_clarification(match: dict[str, Any]) -> bool:
 def _base_match_needs_clarification(match: dict[str, Any]) -> bool:
     if match.get("manually_clarified") is True or match.get("answer_source") == "interviewer_checked":
         return False
-    return bool(match.get("clarification_needed")) or str(match.get("confidence", "")).lower() != "high"
+    return (
+        match.get("response_status") == "no_answer"
+        or bool(match.get("clarification_needed"))
+        or str(match.get("confidence", "")).lower() != "high"
+    )
 
 
 def _follow_up_needs_clarification(match: dict[str, Any]) -> bool:
@@ -465,21 +708,79 @@ def transcript_snippet(
     transcript: str,
     match: dict[str, Any],
     questions: list[dict[str, Any]],
-    radius: int = 120,
     question_text: str | None = None,
 ) -> str:
     question_id = str(match.get("matched_question_id", ""))
     question = next((item for item in questions if str(item.get("id")) == question_id), {})
-    terms = [str(value) for value in question.get("keywords", []) if str(value).strip()]
-    terms.extend(str(question_text or question.get("question", "")).replace("?", "").split())
-    lower = transcript.lower()
-    positions = [lower.find(term.lower()) for term in terms if len(term) > 2 and lower.find(term.lower()) >= 0]
-    if not positions:
-        return transcript[:240] + ("..." if len(transcript) > 240 else "")
-    position = min(positions)
-    start = max(0, position - radius)
-    end = min(len(transcript), position + radius)
-    return transcript[start:end].strip()
+    target_text = str(question_text or question.get("question", "")).strip()
+    target_span = _best_fuzzy_text_span(transcript, target_text)
+    if target_span is None:
+        return "Relevant transcript segment could not be located automatically."
+
+    start, question_end = target_span
+    next_question_starts: list[int] = []
+    for item in questions:
+        candidate_texts = [item.get("question"), item.get("follow_up")]
+        for candidate in candidate_texts:
+            if not isinstance(candidate, str) or not candidate.strip():
+                continue
+            if _question_text_matches(candidate, target_text):
+                continue
+            candidate_span = _best_fuzzy_text_span(transcript, candidate)
+            if candidate_span is not None and candidate_span[0] >= question_end:
+                next_question_starts.append(candidate_span[0])
+
+    natural_end = min(next_question_starts) if next_question_starts else len(transcript)
+    end = min(natural_end, start + 800)
+    snippet = transcript[start:end].strip()
+    if end < natural_end:
+        snippet += "..."
+    return snippet
+
+
+def _best_fuzzy_text_span(
+    transcript: str,
+    expected_text: str,
+    *,
+    minimum_score: float = 0.68,
+) -> tuple[int, int] | None:
+    transcript_tokens = [
+        (match.group(0).lower(), match.start(), match.end())
+        for match in re.finditer(r"[a-z0-9]+", transcript.lower())
+    ]
+    expected_words = _normalized_words(expected_text)
+    if not transcript_tokens or not expected_words:
+        return None
+
+    expected = " ".join(expected_words)
+    transcript_words = [token[0] for token in transcript_tokens]
+    longest_match = SequenceMatcher(
+        None,
+        expected_words,
+        transcript_words,
+        autojunk=False,
+    ).find_longest_match()
+    if longest_match.size < min(2, len(expected_words)):
+        return None
+
+    estimated_start = max(0, longest_match.b - longest_match.a)
+    best_score = 0.0
+    best_span: tuple[int, int] | None = None
+    expected_count = len(expected_words)
+    candidate_starts = range(
+        max(0, estimated_start - 4),
+        min(len(transcript_tokens), estimated_start + 5),
+    )
+    for size in range(max(1, expected_count - 3), min(len(transcript_tokens), expected_count + 3) + 1):
+        for index in candidate_starts:
+            if index + size > len(transcript_tokens):
+                continue
+            candidate = " ".join(token[0] for token in transcript_tokens[index : index + size])
+            score = SequenceMatcher(None, candidate, expected).ratio()
+            if score > best_score:
+                best_score = score
+                best_span = (transcript_tokens[index][1], transcript_tokens[index + size - 1][2])
+    return best_span if best_score >= minimum_score else None
 
 
 def clarification_requests(

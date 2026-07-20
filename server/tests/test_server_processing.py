@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from server.app import server_processing
 
@@ -52,7 +53,9 @@ class ServerProcessingTests(unittest.TestCase):
         self.assertIn("Always output **valid JSON only**", prompt)
         self.assertIn("follow-up belongs inside its parent question", prompt)
         self.assertIn('"asked_in_transcript"', prompt)
-        self.assertNotIn("supporting_transcript", prompt)
+        self.assertIn("perform a second completeness pass", prompt)
+        self.assertIn("supporting_transcript", prompt)
+        self.assertIn("respondent_unsure", prompt)
 
     def test_spoken_follow_up_is_preserved_as_nested_result(self):
         questions = [
@@ -183,6 +186,197 @@ class ServerProcessingTests(unittest.TestCase):
         self.assertEqual(requests[0]["allowed_answers"], ["Yes", "No", "Not sure"])
         self.assertIn("shade trees no", requests[0]["transcript_segment"])
 
+    def test_yes_no_answer_contradicting_transcript_forces_clarification(self):
+        matches = server_processing.validate_matches(
+            [
+                {
+                    "matched_question_id": 2,
+                    "matched_question": "Are there shade trees?",
+                    "extracted_answer": "Yes",
+                    "confidence": "high",
+                    "clarification_needed": False,
+                }
+            ],
+            QUESTIONS,
+            transcript=(
+                "Are there shade trees no is there grass flowers and landscaping yes "
+                "are there drinking fountains yes"
+            ),
+        )
+
+        self.assertEqual(matches[0]["validation_issue"], "yes_no_answer_evidence_contradiction")
+        self.assertEqual(matches[0]["confidence"], "low")
+        self.assertTrue(server_processing.needs_clarification(matches[0]))
+
+    def test_clarification_segment_starts_at_question_and_stops_before_next_question(self):
+        questions = [
+            {
+                "id": 1,
+                "question": "How do sidewalks affect your walking experience?",
+                "type": "impression",
+            },
+            {
+                "id": 6,
+                "question": (
+                    "What additional public services, ramps, pedestrian plazas, crossing buttons, "
+                    "do you think could help pedestrian comfort or safety?"
+                ),
+                "type": "impression",
+            },
+            {
+                "id": 7,
+                "question": "What public services should be more accessible?",
+                "type": "impression",
+            },
+        ]
+        transcript = (
+            "How do sidewalks affect your walking experience? Broken sidewalks make walking hard. "
+            "What additional public services ramps pedestrian plazas crossing buttons do you think "
+            "could help pedestrian comfort or safety? I do not quite know about it to be honest. "
+            "What public services should be more accessible? Bikes, I would say."
+        )
+        segment = server_processing.transcript_snippet(
+            transcript,
+            {
+                "matched_question_id": 6,
+                "matched_question": questions[1]["question"],
+                "extracted_answer": "I do not quite know",
+            },
+            questions,
+        )
+
+        self.assertTrue(segment.startswith("What additional public services"))
+        self.assertIn("I do not quite know about it", segment)
+        self.assertNotIn("Broken sidewalks", segment)
+        self.assertNotIn("Bikes, I would say", segment)
+
+    def test_missing_spoken_questions_receive_targeted_recovery_or_clarification(self):
+        questions = [
+            {
+                "id": 3,
+                "question": "What is something you don't like about public areas such as bus stops?",
+                "type": "impression",
+            },
+            {
+                "id": 6,
+                "question": "What additional public services could help pedestrian safety?",
+                "type": "impression",
+            },
+            {
+                "id": 7,
+                "question": "What public services should be more accessible?",
+                "type": "impression",
+            },
+            {
+                "id": 8,
+                "question": "Should e-bikes and e-scooters have more regulations?",
+                "type": "impression",
+            },
+            {
+                "id": 9,
+                "question": "Do you think intersections make it difficult to walk?",
+                "type": "impression",
+            },
+        ]
+        transcript = (
+            "What is something you don't like about public areas such as bus stops? They are dirty. "
+            "What additional public services could help pedestrian safety? I don't quite know about it. "
+            "What public services should be more accessible? Bikes, I would say. "
+            "Should e-bikes and e-scooters have more regulations? Yes, they move too fast. "
+            "Do you think intersections make it difficult to walk? A little bit, especially for slow walkers."
+        )
+        initial = server_processing.validate_matches(
+            [
+                {
+                    "matched_question_id": 8,
+                    "matched_question": questions[3]["question"],
+                    "extracted_answer": "Yes, they move too fast",
+                    "confidence": "high",
+                    "clarification_needed": False,
+                }
+            ],
+            questions,
+            transcript=transcript,
+        )
+        recovery_response = {"id": "recovery-response"}
+        with patch.object(
+            server_processing,
+            "analyze_transcript",
+            return_value=(
+                [
+                    {
+                        "matched_question_id": 3,
+                        "extracted_answer": "They are dirty",
+                        "confidence": "high",
+                    },
+                    {
+                        "matched_question_id": 6,
+                        "extracted_answer": "I don't quite know about it",
+                        "confidence": "high",
+                    },
+                    {
+                        "matched_question_id": 7,
+                        "extracted_answer": "Bikes",
+                        "confidence": "high",
+                    },
+                ],
+                recovery_response,
+            ),
+        ):
+            recovered, raw_recovery, missing_ids = (
+                server_processing.recover_omitted_question_matches(
+                    transcript,
+                    questions,
+                    initial,
+                )
+            )
+
+        self.assertEqual([str(item["matched_question_id"]) for item in recovered], ["3", "6", "7", "8", "9"])
+        self.assertEqual(missing_ids, ["3", "6", "7", "9"])
+        self.assertEqual(raw_recovery, recovery_response)
+        question_six = next(item for item in recovered if str(item["matched_question_id"]) == "6")
+        self.assertEqual(question_six["response_status"], "respondent_unsure")
+        self.assertFalse(server_processing.needs_clarification(question_six))
+        self.assertIn("I don't quite know about it", question_six["supporting_transcript"])
+        question_nine = next(item for item in recovered if str(item["matched_question_id"]) == "9")
+        self.assertEqual(question_nine["completeness_issue"], "spoken_question_missing_after_targeted_retry")
+        self.assertTrue(server_processing.needs_clarification(question_nine))
+
+    def test_unasked_question_does_not_trigger_completeness_recovery(self):
+        questions = [
+            {
+                "id": 6,
+                "question": "What additional public services could help pedestrian safety?",
+                "type": "impression",
+            },
+            {
+                "id": 7,
+                "question": "What public services should be more accessible?",
+                "type": "impression",
+            },
+        ]
+        transcript = "What public services should be more accessible? Bikes, I would say."
+        matches = server_processing.validate_matches(
+            [
+                {
+                    "matched_question_id": 7,
+                    "extracted_answer": "Bikes",
+                    "confidence": "high",
+                }
+            ],
+            questions,
+            transcript=transcript,
+        )
+
+        self.assertEqual(
+            server_processing.spoken_questions_missing_from_matches(
+                transcript,
+                questions,
+                matches,
+            ),
+            [],
+        )
+
     def test_server_package_preserves_audio_and_processing_provenance(self):
         package = server_processing.build_session_package(
             {
@@ -204,6 +398,7 @@ class ServerProcessingTests(unittest.TestCase):
         self.assertEqual(package["local_session_id"], "local-1")
         self.assertEqual(package["audio"]["recorded_at_ms"], 100250)
         self.assertEqual(package["metadata"]["processing"]["transcription_model"], "gpt-4o-mini-transcribe")
+        self.assertEqual(package["metadata"]["processing"]["analysis_model"], "gpt-4o")
         self.assertEqual(package["metadata"]["processing"]["revision"], 2)
 
 

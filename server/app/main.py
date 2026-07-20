@@ -29,6 +29,7 @@ from .server_processing import (
     build_session_package,
     clarification_requests,
     needs_clarification,
+    recover_omitted_question_matches,
     transcribe_audio,
     validate_matches,
 )
@@ -2225,6 +2226,7 @@ def process_claimed_job(row: dict[str, Any]) -> None:
             )
 
     raw_analysis_path = session_dir / "raw_analysis_response.json"
+    recovery_analysis_path = session_dir / "raw_analysis_recovery_response.json"
     draft_path = session_dir / "draft_analysis.json"
     if draft_path.is_file() and draft_path.stat().st_size > 0:
         draft = json.loads(draft_path.read_text(encoding="utf-8"))
@@ -2238,13 +2240,26 @@ def process_claimed_job(row: dict[str, Any]) -> None:
             else {},
             transcript=transcript,
         )
+        matches, recovery_analysis, initially_missing_question_ids = (
+            recover_omitted_question_matches(
+                transcript,
+                questions,
+                matches,
+            )
+        )
         draft = {
             "input_manifest": input_manifest,
             "transcript": transcript,
             "questions": questions,
             "matches": matches,
+            "completeness_check": {
+                "targeted_recovery_used": recovery_analysis is not None,
+                "initially_missing_spoken_question_ids": initially_missing_question_ids,
+            },
         }
         write_json_atomic(raw_analysis_path, raw_analysis)
+        if recovery_analysis is not None:
+            write_json_atomic(recovery_analysis_path, recovery_analysis)
         write_json_atomic(draft_path, draft)
 
     relative_raw_analysis = str(Path(session_id) / raw_analysis_path.name)

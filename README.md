@@ -1,6 +1,6 @@
 # Questionnaire LLM iOS App
 
-A Swift iOS app for field researchers to collect location-based street assessments. The app durably saves each original `.m4a`, uploads the recording and frozen interview inputs, and immediately returns to collection. A GCP-hosted FastAPI worker uses OpenAI `gpt-4o-mini-transcribe`, performs answer analysis, requests interviewer clarification when necessary, and creates the canonical `session.json`.
+A Swift iOS app for field researchers to collect location-based street assessments. The app durably saves each original `.m4a`, uploads the recording and frozen interview inputs, and immediately returns to collection. A GCP-hosted FastAPI worker uses OpenAI `gpt-4o-mini-transcribe` for speech-to-text and `gpt-4o` for answer analysis, requests interviewer clarification when necessary, and creates the canonical `session.json`.
 
 ## Architecture
 
@@ -25,7 +25,7 @@ flowchart LR
 | Component | Role |
 |-----------|------|
 | **iOS app** | Durable local recording, GPS/place/no-location resolution, input upload, status/result caching, and clarification UI |
-| **Processing worker** | Server-only `gpt-4o-mini-transcribe`, existing answer-analysis prompt, retries, and final package generation |
+| **Processing worker** | Server-only `gpt-4o-mini-transcribe`, `gpt-4o` answer analysis, completeness recovery, retries, and final package generation |
 | **Survey API** (`server/`) | Creates respondent/session IDs, durably accepts audio/input, exposes job/result APIs, and stores packages |
 | **MySQL** | Cloud SQL or any MySQL 8+ instance used as an index for session package paths and searchable metadata |
 
@@ -124,7 +124,7 @@ When the Survey API is configured:
 - When capacity information is available, recording is blocked below a 100 MB safety threshold. Stop verifies that the original `.m4a` is readable and nonzero before the interview can reset or begin processing.
 - Before recording, the app requires an interviewer profile. If the Survey API is configured, the app resolves/registers the interviewer with `POST /interviewers/resolve`; otherwise it stores the profile locally.
 - After **Analyze Answers** from the recording review flow, the app preserves the `.m4a`, freezes questionnaire/respondent/location/interviewer data in `processing_input.json`, queues both files with `POST /sessions/{id}/processing-input`, and immediately returns to the next interview.
-- A separate server worker claims the durable MySQL job, transcribes with `gpt-4o-mini-transcribe`, runs answer analysis, and writes audit artifacts without changing the original audio.
+- A separate server worker claims the durable MySQL job, transcribes with `gpt-4o-mini-transcribe`, analyzes with `gpt-4o`, and writes audit artifacts without changing the original audio. The prompt reviews every questionnaire question twice; server validation detects spoken question IDs omitted by the first response, runs one targeted recovery pass, and sends any remaining omission to clarification instead of silently dropping it.
 - Medium/low-confidence or explicitly ambiguous matches put the job in `needs_review`. The Dashboard fetches the server clarification requests, submits the interviewer's answers with the expected revision, and the server alone generates the final `session.json`.
 - Configured follow-ups are stored inside their parent match as a distinct `follow_up` object with the exact follow-up question, an `asked_in_transcript` flag, and independent answer/confidence/clarification fields. A spoken follow-up that lacks a usable answer creates its own follow-up clarification request instead of disappearing or reusing the parent answer.
 - The app polls/synchronizes lightweight status on Dashboard refresh and manual retry. When a job completes, it downloads and atomically caches the canonical server result locally for dashboard and aggregation use.
@@ -168,7 +168,7 @@ AUDIO_MAX_BYTES=209715200
 OPENAI_API_KEY=your-openai-api-key
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
-OPENAI_ANALYSIS_MODEL=gpt-4o-mini
+OPENAI_ANALYSIS_MODEL=gpt-4o
 OPENAI_REQUEST_TIMEOUT_SECONDS=180
 
 # OpenAI transcription uploads are limited separately from legacy package audio.
@@ -200,6 +200,7 @@ survey_session_packages/
     ├── transcript.txt
     ├── raw_transcription_response.json
     ├── raw_analysis_response.json
+    ├── raw_analysis_recovery_response.json  # only when spoken questions were initially omitted
     ├── draft_analysis.json
     └── session.json
 ```
@@ -348,7 +349,7 @@ The iOS app includes a native **Dashboard** button on the main screen. It is int
 - Local sessions come from `Documents/SurveySessions/<local-session-id>/session_state.json` and/or a completed `session.json`, so recordings awaiting upload or server processing remain visible after relaunch.
 - Rows and detail views show the server-backed state: not submitted, queued, transcribing, analyzing, clarification required, completed, retryable failure, or terminal failure. Local saving alone is never labeled **Uploaded** or **Analysis complete**.
 - **Retry Now**, **Retry All**, and selected-session retry submit eligible recordings sequentially and synchronize existing jobs. They never run Apple Speech or an LLM on the device.
-- A clarification-required session opens the server's question, proposed answer, and transcript segment. The interviewer can choose a structured Yes/No or multiple-choice answer, enter a custom answer, and add a note. Submission is revision-checked so stale screens cannot overwrite a newer result.
+- A clarification-required session opens the server's question, proposed answer, and the relevant question-and-answer transcript segment. The server fuzzy-matches the spoken question and stops the excerpt before the next questionnaire question instead of showing the beginning of the interview. The interviewer can choose a structured Yes/No or multiple-choice answer, enter a custom answer, and add a note. Submission is revision-checked so stale screens cannot overwrite a newer result.
 - Completed results are downloaded from `GET /processing-jobs/{session_id}/result` and atomically cached as the same schema-v3 `session.json` used by the server package index.
 - Detail views explicitly say when the original recording is safe on the device and preserve nullable/pending location state without mislabeling searched places as GPS. Location correction is handled by the separate authenticated web admin dashboard.
 - Device-mode Apple Maps fallback locations appear as non-GPS pins in the native map. The dashboard uses saved coordinates when available and can resolve an older searched-place package's stored address for display when its coordinate fields are missing, without rewriting the canonical session JSON.
