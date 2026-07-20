@@ -323,7 +323,7 @@ class ServerProcessingTests(unittest.TestCase):
                 recovery_response,
             ),
         ):
-            recovered, raw_recovery, missing_ids = (
+            recovered, raw_recovery, audit = (
                 server_processing.recover_omitted_question_matches(
                     transcript,
                     questions,
@@ -332,7 +332,8 @@ class ServerProcessingTests(unittest.TestCase):
             )
 
         self.assertEqual([str(item["matched_question_id"]) for item in recovered], ["3", "6", "7", "8", "9"])
-        self.assertEqual(missing_ids, ["3", "6", "7", "9"])
+        self.assertEqual(audit["initially_missing_question_ids"], ["3", "6", "7", "9"])
+        self.assertEqual(audit["pipeline_version"], 2)
         self.assertEqual(raw_recovery, recovery_response)
         question_six = next(item for item in recovered if str(item["matched_question_id"]) == "6")
         self.assertEqual(question_six["response_status"], "respondent_unsure")
@@ -341,6 +342,74 @@ class ServerProcessingTests(unittest.TestCase):
         question_nine = next(item for item in recovered if str(item["matched_question_id"]) == "9")
         self.assertEqual(question_nine["completeness_issue"], "spoken_question_missing_after_targeted_retry")
         self.assertTrue(server_processing.needs_clarification(question_nine))
+
+    def test_parenthetical_free_bus_lane_question_is_recovered(self):
+        questions = [
+            {
+                "id": 10,
+                "question": "Do you think crosswalk time should be longer?",
+                "type": "impression",
+            },
+            {
+                "id": 11,
+                "question": "Do we need more bus-exclusive lanes (where only buses can run)?",
+                "type": "impression",
+            },
+            {
+                "id": 12,
+                "question": "What do you think about congestion pricing?",
+                "type": "impression",
+            },
+        ]
+        transcript = (
+            "Do you think crosswalk time should be longer? It depends. "
+            "So do we need more bus exclusive lanes? I think so, yeah. It can decrease delays. "
+            "What do you think about congestion pricing? I think it is ridiculous."
+        )
+        initial = server_processing.validate_matches(
+            [
+                {"matched_question_id": 10, "extracted_answer": "It depends", "confidence": "high"},
+                {
+                    "matched_question_id": 12,
+                    "extracted_answer": "I think it is ridiculous",
+                    "confidence": "high",
+                },
+            ],
+            questions,
+            transcript=transcript,
+        )
+        with patch.object(
+            server_processing,
+            "analyze_transcript",
+            return_value=(
+                [
+                    {
+                        "matched_question_id": 11,
+                        "extracted_answer": "I think so, yeah. It can decrease delays.",
+                        "supporting_transcript": (
+                            "So do we need more bus exclusive lanes? I think so, yeah. "
+                            "It can decrease delays."
+                        ),
+                        "confidence": "high",
+                    }
+                ],
+                {"id": "bus-lane-recovery"},
+            ),
+        ):
+            recovered, _, audit = server_processing.recover_omitted_question_matches(
+                transcript,
+                questions,
+                initial,
+            )
+
+        self.assertEqual([item["matched_question_id"] for item in recovered], [10, 11, 12])
+        self.assertEqual(audit["deterministically_located_question_ids"], ["11"])
+        self.assertEqual(audit["recovered_question_ids"], ["11"])
+        self.assertEqual(audit["unasked_question_ids"], [])
+        bus_lane = recovered[1]
+        self.assertTrue(bus_lane["recovered_after_completeness_check"])
+        self.assertIn("bus exclusive lanes", bus_lane["supporting_transcript"])
+        self.assertNotIn("congestion pricing", bus_lane["supporting_transcript"])
 
     def test_unasked_question_does_not_trigger_completeness_recovery(self):
         questions = [
@@ -377,6 +446,56 @@ class ServerProcessingTests(unittest.TestCase):
             [],
         )
 
+        with patch.object(
+            server_processing,
+            "analyze_transcript",
+            return_value=([], {"id": "unasked-audit"}),
+        ) as analyze:
+            recovered, _, audit = server_processing.recover_omitted_question_matches(
+                transcript,
+                questions,
+                matches,
+            )
+
+        analyze.assert_called_once_with(transcript, [questions[0]])
+        self.assertEqual([item["matched_question_id"] for item in recovered], [7])
+        self.assertEqual(audit["unasked_question_ids"], ["6"])
+        self.assertEqual(audit["deterministically_located_question_ids"], [])
+
+    def test_unverified_completeness_answer_cannot_create_false_match(self):
+        questions = [
+            {
+                "id": 6,
+                "question": "What additional public services could help pedestrian safety?",
+                "type": "impression",
+            }
+        ]
+        transcript = "The weather is pleasant and the buildings look clean."
+        with patch.object(
+            server_processing,
+            "analyze_transcript",
+            return_value=(
+                [
+                    {
+                        "matched_question_id": 6,
+                        "extracted_answer": "More crossing buttons",
+                        "supporting_transcript": "The weather is pleasant",
+                        "confidence": "high",
+                    }
+                ],
+                {"id": "hallucinated-audit"},
+            ),
+        ):
+            recovered, _, audit = server_processing.recover_omitted_question_matches(
+                transcript,
+                questions,
+                [],
+            )
+
+        self.assertEqual(recovered, [])
+        self.assertEqual(audit["unasked_question_ids"], ["6"])
+        self.assertEqual(audit["rejected_unverified_question_ids"], ["6"])
+
     def test_server_package_preserves_audio_and_processing_provenance(self):
         package = server_processing.build_session_package(
             {
@@ -399,6 +518,8 @@ class ServerProcessingTests(unittest.TestCase):
         self.assertEqual(package["audio"]["recorded_at_ms"], 100250)
         self.assertEqual(package["metadata"]["processing"]["transcription_model"], "gpt-4o-mini-transcribe")
         self.assertEqual(package["metadata"]["processing"]["analysis_model"], "gpt-4o")
+        self.assertEqual(package["metadata"]["processing"]["analysis_pipeline_version"], 2)
+        self.assertEqual(package["completeness_check"]["pipeline_version"], 2)
         self.assertEqual(package["metadata"]["processing"]["revision"], 2)
 
 

@@ -2039,6 +2039,11 @@ def _finalize_processing_job(row: dict[str, Any], draft: dict[str, Any], revisio
         transcript=draft["transcript"],
         matches=draft["matches"],
         revision=revision,
+        completeness_check=(
+            draft.get("completeness_check")
+            if isinstance(draft.get("completeness_check"), dict)
+            else None
+        ),
     )
     result_path = session_dir / "session.json"
     json_bytes, json_sha256 = write_json_atomic(result_path, package)
@@ -2240,7 +2245,7 @@ def process_claimed_job(row: dict[str, Any]) -> None:
             else {},
             transcript=transcript,
         )
-        matches, recovery_analysis, initially_missing_question_ids = (
+        matches, recovery_analysis, completeness_check = (
             recover_omitted_question_matches(
                 transcript,
                 questions,
@@ -2252,10 +2257,7 @@ def process_claimed_job(row: dict[str, Any]) -> None:
             "transcript": transcript,
             "questions": questions,
             "matches": matches,
-            "completeness_check": {
-                "targeted_recovery_used": recovery_analysis is not None,
-                "initially_missing_spoken_question_ids": initially_missing_question_ids,
-            },
+            "completeness_check": completeness_check,
         }
         write_json_atomic(raw_analysis_path, raw_analysis)
         if recovery_analysis is not None:

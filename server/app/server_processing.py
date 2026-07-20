@@ -18,6 +18,7 @@ OPENAI_TRANSCRIPTION_MODEL = os.environ.get(
 ).strip()
 OPENAI_ANALYSIS_MODEL = os.environ.get("OPENAI_ANALYSIS_MODEL", "gpt-4o").strip()
 OPENAI_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("OPENAI_REQUEST_TIMEOUT_SECONDS", "180"))
+ANALYSIS_PIPELINE_VERSION = 2
 
 
 class ServerProcessingError(RuntimeError):
@@ -285,8 +286,39 @@ def _question_text_matches(candidate: str, expected: str) -> bool:
     return SequenceMatcher(None, candidate_text, expected_text).ratio() >= 0.82
 
 
+def _question_text_variants(question_text: str) -> list[str]:
+    variants = [question_text.strip()]
+    without_parenthetical = re.sub(r"\s*\([^)]*\)", "", question_text).strip()
+    if without_parenthetical and without_parenthetical != variants[0]:
+        variants.append(without_parenthetical)
+    return list(dict.fromkeys(value for value in variants if value))
+
+
+def _question_span(
+    transcript: str,
+    question_text: str,
+    *,
+    search_start: int = 0,
+    search_end: int | None = None,
+) -> tuple[int, int] | None:
+    bounded_end = len(transcript) if search_end is None else min(len(transcript), search_end)
+    if search_start >= bounded_end:
+        return None
+    region = transcript[search_start:bounded_end]
+    candidates: list[tuple[int, int]] = []
+    for index, variant in enumerate(_question_text_variants(question_text)):
+        span = _best_fuzzy_text_span(
+            region,
+            variant,
+            minimum_score=0.78 if index == 0 else 0.82,
+        )
+        if span is not None:
+            candidates.append((span[0] + search_start, span[1] + search_start))
+    return min(candidates, key=lambda item: item[0]) if candidates else None
+
+
 def transcript_contains_question(transcript: str, question_text: str) -> bool:
-    return _best_fuzzy_text_span(transcript, question_text, minimum_score=0.78) is not None
+    return _question_span(transcript, question_text) is not None
 
 
 def _infer_response_status(answer: str | None) -> str:
@@ -345,7 +377,7 @@ def _yes_no_polarity(value: str) -> str | None:
 
 
 def _yes_no_evidence_polarity(transcript: str, question_text: str) -> str | None:
-    question_span = _best_fuzzy_text_span(transcript, question_text)
+    question_span = _question_span(transcript, question_text)
     if question_span is None:
         return None
     answer_after_question = transcript[question_span[1] :]
@@ -573,34 +605,147 @@ def spoken_questions_missing_from_matches(
     ]
 
 
+def _question_search_bounds(
+    transcript: str,
+    questions: list[dict[str, Any]],
+    matches: list[dict[str, Any]],
+    target_question_id: str,
+) -> tuple[int, int]:
+    matched_ids = {str(match.get("matched_question_id")) for match in matches}
+    target_index = next(
+        (index for index, item in enumerate(questions) if str(item.get("id")) == target_question_id),
+        -1,
+    )
+    if target_index < 0:
+        return 0, len(transcript)
+
+    start = 0
+    for index in range(target_index - 1, -1, -1):
+        question = questions[index]
+        if str(question.get("id")) not in matched_ids:
+            continue
+        span = _question_span(transcript, str(question.get("question") or ""))
+        if span is not None:
+            start = span[1]
+            break
+
+    end = len(transcript)
+    for index in range(target_index + 1, len(questions)):
+        question = questions[index]
+        if str(question.get("id")) not in matched_ids:
+            continue
+        span = _question_span(transcript, str(question.get("question") or ""))
+        if span is not None and span[0] >= start:
+            end = span[0]
+            break
+    return start, end
+
+
+def _located_missing_question_spans(
+    transcript: str,
+    questions: list[dict[str, Any]],
+    matches: list[dict[str, Any]],
+    missing_questions: list[dict[str, Any]],
+) -> dict[str, tuple[int, int]]:
+    located: dict[str, tuple[int, int]] = {}
+    for question in missing_questions:
+        question_id = str(question.get("id"))
+        start, end = _question_search_bounds(
+            transcript,
+            questions,
+            matches,
+            question_id,
+        )
+        span = _question_span(
+            transcript,
+            str(question.get("question") or ""),
+            search_start=start,
+            search_end=end,
+        )
+        if span is not None:
+            located[question_id] = span
+    return located
+
+
+def _verified_supporting_evidence_span(
+    transcript: str,
+    question: dict[str, Any],
+    raw_match: dict[str, Any],
+) -> tuple[int, int] | None:
+    evidence = raw_match.get("supporting_transcript")
+    if not isinstance(evidence, str) or not evidence.strip():
+        return None
+    exact_start = transcript.casefold().find(evidence.strip().casefold())
+    if exact_start < 0:
+        return None
+    exact_end = exact_start + len(evidence.strip())
+
+    question_words = set(_normalized_words(str(question.get("question") or "")))
+    evidence_words = set(_normalized_words(evidence))
+    ignored = {
+        "a", "an", "and", "are", "as", "at", "be", "can", "do", "does", "for",
+        "how", "i", "in", "is", "it", "more", "of", "on", "or", "should", "that",
+        "the", "think", "to", "we", "what", "where", "which", "you", "your",
+    }
+    distinctive = question_words - ignored
+    overlap = distinctive.intersection(evidence_words)
+    minimum_overlap = min(3, len(distinctive))
+    if minimum_overlap == 0 or len(overlap) < minimum_overlap:
+        return None
+    return exact_start, exact_end
+
+
 def recover_omitted_question_matches(
     transcript: str,
     questions: list[dict[str, Any]],
     matches: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None, list[str]]:
-    missing_questions = spoken_questions_missing_from_matches(transcript, questions, matches)
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any]]:
+    matched_ids = {str(match.get("matched_question_id")) for match in matches}
+    missing_questions = [
+        question for question in questions if str(question.get("id")) not in matched_ids
+    ]
     missing_ids = [str(question.get("id")) for question in missing_questions]
+    empty_audit = {
+        "pipeline_version": ANALYSIS_PIPELINE_VERSION,
+        "initially_missing_question_ids": [],
+        "deterministically_located_question_ids": [],
+        "recovered_question_ids": [],
+        "clarification_placeholder_question_ids": [],
+        "unasked_question_ids": [],
+        "rejected_unverified_question_ids": [],
+    }
     if not missing_questions:
-        return matches, None, []
+        return matches, None, empty_audit
 
-    recovery_sections: list[str] = []
-    for question in missing_questions:
-        question_id = question.get("id")
-        segment = transcript_snippet(
-            transcript,
-            {"matched_question_id": question_id},
-            questions,
-        )
-        recovery_sections.append(
-            f"Question {question_id} relevant transcript segment:\n{segment}"
-        )
-    recovery_transcript = "\n\n".join(recovery_sections)
-    raw_recovered, recovery_response = analyze_transcript(
-        recovery_transcript,
+    located_spans = _located_missing_question_spans(
+        transcript,
+        questions,
+        matches,
         missing_questions,
     )
+    raw_recovered, recovery_response = analyze_transcript(
+        transcript,
+        missing_questions,
+    )
+    questions_by_id = {str(question.get("id")): question for question in missing_questions}
+    accepted_raw: list[dict[str, Any]] = []
+    rejected_unverified_ids: list[str] = []
+    for raw_match in raw_recovered:
+        question_id = str(raw_match.get("matched_question_id"))
+        question = questions_by_id.get(question_id)
+        if question is None:
+            continue
+        if question_id in located_spans or _verified_supporting_evidence_span(
+            transcript,
+            question,
+            raw_match,
+        ) is not None:
+            accepted_raw.append(raw_match)
+        else:
+            rejected_unverified_ids.append(question_id)
+
     recovered = validate_matches(
-        raw_recovered,
+        accepted_raw,
         questions,
         transcript=transcript,
     )
@@ -612,12 +757,18 @@ def recover_omitted_question_matches(
         if str(match.get("matched_question_id")) in missing_id_set
     }
     combined = list(matches)
+    recovered_ids: list[str] = []
+    placeholder_ids: list[str] = []
     for question in missing_questions:
         question_id = str(question.get("id"))
         recovered_match = recovered_by_id.get(question_id)
         if recovered_match is not None:
             recovered_match["recovered_after_completeness_check"] = True
             combined.append(recovered_match)
+            recovered_ids.append(question_id)
+            continue
+
+        if question_id not in located_spans:
             continue
 
         try:
@@ -660,6 +811,7 @@ def recover_omitted_question_matches(
                 else None
             )
         combined.append(placeholder)
+        placeholder_ids.append(question_id)
 
     question_text_by_id = {
         str(question.get("id")): str(question.get("question") or "")
@@ -668,11 +820,23 @@ def recover_omitted_question_matches(
 
     def transcript_order(match: dict[str, Any]) -> int:
         question_text = question_text_by_id.get(str(match.get("matched_question_id")), "")
-        span = _best_fuzzy_text_span(transcript, question_text, minimum_score=0.78)
+        span = _question_span(transcript, question_text)
         return span[0] if span is not None else len(transcript)
 
     combined.sort(key=transcript_order)
-    return combined, recovery_response, missing_ids
+    resolved_ids = set(recovered_ids).union(placeholder_ids)
+    audit = {
+        "pipeline_version": ANALYSIS_PIPELINE_VERSION,
+        "initially_missing_question_ids": missing_ids,
+        "deterministically_located_question_ids": list(located_spans),
+        "recovered_question_ids": recovered_ids,
+        "clarification_placeholder_question_ids": placeholder_ids,
+        "unasked_question_ids": [
+            question_id for question_id in missing_ids if question_id not in resolved_ids
+        ],
+        "rejected_unverified_question_ids": list(dict.fromkeys(rejected_unverified_ids)),
+    }
+    return combined, recovery_response, audit
 
 
 def needs_clarification(match: dict[str, Any]) -> bool:
@@ -713,7 +877,7 @@ def transcript_snippet(
     question_id = str(match.get("matched_question_id", ""))
     question = next((item for item in questions if str(item.get("id")) == question_id), {})
     target_text = str(question_text or question.get("question", "")).strip()
-    target_span = _best_fuzzy_text_span(transcript, target_text)
+    target_span = _question_span(transcript, target_text)
     if target_span is None:
         return "Relevant transcript segment could not be located automatically."
 
@@ -726,7 +890,7 @@ def transcript_snippet(
                 continue
             if _question_text_matches(candidate, target_text):
                 continue
-            candidate_span = _best_fuzzy_text_span(transcript, candidate)
+            candidate_span = _question_span(transcript, candidate)
             if candidate_span is not None and candidate_span[0] >= question_end:
                 next_question_starts.append(candidate_span[0])
 
@@ -852,6 +1016,7 @@ def build_session_package(
     transcript: str,
     matches: list[dict[str, Any]],
     revision: int,
+    completeness_check: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     timestamp = now.timestamp()
@@ -886,6 +1051,19 @@ def build_session_package(
     recording_start = input_manifest.get("location_point")
     if input_manifest.get("location_source") != "device_gps" or not isinstance(recording_start, dict):
         recording_start = None
+    normalized_completeness = (
+        completeness_check
+        if isinstance(completeness_check, dict)
+        else {
+            "pipeline_version": ANALYSIS_PIPELINE_VERSION,
+            "initially_missing_question_ids": [],
+            "deterministically_located_question_ids": [],
+            "recovered_question_ids": [],
+            "clarification_placeholder_question_ids": [],
+            "unasked_question_ids": [],
+            "rejected_unverified_question_ids": [],
+        }
+    )
     package = {
         "metadata": {
             "schema_version": 3,
@@ -898,6 +1076,7 @@ def build_session_package(
             "cloud": {"session_id": cloud_session_id, "respondent_id": cloud_respondent_id},
             "processing": {
                 "revision": revision,
+                "analysis_pipeline_version": ANALYSIS_PIPELINE_VERSION,
                 "transcription_model": OPENAI_TRANSCRIPTION_MODEL,
                 "analysis_model": OPENAI_ANALYSIS_MODEL,
                 "processed_on": "server",
@@ -922,5 +1101,6 @@ def build_session_package(
         "trajectory_points": trajectory,
         "transcription": transcript,
         "matched_questions": matches,
+        "completeness_check": normalized_completeness,
     }
     return package
