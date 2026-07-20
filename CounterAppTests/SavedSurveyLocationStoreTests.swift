@@ -314,6 +314,37 @@ struct SavedSurveyLocationStoreTests {
         #expect(result.location?.coordinate == nil)
     }
 
+    @Test func nativeDashboardMapsDevicePlaceSearchCoordinatesAndAddressFallback() throws {
+        let coordinateResult = LocalSessionDashboardLocationResolver.resolve(json: [
+            "location_info": [
+                "mode": "device",
+                "collection_method": "mapkit_place_search",
+                "location_name": "Canaan Senior Service Center",
+                "formatted_address": "1428 5th Ave, New York, NY",
+                "latitude": 40.7991,
+                "longitude": -73.9475
+            ]
+        ])
+
+        #expect(coordinateResult.location?.isPlaceSearch == true)
+        #expect(coordinateResult.location?.coordinate?.latitude == 40.7991)
+        #expect(coordinateResult.location?.coordinate?.longitude == -73.9475)
+
+        let addressOnlyResult = LocalSessionDashboardLocationResolver.resolve(json: [
+            "location_info": [
+                "mode": "device",
+                "collection_method": "mapkit_place_search",
+                "location_name": "Canaan Senior Service Center",
+                "formatted_address": "1428 5th Ave, New York, NY",
+                "latitude": NSNull(),
+                "longitude": NSNull()
+            ]
+        ])
+
+        #expect(addressOnlyResult.location?.coordinate == nil)
+        #expect(addressOnlyResult.location?.mapSearchQuery == "1428 5th Ave, New York, NY")
+    }
+
     private var defaultsSuiteName: String { "SavedSurveyLocationStoreTests" }
 
     private func temporaryDefaults() throws -> UserDefaults {

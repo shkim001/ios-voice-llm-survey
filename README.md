@@ -350,6 +350,7 @@ The iOS app includes a native **Dashboard** button on the main screen. It is int
 - A clarification-required session opens the server's question, proposed answer, and transcript segment. The interviewer can choose a structured Yes/No or multiple-choice answer, enter a custom answer, and add a note. Submission is revision-checked so stale screens cannot overwrite a newer result.
 - Completed results are downloaded from `GET /processing-jobs/{session_id}/result` and atomically cached as the same schema-v3 `session.json` used by the server package index.
 - Detail views explicitly say when the original recording is safe on the device and preserve nullable/pending location state without mislabeling searched places as GPS. Location correction is handled by the separate authenticated web admin dashboard.
+- Device-mode Apple Maps fallback locations appear as non-GPS pins in the native map. The dashboard uses saved coordinates when available and can resolve an older searched-place package's stored address for display when its coordinate fields are missing, without rewriting the canonical session JSON.
 - Session rows and detail pages show the interviewer saved in `interviewer_info`.
 - Tapping the dashboard refresh button calls `GET /admin/sessions` and fetches only the lightweight server session list.
 - Server-only sessions appear under **Available on server**.

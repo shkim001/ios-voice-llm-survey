@@ -30,6 +30,20 @@ struct LocalSessionDashboardSession {
             let value = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
             return CLLocationCoordinate2DIsValid(value) ? value : nil
         }
+
+        var isPlaceSearch: Bool {
+            source == "place_search" || collectionMethod == "mapkit_place_search"
+        }
+
+        var mapSearchQuery: String? {
+            guard isPlaceSearch else { return nil }
+            return [formattedAddress, label]
+                .compactMap { value in
+                    let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    return trimmed.isEmpty ? nil : trimmed
+                }
+                .first
+        }
     }
 
     struct MatchedAnswer {
@@ -84,6 +98,12 @@ struct LocalSessionDashboardSession {
             && statusSummary.primary != "Clarification required"
     }
 
+    var canShowMap: Bool {
+        !trajectoryPoints.isEmpty
+            || resolvedLocation?.coordinate != nil
+            || resolvedLocation?.mapSearchQuery != nil
+    }
+
 }
 
 enum LocalSessionDashboardLocationResolver {
@@ -93,6 +113,8 @@ enum LocalSessionDashboardLocationResolver {
     ) {
         let info = json["location_info"] as? [String: Any]
         let legacy = json["location"] as? [String: Any]
+        let coordinateSnapshot = json["location_coordinates"] as? [String: Any]
+        let placeSnapshot = json["place_snapshot"] as? [String: Any]
         let respondent = json["respondent_info"] as? [String: Any]
         let mode = nonEmptyString(info?["mode"])
         let collectionMethod = nonEmptyString(info?["collection_method"])
@@ -117,6 +139,7 @@ enum LocalSessionDashboardLocationResolver {
 
         let legacyTrajectory = firstTrajectoryCoordinate(json: json)
         let label = nonEmptyString(info?["location_name"])
+            ?? nonEmptyString(placeSnapshot?["display_label"])
             ?? nonEmptyString(legacy?["label"])
             ?? nonEmptyString(json["location_label"])
             ?? nonEmptyString(respondent?["location"])
@@ -133,18 +156,24 @@ enum LocalSessionDashboardLocationResolver {
                 source: collectionMethod ?? nonEmptyString(legacy?["source"]) ?? "legacy",
                 quality: nonEmptyString(legacy?["quality"]),
                 label: nonEmptyString(info?["location_name"])
+                    ?? nonEmptyString(placeSnapshot?["display_label"])
                     ?? nonEmptyString(legacy?["label"])
                     ?? nonEmptyString(json["location_label"])
                     ?? nonEmptyString(respondent?["location"]),
                 formattedAddress: nonEmptyString(info?["formatted_address"])
+                    ?? nonEmptyString(placeSnapshot?["formatted_address"])
                     ?? nonEmptyString(legacy?["formatted_address"])
                     ?? nonEmptyString(legacy?["formattedAddress"])
                     ?? nonEmptyString(legacy?["address"]),
                 latitude: doubleValue(info?["latitude"])
+                    ?? doubleValue(coordinateSnapshot?["latitude"])
+                    ?? doubleValue(placeSnapshot?["latitude"])
                     ?? doubleValue(legacy?["latitude"])
                     ?? doubleValue(legacy?["lat"])
                     ?? legacyTrajectory?.latitude,
                 longitude: doubleValue(info?["longitude"])
+                    ?? doubleValue(coordinateSnapshot?["longitude"])
+                    ?? doubleValue(placeSnapshot?["longitude"])
                     ?? doubleValue(legacy?["longitude"])
                     ?? doubleValue(legacy?["lon"])
                     ?? doubleValue(legacy?["lng"])
@@ -1341,14 +1370,14 @@ final class LocalSessionDetailViewController: UITableViewController {
             switch actionRows()[indexPath.row] {
             case .map:
                 content.text = "View Map"
-                let hasMapLocation = !session.trajectoryPoints.isEmpty || session.resolvedLocation?.coordinate != nil
+                let hasMapLocation = session.canShowMap
                 if session.resolvedLocation?.mode == "fixed", !hasMapLocation {
                     content.secondaryText = "Map unavailable because this location has no coordinates. The fixed location name and address remain available above."
                 } else if session.resolvedLocation?.mode == "fixed" {
                     content.secondaryText = "Fixed saved location; no device GPS trajectory"
                 } else if session.resolvedLocation?.mode == "none" {
                     content.secondaryText = "Location collection was intentionally disabled"
-                } else if session.resolvedLocation?.source == "place_search" {
+                } else if session.resolvedLocation?.isPlaceSearch == true {
                     content.secondaryText = "Searched place (not device GPS); \(session.trajectoryPoints.count) GPS point(s)"
                 } else {
                     content.secondaryText = "\(session.trajectoryPoints.count) device GPS point(s)"
@@ -1402,7 +1431,7 @@ final class LocalSessionDetailViewController: UITableViewController {
 
         switch actionRows()[indexPath.row] {
         case .map:
-            guard !session.trajectoryPoints.isEmpty || session.resolvedLocation?.coordinate != nil else { return }
+            guard session.canShowMap else { return }
             navigationController?.pushViewController(
                 LocalSessionMapViewController(session: session),
                 animated: true
@@ -1724,6 +1753,7 @@ final class LocalSessionMapViewController: UIViewController {
     private let mapView = MKMapView()
     private let statusLabel = UILabel()
     private var polyline: MKPolyline?
+    private var placeSearch: MKLocalSearch?
 
     init(session: LocalSessionDashboardSession) {
         self.session = session
@@ -1760,7 +1790,7 @@ final class LocalSessionMapViewController: UIViewController {
             sourceText = "Fixed survey location (no trajectory)"
         } else if session.resolvedLocation?.mode == "none" {
             sourceText = "Location intentionally disabled"
-        } else if session.resolvedLocation?.source == "place_search" {
+        } else if session.resolvedLocation?.isPlaceSearch == true {
             sourceText = "Searched place (not device GPS)"
         } else {
             sourceText = "Device GPS trajectory"
@@ -1803,14 +1833,46 @@ final class LocalSessionMapViewController: UIViewController {
         }
         if let resolved = session.resolvedLocation,
            let coordinate = resolved.coordinate,
-           resolved.source == "place_search" || resolved.mode == "fixed" {
+           resolved.isPlaceSearch || resolved.mode == "fixed" {
             let title = resolved.mode == "fixed"
                 ? (resolved.label ?? "Fixed survey location")
                 : "Searched place (not GPS)"
             addAnnotation(title: title, coordinate: coordinate)
+        } else if coordinates.isEmpty,
+                  let resolved = session.resolvedLocation,
+                  let query = resolved.mapSearchQuery {
+            resolveStoredPlaceForMap(query: query, location: resolved)
         }
 
         fitRoute()
+    }
+
+    private func resolveStoredPlaceForMap(
+        query: String,
+        location: LocalSessionDashboardSession.ResolvedLocation
+    ) {
+        statusLabel.text = "\(session.locationLabel)  |  Finding stored searched place…"
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = query
+        let search = MKLocalSearch(request: request)
+        placeSearch = search
+        search.start { [weak self] response, _ in
+            DispatchQueue.main.async {
+                guard let self, self.placeSearch === search else { return }
+                self.placeSearch = nil
+                guard let coordinate = response?.mapItems.first?.placemark.coordinate,
+                      CLLocationCoordinate2DIsValid(coordinate) else {
+                    self.statusLabel.text = "Map unavailable: Apple Maps could not resolve the stored searched address."
+                    return
+                }
+                self.addAnnotation(
+                    title: location.label ?? "Searched place (not GPS)",
+                    coordinate: coordinate
+                )
+                self.statusLabel.text = "\(self.session.locationLabel)  |  Searched place pin resolved from stored address (not GPS)"
+                self.setMapRegion(around: coordinate)
+            }
+        }
     }
 
     private func addAnnotation(title: String, coordinate: CLLocationCoordinate2D) {
@@ -1834,6 +1896,10 @@ final class LocalSessionMapViewController: UIViewController {
             CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude)
         } ?? session.resolvedLocation?.coordinate
         guard let center else { return }
+        setMapRegion(around: center)
+    }
+
+    private func setMapRegion(around center: CLLocationCoordinate2D) {
         let region = MKCoordinateRegion(
             center: center,
             latitudinalMeters: 400,
