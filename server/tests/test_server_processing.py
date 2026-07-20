@@ -25,6 +25,27 @@ QUESTIONS = [
 
 
 class ServerProcessingTests(unittest.TestCase):
+    def test_match_order_preserves_transcript_order_instead_of_sorting_question_ids(self):
+        questions = [
+            {"id": 1, "question": "Question 1", "type": "yes-no"},
+            {"id": 2, "question": "Question 2", "type": "yes-no"},
+            {"id": 7, "question": "Question 7", "type": "yes-no"},
+            {"id": 13, "question": "Question 13", "type": "yes-no"},
+        ]
+        raw_matches = [
+            {"matched_question_id": 1, "extracted_answer": "Yes", "confidence": "high"},
+            {"matched_question_id": 2, "extracted_answer": "No", "confidence": "high"},
+            {"matched_question_id": 7, "extracted_answer": "No", "confidence": "high"},
+            {"matched_question_id": 13, "extracted_answer": "Yes", "confidence": "high"},
+        ]
+
+        matches = server_processing.validate_matches(raw_matches, questions)
+
+        self.assertEqual(
+            [match["matched_question_id"] for match in matches],
+            [1, 2, 7, 13],
+        )
+
     def test_prompt_remains_behavior_aligned_with_existing_app_prompt(self):
         prompt = server_processing.generate_system_prompt(QUESTIONS)
         self.assertIn("Question 2: Are there shade trees?", prompt)

@@ -320,7 +320,9 @@ def validate_matches(
         else:
             normalized.append(updated)
         by_id[str(question_id)] = updated
-    return sorted(normalized, key=lambda item: str(item.get("matched_question_id", "")))
+    # Preserve the model's match order because it follows the spoken transcript.
+    # Sorting IDs as strings would turn 1, 2, 7, 13 into 1, 13, 2, 7.
+    return normalized
 
 
 def needs_clarification(match: dict[str, Any]) -> bool:
