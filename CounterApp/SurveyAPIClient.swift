@@ -161,6 +161,7 @@ final class SurveyAPIClient {
     struct ProcessingClarification: Codable, Equatable {
         let clarificationId: String
         let matchedIndex: Int
+        let questionPart: String?
         let questionId: Int?
         let questionText: String?
         let answerType: String
@@ -173,6 +174,7 @@ final class SurveyAPIClient {
         enum CodingKeys: String, CodingKey {
             case clarificationId = "clarification_id"
             case matchedIndex = "matched_index"
+            case questionPart = "question_part"
             case questionId = "question_id"
             case questionText = "question_text"
             case answerType = "answer_type"

@@ -802,6 +802,29 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                         currentResponseQuestionKeys.insert(questionKey)
                         questionIds[questionKey] = item.matchedQuestionId
 
+                        if let followUp = item.followUp,
+                           followUp.askedInTranscript || followUp.displayedAnswer != nil {
+                            let followUpKey = "\(questionKey)::follow_up"
+                            allQuestionKeys.insert(followUpKey)
+                            currentResponseQuestionKeys.insert(followUpKey)
+                            questionIds[followUpKey] = item.matchedQuestionId
+                            questionTexts[followUpKey] = followUp.question
+                            if let answer = followUp.displayedAnswer {
+                                let normalizedAnswer = answer.lowercased()
+                                let answerType: String
+                                if normalizedAnswer.contains("yes") {
+                                    answerType = "yes"
+                                } else if normalizedAnswer.contains("no") {
+                                    answerType = "no"
+                                } else {
+                                    answerType = normalizedAnswer
+                                }
+                                statistics[followUpKey, default: [:]][answerType, default: 0] += 1
+                                answerDisplayNames[followUpKey, default: [:]][answerType] =
+                                    answerType == "yes" ? "Yes" : answerType == "no" ? "No" : answer
+                            }
+                        }
+
                         if let selectedCodes = item.selectedOptionCodes, !selectedCodes.isEmpty {
                             for (index, code) in selectedCodes.enumerated() {
                                 let normalizedCode = code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
@@ -2661,10 +2684,25 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 ("final_answer", jsonString(matched.finalAnswer)),
                 ("manually_clarified", jsonBool(matched.manuallyClarified)),
                 ("clarification_note", jsonString(matched.clarificationNote)),
-                ("answer_source", jsonString(matched.answerSource))
+                ("answer_source", jsonString(matched.answerSource)),
+                ("follow_up", matched.followUp.map { matchedFollowUpJSON($0, indent: indent + 1) })
             ], indent: indent + 1)
         }
         return orderedArray(values, indent: indent)
+    }
+
+    private func matchedFollowUpJSON(_ followUp: MatchedFollowUp, indent: Int) -> String {
+        orderedObject([
+            ("question", jsonString(followUp.question)),
+            ("asked_in_transcript", jsonBool(followUp.askedInTranscript)),
+            ("extracted_answer", jsonString(followUp.extractedAnswer)),
+            ("confidence", jsonString(followUp.confidence)),
+            ("clarification_needed", jsonBool(followUp.clarificationNeeded)),
+            ("final_answer", jsonString(followUp.finalAnswer)),
+            ("manually_clarified", jsonBool(followUp.manuallyClarified)),
+            ("clarification_note", jsonString(followUp.clarificationNote)),
+            ("answer_source", jsonString(followUp.answerSource))
+        ], indent: indent)
     }
 
     private func orderedObject(_ pairs: [(String, String?)], indent: Int) -> String {
@@ -2830,7 +2868,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     finalAnswer: checkedAnswer,
                     manuallyClarified: existing.manuallyClarified,
                     clarificationNote: noteParts.joined(separator: " "),
-                    answerSource: "interviewer_checked"
+                    answerSource: "interviewer_checked",
+                    followUp: existing.followUp
                 )
             } else {
                 updatedMatches.append(

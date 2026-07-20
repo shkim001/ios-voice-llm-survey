@@ -51,6 +51,7 @@ struct LocalSessionDashboardSession {
         let question: String
         let answer: String
         let confidence: String?
+        let isFollowUp: Bool
     }
 
     let localSessionId: String
@@ -374,13 +375,35 @@ enum LocalSessionDashboardLibrary {
         )?["session_package_uploaded_at_epoch"] != nil
         let isUploaded = source == .cachedServer || manifestUploadConfirmed || legacyUploadConfirmed
 
-        let answers = rawAnswers.map { raw in
-            LocalSessionDashboardSession.MatchedAnswer(
+        let answers = rawAnswers.flatMap { raw -> [LocalSessionDashboardSession.MatchedAnswer] in
+            var values = [LocalSessionDashboardSession.MatchedAnswer(
                 questionId: intValue(raw["matched_question_id"]),
                 question: nonEmptyString(raw["matched_question"]) ?? "Question",
-                answer: nonEmptyString(raw["extracted_answer"]) ?? "",
-                confidence: nonEmptyString(raw["confidence"])
-            )
+                answer: nonEmptyString(raw["final_answer"])
+                    ?? nonEmptyString(raw["extracted_answer"])
+                    ?? "",
+                confidence: nonEmptyString(raw["confidence"]),
+                isFollowUp: false
+            )]
+            if let followUp = raw["follow_up"] as? [String: Any] {
+                let shouldDisplayFollowUp = followUp["asked_in_transcript"] as? Bool == true
+                    || nonEmptyString(followUp["extracted_answer"]) != nil
+                    || nonEmptyString(followUp["final_answer"]) != nil
+                if shouldDisplayFollowUp {
+                values.append(
+                    LocalSessionDashboardSession.MatchedAnswer(
+                        questionId: intValue(raw["matched_question_id"]),
+                        question: nonEmptyString(followUp["question"]) ?? "Follow-up question",
+                        answer: nonEmptyString(followUp["final_answer"])
+                            ?? nonEmptyString(followUp["extracted_answer"])
+                            ?? "No follow-up answer captured",
+                        confidence: nonEmptyString(followUp["confidence"]),
+                        isFollowUp: true
+                    )
+                )
+                }
+            }
+            return values
         }
 
         let trajectoryPoints = rawTrajectory.compactMap { raw -> LocalSessionDashboardSession.TrajectoryPoint? in
@@ -466,13 +489,27 @@ enum LocalSessionDashboardLibrary {
         let transcription = (try? String(contentsOf: transcriptURL, encoding: .utf8))
             ?? manifest.transcription
             ?? ""
-        let answers = manifest.matchedQuestions.map {
-            LocalSessionDashboardSession.MatchedAnswer(
-                questionId: $0.matchedQuestionId,
-                question: $0.matchedQuestion,
-                answer: $0.finalAnswer ?? $0.extractedAnswer,
-                confidence: $0.confidence
-            )
+        let answers = manifest.matchedQuestions.flatMap { match -> [LocalSessionDashboardSession.MatchedAnswer] in
+            var values = [LocalSessionDashboardSession.MatchedAnswer(
+                questionId: match.matchedQuestionId,
+                question: match.matchedQuestion,
+                answer: match.finalAnswer ?? match.extractedAnswer,
+                confidence: match.confidence,
+                isFollowUp: false
+            )]
+            if let followUp = match.followUp,
+               followUp.askedInTranscript || followUp.displayedAnswer != nil {
+                values.append(
+                    LocalSessionDashboardSession.MatchedAnswer(
+                        questionId: match.matchedQuestionId,
+                        question: followUp.question,
+                        answer: followUp.displayedAnswer ?? "No follow-up answer captured",
+                        confidence: followUp.confidence,
+                        isFollowUp: true
+                    )
+                )
+            }
+            return values
         }
         let trajectory = manifest.trajectoryPoints.map {
             LocalSessionDashboardSession.TrajectoryPoint(
@@ -1407,7 +1444,9 @@ final class LocalSessionDetailViewController: UITableViewController {
                 cell.selectionStyle = .none
             } else {
                 let answer = session.matchedAnswers[indexPath.row]
-                let prefix = answer.questionId.map { "Q\($0): " } ?? ""
+                let prefix = answer.questionId.map {
+                    answer.isFollowUp ? "Q\($0) Follow-up: " : "Q\($0): "
+                } ?? (answer.isFollowUp ? "Follow-up: " : "")
                 content.text = prefix + answer.question
                 content.secondaryText = [answer.answer, answer.confidence].compactMap { $0 }.joined(separator: "  |  ")
                 cell.selectionStyle = .none
@@ -1570,7 +1609,9 @@ final class LocalSessionDetailViewController: UITableViewController {
             ? ""
             : "\n\nAllowed answers:\n" + item.allowedAnswers.joined(separator: "\n")
         let alert = UIAlertController(
-            title: "Clarification \(position + 1) of \(job.clarifications.count)",
+            title: item.questionPart == "follow_up"
+                ? "Follow-up Clarification \(position + 1) of \(job.clarifications.count)"
+                : "Clarification \(position + 1) of \(job.clarifications.count)",
             message: """
             Question:
             \(item.questionText ?? "Unknown question")

@@ -89,6 +89,29 @@ class LocationAggregationViewController: UIViewController {
                 currentResponseQuestionKeys.insert(questionKey)
                 questionIds[questionKey] = item.matchedQuestionId
 
+                if let followUp = item.followUp,
+                   followUp.askedInTranscript || followUp.displayedAnswer != nil {
+                    let followUpKey = "\(questionKey)::follow_up"
+                    allQuestionKeys.insert(followUpKey)
+                    currentResponseQuestionKeys.insert(followUpKey)
+                    questionIds[followUpKey] = item.matchedQuestionId
+                    questionTexts[followUpKey] = followUp.question
+                    if let answer = followUp.displayedAnswer {
+                        let normalizedAnswer = answer.lowercased()
+                        let answerType: String
+                        if normalizedAnswer.contains("yes") {
+                            answerType = "yes"
+                        } else if normalizedAnswer.contains("no") {
+                            answerType = "no"
+                        } else {
+                            answerType = normalizedAnswer
+                        }
+                        statistics[followUpKey, default: [:]][answerType, default: 0] += 1
+                        answerDisplayNames[followUpKey, default: [:]][answerType] =
+                            answerType == "yes" ? "Yes" : answerType == "no" ? "No" : answer
+                    }
+                }
+
                 if let selectedCodes = item.selectedOptionCodes, !selectedCodes.isEmpty {
                     for (index, code) in selectedCodes.enumerated() {
                         let normalizedCode = code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()

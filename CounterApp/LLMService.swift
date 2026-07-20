@@ -255,7 +255,8 @@ class LLMService {
                 finalAnswer: match.finalAnswer,
                 manuallyClarified: match.manuallyClarified,
                 clarificationNote: match.clarificationNote,
-                answerSource: match.answerSource
+                answerSource: match.answerSource,
+                followUp: match.followUp
             )
         }
     }

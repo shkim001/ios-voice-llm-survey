@@ -503,7 +503,7 @@ def analysis_answer_rows(
         if identity.get("id") and identity.get("version"):
             cur.execute(
                 f"""
-                SELECT question_id AS id, prompt, answer_type
+                SELECT question_id AS id, prompt, answer_type, follow_up
                 FROM questionnaire_questions
                 WHERE questionnaire_id = %s
                   AND version = %s
@@ -514,33 +514,31 @@ def analysis_answer_rows(
             question_lookup = {str(row["id"]): row for row in cur.fetchall()}
 
     rows = []
-    for index, item in enumerate(raw_matches):
-        if not isinstance(item, dict):
-            continue
 
-        qid_raw = item.get("matched_question_id")
-        if qid_raw is None:
-            continue
-
-        question_id = str(qid_raw)
-        question = question_lookup.get(question_id, {})
+    def append_analysis_row(
+        *,
+        question_id: str,
+        item: dict,
+        question_text: str | None,
+        answer_type: str | None,
+    ) -> None:
         extracted_answer = item.get("extracted_answer")
         final_answer = item.get("final_answer")
         selected_option_codes = item.get("selected_option_codes")
         if isinstance(selected_option_codes, list) and selected_option_codes:
-            analysis_answer = ", ".join(str(code).strip().upper() for code in selected_option_codes if str(code).strip())
+            analysis_answer = ", ".join(
+                str(code).strip().upper()
+                for code in selected_option_codes
+                if str(code).strip()
+            )
         else:
-            analysis_answer = final_answer if isinstance(final_answer, str) and final_answer.strip() else extracted_answer
+            analysis_answer = (
+                final_answer
+                if isinstance(final_answer, str) and final_answer.strip()
+                else extracted_answer
+            )
         confidence = item.get("confidence")
         clarification_needed = item.get("clarification_needed")
-        fallback_question_text = item.get("matched_question")
-        question_text = question.get("prompt")
-        if not isinstance(question_text, str):
-            question_text = fallback_question_text if isinstance(fallback_question_text, str) else None
-        answer_type = question.get("answer_type")
-        if not isinstance(answer_type, str):
-            answer_type = None
-
         rows.append(
             (
                 session_bytes,
@@ -548,7 +546,7 @@ def analysis_answer_rows(
                 identity.get("id"),
                 identity.get("version"),
                 question_id,
-                index,
+                len(rows),
                 question_text,
                 answer_type,
                 analysis_answer if isinstance(analysis_answer, str) else None,
@@ -559,6 +557,43 @@ def analysis_answer_rows(
                 source_json_path,
             )
         )
+
+    for item in raw_matches:
+        if not isinstance(item, dict):
+            continue
+
+        qid_raw = item.get("matched_question_id")
+        if qid_raw is None:
+            continue
+
+        question_id = str(qid_raw)
+        question = question_lookup.get(question_id, {})
+        fallback_question_text = item.get("matched_question")
+        question_text = question.get("prompt")
+        if not isinstance(question_text, str):
+            question_text = fallback_question_text if isinstance(fallback_question_text, str) else None
+        answer_type = question.get("answer_type")
+        if not isinstance(answer_type, str):
+            answer_type = None
+        append_analysis_row(
+            question_id=question_id,
+            item=item,
+            question_text=question_text,
+            answer_type=answer_type,
+        )
+        follow_up = item.get("follow_up")
+        if isinstance(follow_up, dict) and (
+            follow_up.get("asked_in_transcript")
+            or follow_up.get("extracted_answer")
+            or follow_up.get("final_answer")
+        ):
+            follow_up_text = follow_up.get("question") or question.get("follow_up")
+            append_analysis_row(
+                question_id=f"{question_id}:follow_up",
+                item=follow_up,
+                question_text=follow_up_text if isinstance(follow_up_text, str) else None,
+                answer_type="follow_up",
+            )
 
     return rows
 
@@ -2070,20 +2105,29 @@ def submit_processing_clarifications(
         match = matches[answer.matched_index]
         if not isinstance(match, dict):
             raise HTTPException(status_code=500, detail="clarification match is invalid")
-        original_answer = match.get("extracted_answer")
+        is_follow_up = answer.clarification_id == f"match-{answer.matched_index}-follow-up"
+        expected_main_id = f"match-{answer.matched_index}"
+        if not is_follow_up and answer.clarification_id != expected_main_id:
+            raise HTTPException(status_code=400, detail="clarification_id does not match matched_index")
+        target = match.get("follow_up") if is_follow_up else match
+        if not isinstance(target, dict):
+            raise HTTPException(status_code=400, detail="clarification target is missing")
+        original_answer = target.get("extracted_answer")
         if answer.use_original_answer:
             if not isinstance(original_answer, str) or not original_answer.strip():
                 raise HTTPException(status_code=400, detail="clarification has no original answer to accept")
-            match["final_answer"] = original_answer.strip()
+            target["final_answer"] = original_answer.strip()
         else:
-            match["final_answer"] = answer.final_answer.strip()
-        match["manually_clarified"] = True
-        match["clarification_note"] = answer.note.strip() if answer.note else None
-        match["answer_source"] = "accepted_model_answer" if answer.use_original_answer else "manual_clarification"
-        if answer.selected_option_codes is not None:
-            match["selected_option_codes"] = answer.selected_option_codes
-        if answer.selected_option_labels is not None:
-            match["selected_option_labels"] = answer.selected_option_labels
+            target["final_answer"] = answer.final_answer.strip()
+        target["manually_clarified"] = True
+        target["clarification_needed"] = False
+        target["clarification_note"] = answer.note.strip() if answer.note else None
+        target["answer_source"] = "accepted_model_answer" if answer.use_original_answer else "manual_clarification"
+        if not is_follow_up:
+            if answer.selected_option_codes is not None:
+                target["selected_option_codes"] = answer.selected_option_codes
+            if answer.selected_option_labels is not None:
+                target["selected_option_labels"] = answer.selected_option_labels
     next_revision = body.expected_revision + 1
     draft["matches"] = matches
     write_json_atomic(draft_path, draft)
@@ -2192,6 +2236,7 @@ def process_claimed_job(row: dict[str, Any]) -> None:
             input_manifest.get("interviewer_checked_option_codes_by_question_id")
             if isinstance(input_manifest.get("interviewer_checked_option_codes_by_question_id"), dict)
             else {},
+            transcript=transcript,
         )
         draft = {
             "input_manifest": input_manifest,

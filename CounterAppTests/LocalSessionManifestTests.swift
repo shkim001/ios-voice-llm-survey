@@ -375,6 +375,30 @@ struct LocalSessionManifestTests {
         #expect(try LocalSessionManifestStore.load(from: clarifiedDirectory).matchedQuestions.first?.finalAnswer == "Corrected")
     }
 
+    @Test func matchedQuestionPreservesStructuredFollowUp() throws {
+        let json = #"""
+        {
+          "matched_question_id": 3,
+          "matched_question": "How often do you walk in your local neighborhood?",
+          "extracted_answer": "Every day",
+          "confidence": "high",
+          "clarification_needed": false,
+          "follow_up": {
+            "question": "What is the main purpose of your walking trips?",
+            "asked_in_transcript": true,
+            "extracted_answer": "Shopping and visiting my daughter",
+            "confidence": "high",
+            "clarification_needed": false
+          }
+        }
+        """#.data(using: .utf8)!
+
+        let match = try JSONDecoder().decode(MatchedQuestion.self, from: json)
+        #expect(match.followUp?.askedInTranscript == true)
+        #expect(match.followUp?.displayedAnswer == "Shopping and visiting my daughter")
+        #expect(match.withAcceptedOriginalAnswer(note: nil).followUp == match.followUp)
+    }
+
     @Test func retentionProtectsPendingAndLegacyUnuploadedAudio() throws {
         let pendingDirectory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: pendingDirectory) }

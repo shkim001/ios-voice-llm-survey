@@ -46,11 +46,105 @@ class ServerProcessingTests(unittest.TestCase):
             [1, 2, 7, 13],
         )
 
-    def test_prompt_remains_behavior_aligned_with_existing_app_prompt(self):
+    def test_prompt_requires_structured_follow_up_in_parent_match(self):
         prompt = server_processing.generate_system_prompt(QUESTIONS)
         self.assertIn("Question 2: Are there shade trees?", prompt)
         self.assertIn("Always output **valid JSON only**", prompt)
+        self.assertIn("follow-up belongs inside its parent question", prompt)
+        self.assertIn('"asked_in_transcript"', prompt)
         self.assertNotIn("supporting_transcript", prompt)
+
+    def test_spoken_follow_up_is_preserved_as_nested_result(self):
+        questions = [
+            {
+                "id": 3,
+                "question": "How often do you walk in your local neighborhood?",
+                "follow_up": "What is the main purpose of your walking trips?",
+                "type": "impression",
+            }
+        ]
+        transcript = (
+            "How often do you walk in your local neighborhood? Every day. "
+            "What is the main purpose of your walking trips? Shopping, laundry, and visiting family."
+        )
+        matches = server_processing.validate_matches(
+            [
+                {
+                    "matched_question_id": 3,
+                    "matched_question": questions[0]["question"],
+                    "extracted_answer": "Every day",
+                    "confidence": "high",
+                    "clarification_needed": False,
+                    "follow_up": {
+                        "question": questions[0]["follow_up"],
+                        "asked_in_transcript": True,
+                        "extracted_answer": "Shopping, laundry, and visiting family",
+                        "confidence": "high",
+                        "clarification_needed": False,
+                    },
+                }
+            ],
+            questions,
+            transcript=transcript,
+        )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["follow_up"]["extracted_answer"], "Shopping, laundry, and visiting family")
+        self.assertFalse(server_processing.needs_clarification(matches[0]))
+
+    def test_duplicate_parent_id_follow_up_is_merged_and_missing_answer_requires_review(self):
+        questions = [
+            {
+                "id": 11,
+                "question": "When do you feel safe walking?",
+                "follow_up": "Do you feel safe walking after dark?",
+                "type": "impression",
+            }
+        ]
+        transcript = (
+            "When do you feel safe walking? For the most part I feel safe. "
+            "Do you feel safe walking after dark? In the summer I do."
+        )
+        merged = server_processing.validate_matches(
+            [
+                {
+                    "matched_question_id": 11,
+                    "matched_question": questions[0]["question"],
+                    "extracted_answer": "For the most part I feel safe",
+                    "confidence": "high",
+                    "clarification_needed": False,
+                },
+                {
+                    "matched_question_id": 11,
+                    "matched_question": questions[0]["follow_up"],
+                    "extracted_answer": "In the summer I do",
+                    "confidence": "high",
+                    "clarification_needed": False,
+                },
+            ],
+            questions,
+            transcript=transcript,
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["follow_up"]["extracted_answer"], "In the summer I do")
+
+        missing = server_processing.validate_matches(
+            [
+                {
+                    "matched_question_id": 11,
+                    "matched_question": questions[0]["question"],
+                    "extracted_answer": "For the most part I feel safe",
+                    "confidence": "high",
+                    "clarification_needed": False,
+                }
+            ],
+            questions,
+            transcript=transcript,
+        )
+        self.assertTrue(server_processing.needs_clarification(missing[0]))
+        requests = server_processing.clarification_requests(transcript, missing, questions)
+        self.assertEqual(requests[0]["question_part"], "follow_up")
+        self.assertEqual(requests[0]["question_text"], questions[0]["follow_up"])
 
     def test_multiple_choice_validation_and_interviewer_checked_answer(self):
         matches = server_processing.validate_matches(

@@ -288,6 +288,7 @@ struct ExportedMatchedQuestion: Decodable {
     let finalAnswer: String?
     let selectedOptionCodes: [String]?
     let selectedOptionLabels: [String]?
+    let followUp: MatchedFollowUp?
     
     enum CodingKeys: String, CodingKey {
         case matchedQuestionId = "matched_question_id"
@@ -296,6 +297,7 @@ struct ExportedMatchedQuestion: Decodable {
         case finalAnswer = "final_answer"
         case selectedOptionCodes = "selected_option_codes"
         case selectedOptionLabels = "selected_option_labels"
+        case followUp = "follow_up"
     }
 }
 
@@ -320,6 +322,37 @@ struct ExportedRespondentInfo: Decodable {
 }
 
 // MARK: - POE API Response Models
+struct MatchedFollowUp: Codable, Equatable {
+    let question: String
+    let askedInTranscript: Bool
+    let extractedAnswer: String?
+    let confidence: String
+    let clarificationNeeded: Bool
+    let finalAnswer: String?
+    let manuallyClarified: Bool?
+    let clarificationNote: String?
+    let answerSource: String?
+
+    enum CodingKeys: String, CodingKey {
+        case question
+        case askedInTranscript = "asked_in_transcript"
+        case extractedAnswer = "extracted_answer"
+        case confidence
+        case clarificationNeeded = "clarification_needed"
+        case finalAnswer = "final_answer"
+        case manuallyClarified = "manually_clarified"
+        case clarificationNote = "clarification_note"
+        case answerSource = "answer_source"
+    }
+
+    var displayedAnswer: String? {
+        let preferred = finalAnswer?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let preferred, !preferred.isEmpty { return preferred }
+        let extracted = extractedAnswer?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return extracted?.isEmpty == false ? extracted : nil
+    }
+}
+
 struct MatchedQuestion: Codable {
     let matchedQuestionId: Int
     let matchedQuestion: String
@@ -332,6 +365,7 @@ struct MatchedQuestion: Codable {
     let manuallyClarified: Bool?
     let clarificationNote: String?
     let answerSource: String?
+    let followUp: MatchedFollowUp?
     
     enum CodingKeys: String, CodingKey {
         case matchedQuestionId = "matched_question_id"
@@ -345,6 +379,7 @@ struct MatchedQuestion: Codable {
         case manuallyClarified = "manually_clarified"
         case clarificationNote = "clarification_note"
         case answerSource = "answer_source"
+        case followUp = "follow_up"
     }
 
     init(
@@ -358,7 +393,8 @@ struct MatchedQuestion: Codable {
         finalAnswer: String? = nil,
         manuallyClarified: Bool? = nil,
         clarificationNote: String? = nil,
-        answerSource: String? = nil
+        answerSource: String? = nil,
+        followUp: MatchedFollowUp? = nil
     ) {
         self.matchedQuestionId = matchedQuestionId
         self.matchedQuestion = matchedQuestion
@@ -371,6 +407,7 @@ struct MatchedQuestion: Codable {
         self.manuallyClarified = manuallyClarified
         self.clarificationNote = clarificationNote
         self.answerSource = answerSource
+        self.followUp = followUp
     }
 
     func withManualClarification(
@@ -393,7 +430,8 @@ struct MatchedQuestion: Codable {
             finalAnswer: cleanedAnswer?.isEmpty == false ? cleanedAnswer : nil,
             manuallyClarified: true,
             clarificationNote: cleanedNote?.isEmpty == false ? cleanedNote : nil,
-            answerSource: "manual_clarification"
+            answerSource: "manual_clarification",
+            followUp: followUp
         )
     }
 
@@ -411,7 +449,8 @@ struct MatchedQuestion: Codable {
             finalAnswer: extractedAnswer,
             manuallyClarified: true,
             clarificationNote: cleanedNote?.isEmpty == false ? cleanedNote : nil,
-            answerSource: "accepted_model_answer"
+            answerSource: "accepted_model_answer",
+            followUp: followUp
         )
     }
 }

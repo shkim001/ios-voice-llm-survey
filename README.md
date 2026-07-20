@@ -126,6 +126,7 @@ When the Survey API is configured:
 - After **Analyze Answers** from the recording review flow, the app preserves the `.m4a`, freezes questionnaire/respondent/location/interviewer data in `processing_input.json`, queues both files with `POST /sessions/{id}/processing-input`, and immediately returns to the next interview.
 - A separate server worker claims the durable MySQL job, transcribes with `gpt-4o-mini-transcribe`, runs answer analysis, and writes audit artifacts without changing the original audio.
 - Medium/low-confidence or explicitly ambiguous matches put the job in `needs_review`. The Dashboard fetches the server clarification requests, submits the interviewer's answers with the expected revision, and the server alone generates the final `session.json`.
+- Configured follow-ups are stored inside their parent match as a distinct `follow_up` object with the exact follow-up question, an `asked_in_transcript` flag, and independent answer/confidence/clarification fields. A spoken follow-up that lacks a usable answer creates its own follow-up clarification request instead of disappearing or reusing the parent answer.
 - The app polls/synchronizes lightweight status on Dashboard refresh and manual retry. When a job completes, it downloads and atomically caches the canonical server result locally for dashboard and aggregation use.
 - Completed packages include `interviewer_info`; the server indexes package metadata and extracts matched answers into `analysis_answers` for counting/filtering.
 - In Device Location mode, GPS failure does not block recording: the interviewer can retry, accept a disclosed low-accuracy point, record without GPS, search with native MapKit, or cancel. Device-GPS trajectory sampling continues about every 15 seconds when GPS is available.
@@ -203,7 +204,7 @@ survey_session_packages/
     └── session.json
 ```
 
-`session.json` is created only after analysis is accepted or all clarification requests are resolved. The original `.m4a` is never replaced by a derived file.
+`session.json` is created only after analysis is accepted or all clarification requests are resolved. Follow-up answers remain nested under their stable parent question ID, while the native and web dashboards label them as `Q# Follow-up`; SQL analysis indexes them separately as `<question-id>:follow_up`. The original `.m4a` is never replaced by a derived file.
 
 ### 2. Install and run
 
