@@ -135,6 +135,19 @@ enum LocalSessionUploadStatus: String, LocalSessionDefaultingStatus {
     static let decodingFallback: Self = .notReady
 }
 
+enum LocalSessionServerProcessingStatus: String, LocalSessionDefaultingStatus {
+    case notSubmitted = "not_submitted"
+    case queued
+    case transcribing
+    case analyzing
+    case needsReview = "needs_review"
+    case completed
+    case failedRetryable = "failed_retryable"
+    case failedTerminal = "failed_terminal"
+
+    static let decodingFallback: Self = .notSubmitted
+}
+
 struct LocalSessionRetryMetadata: Codable {
     var retryCount: Int
     var lastError: String?
@@ -170,7 +183,7 @@ struct LocalSessionRetryMetadata: Codable {
 }
 
 struct LocalSessionManifest: Codable {
-    static let currentSchemaVersion = 6
+    static let currentSchemaVersion = 7
     static let currentTranscriptionPipelineVersion = 2
 
     var schemaVersion: Int
@@ -208,6 +221,9 @@ struct LocalSessionManifest: Codable {
     var analysisErrorCategory: String?
     var clarificationStatus: LocalSessionClarificationStatus
     var uploadStatus: LocalSessionUploadStatus
+    var serverProcessingStatus: LocalSessionServerProcessingStatus
+    var serverProcessingRevision: Int?
+    var processingInputFileName: String?
     var cloudRespondentId: String?
     var cloudSessionId: String?
     var retry: LocalSessionRetryMetadata
@@ -248,6 +264,9 @@ struct LocalSessionManifest: Codable {
         case analysisErrorCategory = "analysis_error_category"
         case clarificationStatus = "clarification_status"
         case uploadStatus = "upload_status"
+        case serverProcessingStatus = "server_processing_status"
+        case serverProcessingRevision = "server_processing_revision"
+        case processingInputFileName = "processing_input_file_name"
         case cloudRespondentId = "cloud_respondent_id"
         case cloudSessionId = "cloud_session_id"
         case retry
@@ -306,6 +325,9 @@ struct LocalSessionManifest: Codable {
         analysisErrorCategory = nil
         clarificationStatus = .pending
         uploadStatus = .notReady
+        serverProcessingStatus = .notSubmitted
+        serverProcessingRevision = nil
+        processingInputFileName = nil
         cloudRespondentId = nil
         cloudSessionId = nil
         retry = LocalSessionRetryMetadata()
@@ -376,6 +398,12 @@ struct LocalSessionManifest: Codable {
             forKey: .clarificationStatus
         ) ?? .pending
         uploadStatus = try container.decodeIfPresent(LocalSessionUploadStatus.self, forKey: .uploadStatus) ?? .notReady
+        serverProcessingStatus = try container.decodeIfPresent(
+            LocalSessionServerProcessingStatus.self,
+            forKey: .serverProcessingStatus
+        ) ?? .notSubmitted
+        serverProcessingRevision = try container.decodeIfPresent(Int.self, forKey: .serverProcessingRevision)
+        processingInputFileName = try container.decodeIfPresent(String.self, forKey: .processingInputFileName)
         cloudRespondentId = try container.decodeIfPresent(String.self, forKey: .cloudRespondentId)
         cloudSessionId = try container.decodeIfPresent(String.self, forKey: .cloudSessionId)
         retry = try container.decodeIfPresent(LocalSessionRetryMetadata.self, forKey: .retry) ?? LocalSessionRetryMetadata()
@@ -414,8 +442,30 @@ struct LocalSessionStatusSummary: Equatable {
 
         let primary: String
         let retryableStage: Bool
-        if manifest.uploadStatus == .uploaded {
+        if manifest.serverProcessingStatus == .completed
+            || (manifest.uploadStatus == .uploaded && hasFinalPackage) {
             primary = "Uploaded"
+            retryableStage = false
+        } else if manifest.serverProcessingStatus == .needsReview {
+            primary = "Clarification required"
+            messages.append("Server analysis needs interviewer review")
+            retryableStage = true
+        } else if manifest.serverProcessingStatus == .failedTerminal {
+            primary = "Failed — action required"
+            messages.append("Server processing failed")
+            retryableStage = true
+        } else if manifest.serverProcessingStatus == .failedRetryable {
+            primary = "Waiting for server retry"
+            messages.append("Server processing will retry")
+            retryableStage = true
+        } else if manifest.serverProcessingStatus == .queued {
+            primary = "Queued on server"
+            retryableStage = true
+        } else if manifest.serverProcessingStatus == .transcribing {
+            primary = "Transcribing on server"
+            retryableStage = false
+        } else if manifest.serverProcessingStatus == .analyzing {
+            primary = "Analyzing on server"
             retryableStage = false
         } else if manifest.audioStatus != .recordedLocally {
             primary = "Failed — action required"
@@ -559,6 +609,9 @@ enum LocalSessionManifestStore {
             if value.uploadStatus != .uploaded {
                 value.uploadStatus = .notReady
             }
+            if value.serverProcessingStatus == .notSubmitted {
+                value.processingInputFileName = nil
+            }
         }
 
         // session.json is derived from the manifest. Removing an older address-only
@@ -566,6 +619,10 @@ enum LocalSessionManifestStore {
         let packageURL = directoryURL.appendingPathComponent("session.json")
         if FileManager.default.fileExists(atPath: packageURL.path) {
             try FileManager.default.removeItem(at: packageURL)
+        }
+        let processingInputURL = directoryURL.appendingPathComponent("processing_input.json")
+        if FileManager.default.fileExists(atPath: processingInputURL.path) {
+            try FileManager.default.removeItem(at: processingInputURL)
         }
     }
 
@@ -600,12 +657,16 @@ enum LocalSessionManifestStore {
             value.analysisErrorCategory = nil
             value.clarificationStatus = .pending
             value.uploadStatus = .notReady
+            value.serverProcessingStatus = .notSubmitted
+            value.serverProcessingRevision = nil
+            value.processingInputFileName = nil
             value.retry = LocalSessionRetryMetadata()
         }
 
         let derivedURLs = [
             directoryURL.appendingPathComponent(FileTranscriptStore.fileName),
-            directoryURL.appendingPathComponent("session.json")
+            directoryURL.appendingPathComponent("session.json"),
+            directoryURL.appendingPathComponent("processing_input.json")
         ]
         for url in derivedURLs where FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)

@@ -168,7 +168,7 @@ struct DeferredSessionOutboxTests {
         #expect(api.uploadCallCount == 1)
     }
 
-    @Test func automaticTriggersDoNotStartSpeechOrLLMButManualRetryMayResumeIt() async throws {
+    @Test func automaticAndManualTriggersSubmitServerProcessingWithoutLocalSpeechOrLLM() async throws {
         let fixture = try makeReadyFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         try FileManager.default.removeItem(at: fixture.directory.appendingPathComponent("session.json"))
@@ -190,15 +190,16 @@ struct DeferredSessionOutboxTests {
         )
 
         let launch = await outbox.run(trigger: .launch)
-        #expect(launch.deferredSessionIds == [fixture.localSessionId])
+        #expect(launch.uploadedSessionIds == [fixture.localSessionId])
         #expect(processor.callCount == 0)
+        #expect(try LocalSessionManifestStore.load(from: fixture.directory).serverProcessingStatus == .queued)
 
         let manual = await outbox.retryNow()
         #expect(manual.deferredSessionIds == [fixture.localSessionId])
-        #expect(processor.callCount == 1)
+        #expect(processor.callCount == 0)
     }
 
-    @Test func manualRetryReprocessesLegacyFinalPackageInsteadOfUploadingIt() async throws {
+    @Test func legacyCompletedPackageRemainsUploadableWithoutLocalReprocessing() async throws {
         let fixture = try makeReadyFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         try Data("Legacy tail transcript".utf8).write(
@@ -224,11 +225,11 @@ struct DeferredSessionOutboxTests {
 
         let result = await outbox.retryNow(localSessionId: fixture.localSessionId)
 
-        #expect(result.deferredSessionIds == [fixture.localSessionId])
-        #expect(processor.callCount == 1)
-        #expect(api.uploadCallCount == 0)
-        #expect(!FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("session.json").path))
-        #expect(try LocalSessionManifestStore.load(from: fixture.directory).transcriptionStatus == .pending)
+        #expect(result.uploadedSessionIds == [fixture.localSessionId])
+        #expect(processor.callCount == 0)
+        #expect(api.uploadCallCount == 1)
+        #expect(FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("session.json").path))
+        #expect(try LocalSessionManifestStore.load(from: fixture.directory).uploadStatus == .uploaded)
     }
 
     @Test func inactiveAppDoesNotStartAutomaticOutboxWork() async throws {
@@ -299,7 +300,7 @@ struct DeferredSessionOutboxTests {
         #expect(try LocalSessionManifestStore.load(from: thirdDirectory).uploadStatus == .pending)
     }
 
-    @Test func batchRetryFinalizesCompletedAnalysisAndUploadsIt() async throws {
+    @Test func batchRetrySubmitsRawAudioForServerProcessing() async throws {
         let fixture = try makeReadyFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         try FileManager.default.removeItem(at: fixture.directory.appendingPathComponent("session.json"))
@@ -328,18 +329,81 @@ struct DeferredSessionOutboxTests {
         let result = await outbox.retryNow(localSessionId: fixture.localSessionId)
 
         #expect(result.uploadedSessionIds == [fixture.localSessionId])
-        #expect(processor.callCount == 1)
-        #expect(api.uploadCallCount == 1)
-        let packageURL = fixture.directory.appendingPathComponent("session.json")
-        let package = try #require(
-            JSONSerialization.jsonObject(with: Data(contentsOf: packageURL)) as? [String: Any]
-        )
-        #expect(package["transcription"] as? String == CompletingStageProcessor.transcript)
-        #expect((package["matched_questions"] as? [[String: Any]])?.count == 1)
+        #expect(processor.callCount == 0)
+        #expect(api.uploadCallCount == 0)
+        #expect(api.processingUploadCallCount == 1)
+        #expect(FileManager.default.fileExists(
+            atPath: fixture.directory.appendingPathComponent("processing_input.json").path
+        ))
         let manifest = try LocalSessionManifestStore.load(from: fixture.directory)
-        #expect(manifest.analysisStatus == .completed)
-        #expect(manifest.clarificationStatus == .completed)
+        #expect(manifest.serverProcessingStatus == .queued)
+        #expect(manifest.analysisStatus == .pending)
         #expect(manifest.uploadStatus == .uploaded)
+        #expect(FileManager.default.fileExists(atPath: fixture.audioURL.path))
+    }
+
+    @Test func completedServerResultIsSavedAtomicallyAndUpdatesManifest() async throws {
+        let fixture = try makeReadyFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try FileManager.default.removeItem(at: fixture.directory.appendingPathComponent("session.json"))
+        try LocalSessionManifestStore.update(in: fixture.directory) { manifest in
+            manifest.transcriptionStatus = .pending
+            manifest.analysisStatus = .pending
+            manifest.clarificationStatus = .pending
+            manifest.uploadStatus = .notReady
+        }
+        let resultJSON = """
+        {
+          "local_session_id": "\(fixture.localSessionId)",
+          "transcription": "Server transcript",
+          "matched_questions": [
+            {
+              "matched_question_id": 1,
+              "matched_question": "Are there seats?",
+              "extracted_answer": "Yes",
+              "confidence": "high",
+              "clarification_needed": false
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+        let api = MockDeferredAPI(
+            uploadResults: [],
+            processingStatus: "completed",
+            processingResultData: resultJSON
+        )
+        let outbox = makeOutbox(root: fixture.root, api: api, clock: MutableClock(13_000))
+
+        let result = await outbox.run(trigger: .sessionReady)
+
+        #expect(result.uploadedSessionIds == [fixture.localSessionId])
+        #expect(try Data(contentsOf: fixture.directory.appendingPathComponent("session.json")) == resultJSON)
+        #expect(try String(contentsOf: fixture.directory.appendingPathComponent("transcript.txt"), encoding: .utf8) == "Server transcript")
+        let manifest = try LocalSessionManifestStore.load(from: fixture.directory)
+        #expect(manifest.serverProcessingStatus == .completed)
+        #expect(manifest.transcription == "Server transcript")
+        #expect(manifest.matchedQuestions.count == 1)
+        #expect(FileManager.default.fileExists(atPath: fixture.audioURL.path))
+    }
+
+    @Test func needsReviewServerStatusBecomesDashboardClarificationState() async throws {
+        let fixture = try makeReadyFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try FileManager.default.removeItem(at: fixture.directory.appendingPathComponent("session.json"))
+        try LocalSessionManifestStore.update(in: fixture.directory) { manifest in
+            manifest.transcriptionStatus = .pending
+            manifest.analysisStatus = .pending
+            manifest.clarificationStatus = .pending
+            manifest.uploadStatus = .notReady
+        }
+        let api = MockDeferredAPI(uploadResults: [], processingStatus: "needs_review")
+        let outbox = makeOutbox(root: fixture.root, api: api, clock: MutableClock(14_000))
+
+        _ = await outbox.run(trigger: .sessionReady)
+
+        let manifest = try LocalSessionManifestStore.load(from: fixture.directory)
+        #expect(manifest.serverProcessingStatus == .needsReview)
+        #expect(LocalSessionStatusSummary.derive(from: manifest, hasFinalPackage: false).primary == "Clarification required")
         #expect(FileManager.default.fileExists(atPath: fixture.audioURL.path))
     }
 
@@ -492,8 +556,12 @@ private final class MockDeferredAPI: DeferredSessionAPIClient {
     private let uploadDelayNanoseconds: UInt64
     private let acceptedBeforeFailure: Bool
     private var loseFirstCreationResponse: Bool
+    private let processingStatus: String
+    private let processingResultData: Data?
     private(set) var createCallCount = 0
     private(set) var uploadCallCount = 0
+    private(set) var processingUploadCallCount = 0
+    private(set) var processingFetchCallCount = 0
     private(set) var acceptedLocalSessionIds: Set<String> = []
     private(set) var createdIdentityByLocalSessionId: [String: DeferredCloudSessionIdentity] = [:]
     private(set) var uploadedCloudSessionIds: [String] = []
@@ -502,12 +570,16 @@ private final class MockDeferredAPI: DeferredSessionAPIClient {
         uploadResults: [Result<DeferredPackageUploadReceipt, Error>],
         uploadDelayNanoseconds: UInt64 = 0,
         acceptedBeforeFailure: Bool = false,
-        loseFirstCreationResponse: Bool = false
+        loseFirstCreationResponse: Bool = false,
+        processingStatus: String = "queued",
+        processingResultData: Data? = nil
     ) {
         self.uploadResults = uploadResults
         self.uploadDelayNanoseconds = uploadDelayNanoseconds
         self.acceptedBeforeFailure = acceptedBeforeFailure
         self.loseFirstCreationResponse = loseFirstCreationResponse
+        self.processingStatus = processingStatus
+        self.processingResultData = processingResultData
     }
 
     func createDeferredCloudSession(
@@ -543,5 +615,39 @@ private final class MockDeferredAPI: DeferredSessionAPIClient {
             acceptedLocalSessionIds.insert(localSessionId)
         }
         return try result.get()
+    }
+
+    func uploadDeferredProcessingInput(
+        sessionId: String,
+        inputManifestURL: URL,
+        audioURL: URL,
+        localSessionId: String
+    ) async throws -> DeferredProcessingJobReceipt {
+        processingUploadCallCount += 1
+        acceptedLocalSessionIds.insert(localSessionId)
+        uploadedCloudSessionIds.append(sessionId)
+        return DeferredProcessingJobReceipt(
+            sessionId: sessionId,
+            respondentId: Self.respondentId,
+            status: processingStatus,
+            revision: 1,
+            resultAvailable: processingStatus == "completed"
+        )
+    }
+
+    func fetchDeferredProcessingJob(sessionId: String) async throws -> DeferredProcessingJobReceipt {
+        processingFetchCallCount += 1
+        return DeferredProcessingJobReceipt(
+            sessionId: sessionId,
+            respondentId: Self.respondentId,
+            status: processingStatus,
+            revision: 1,
+            resultAvailable: processingStatus == "completed"
+        )
+    }
+
+    func fetchDeferredProcessingResult(sessionId: String) async throws -> Data {
+        guard let processingResultData else { throw URLError(.resourceUnavailable) }
+        return processingResultData
     }
 }

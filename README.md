@@ -1,30 +1,35 @@
 # Questionnaire LLM iOS App
 
-A Swift iOS app for field researchers to collect location-based street assessments. Participants record spoken responses; the interviewer can use device GPS, an offline saved fixed survey location, or intentionally collect no location. The app transcribes audio, matches answers to survey questions with an LLM, and durably uploads one complete interview package to a backend (FastAPI + MySQL / Cloud SQL).
+A Swift iOS app for field researchers to collect location-based street assessments. The app durably saves each original `.m4a`, uploads the recording and frozen interview inputs, and immediately returns to collection. A GCP-hosted FastAPI worker uses OpenAI `gpt-4o-mini-transcribe`, performs answer analysis, requests interviewer clarification when necessary, and creates the canonical `session.json`.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
   iOS[iOS App]
-  LLM[LLM API]
+  OpenAI[OpenAI API]
   API[Survey API / FastAPI]
+  Worker[Durable processing worker]
   DB[(MySQL / Cloud SQL)]
 
-  iOS -->|transcription + chat/completions| LLM
-  iOS -->|session.json + audio.m4a| API
+  iOS -->|processing_input.json + audio.m4a| API
+  API -->|queued job| DB
+  Worker -->|claim job| DB
+  Worker -->|audio transcription + answer analysis| OpenAI
+  Worker -->|canonical session.json| API
+  iOS -->|status, clarification, result| API
   API -->|session package files| Files[(VM filesystem)]
   API -->|package index| DB
 ```
 
 | Component | Role |
 |-----------|------|
-| **iOS app** | Durable local recording, GPS/place/no-location resolution, speech-to-text, LLM matching, local JSON export, and deferred cloud upload |
-| **LLM** | OpenAI, Gemini, or a **self-hosted OpenAI-compatible** endpoint on a VM |
-| **Survey API** (`server/`) | Creates respondent/session IDs, stores each interview folder on the VM, and writes a lightweight MySQL index |
+| **iOS app** | Durable local recording, GPS/place/no-location resolution, input upload, status/result caching, and clarification UI |
+| **Processing worker** | Server-only `gpt-4o-mini-transcribe`, existing answer-analysis prompt, retries, and final package generation |
+| **Survey API** (`server/`) | Creates respondent/session IDs, durably accepts audio/input, exposes job/result APIs, and stores packages |
 | **MySQL** | Cloud SQL or any MySQL 8+ instance used as an index for session package paths and searchable metadata |
 
-You can run in **local-only** mode (export JSON on device, no server) or **full study** mode (Survey API + database + optional VM LLM).
+The original audio and `session_state.json` remain protected on the device if upload or processing fails. Transcription and answer analysis require the Survey API and worker.
 
 ---
 
@@ -36,13 +41,13 @@ You can run in **local-only** mode (export JSON on device, no server) or **full 
 - **iOS 17+** (simulator or physical device)
 - Apple Developer signing for device installs
 
-### LLM (pick one)
+### Server-side OpenAI processing
 
-- **OpenAI** API key — [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (recommended)
-- **Gemini** API key — [Google AI Studio](https://aistudio.google.com/apikey)
-- **Self-hosted** OpenAI-compatible API on a VM (Ollama + proxy, vLLM, etc.)
+- An OpenAI API key configured only in `server/.env`
+- `gpt-4o-mini-transcribe` access for speech-to-text
+- A long-running worker process in addition to the FastAPI web process
 
-### Survey API (optional, for cloud storage)
+### Survey API and worker (required for transcription and analysis)
 
 - Python 3.10+
 - MySQL database (e.g. Google Cloud SQL) with schema for `respondents` and `survey_sessions`; `schema.sql` adds the session package index table
@@ -73,7 +78,6 @@ You can run in **local-only** mode (export JSON on device, no server) or **full 
 
 6. **Grant permissions** when prompted:
    - Microphone — recording
-   - Speech recognition — transcription
    - Location — fresh GPS is attempted before recording; fallback choices permit searched-place or no-location recording
 
 ---
@@ -82,23 +86,9 @@ You can run in **local-only** mode (export JSON on device, no server) or **full 
 
 Open **Settings** (gear) from the main screen.
 
-### LLM
+### Processing server
 
-| Setting | When to use |
-|---------|-------------|
-| **Select API Provider** | OpenAI (default) or Gemini |
-| **Configure OpenAI / Gemini API Key** | Required for cloud LLM providers |
-| **Configure Custom LLM Base URL** | Point at a self-hosted OpenAI-compatible API, e.g. `http://YOUR_VM_IP:11434/v1` |
-
-**Self-hosted LLM (VM):**
-
-1. Set provider to **OpenAI**.
-2. Set **Custom LLM Base URL** to your proxy base including `/v1` (the app calls `{baseURL}/chat/completions`).
-3. Enter any non-empty API key if your proxy does not require one (e.g. `local`).
-4. Your proxy must accept model name **`gpt-4o-mini`** (hardcoded in the app) or map that name to your local model.
-5. Allow long responses: the iOS client uses a **180s** timeout for OpenAI-style requests.
-
-**Public OpenAI / Gemini:** leave Custom LLM Base URL empty and use a real API key for the selected provider.
+The app stores only the Survey API base URL and optional shared Survey API key. OpenAI credentials and model configuration are server-only and are no longer requested in the active app workflow.
 
 ### Location Mode
 
@@ -133,13 +123,13 @@ When the Survey API is configured:
 - Recording creates a local `SurveySessions/<local-session-id>/` folder and atomic `session_state.json` when audio is about to be saved; unuploaded audio and pending work are protected from automatic retention cleanup.
 - When capacity information is available, recording is blocked below a 100 MB safety threshold. Stop verifies that the original `.m4a` is readable and nonzero before the interview can reset or begin processing.
 - Before recording, the app requires an interviewer profile. If the Survey API is configured, the app resolves/registers the interviewer with `POST /interviewers/resolve`; otherwise it stores the profile locally.
-- After **Analyze Answers** from the recording review flow, the app writes `session.json` into that local session folder.
-- Each `session.json` includes `interviewer_info` with `interviewer_id`, `name`, `email`, and `identity_scope`.
-- If any matched answer has medium/low confidence or needs clarification, the interviewer can select or type a final answer before the package is saved.
-- If the Survey API is configured, the app uploads `session.json` and the original `.m4a` together to `POST /sessions/{id}/package`. Launch, foreground, and satisfied network-path callbacks only discover saved work and ask before opening the Dashboard; they do not silently process old sessions. The interviewer can process one session from its detail page or select several eligible sessions for sequential processing.
-- The server stores both files under one VM folder, writes a package index row to MySQL, indexes interviewer fields, and extracts matched answers into `analysis_answers` for easier counting/filtering.
+- After **Analyze Answers** from the recording review flow, the app preserves the `.m4a`, freezes questionnaire/respondent/location/interviewer data in `processing_input.json`, queues both files with `POST /sessions/{id}/processing-input`, and immediately returns to the next interview.
+- A separate server worker claims the durable MySQL job, transcribes with `gpt-4o-mini-transcribe`, runs answer analysis, and writes audit artifacts without changing the original audio.
+- Medium/low-confidence or explicitly ambiguous matches put the job in `needs_review`. The Dashboard fetches the server clarification requests, submits the interviewer's answers with the expected revision, and the server alone generates the final `session.json`.
+- The app polls/synchronizes lightweight status on Dashboard refresh and manual retry. When a job completes, it downloads and atomically caches the canonical server result locally for dashboard and aggregation use.
+- Completed packages include `interviewer_info`; the server indexes package metadata and extracts matched answers into `analysis_answers` for counting/filtering.
 - In Device Location mode, GPS failure does not block recording: the interviewer can retry, accept a disclosed low-accuracy point, record without GPS, search with native MapKit, or cancel. Device-GPS trajectory sampling continues about every 15 seconds when GPS is available.
-- `NWPathMonitor` only triggers pending-work discovery; actual user-approved Speech, LLM, HTTP, and server responses determine success. iOS does not guarantee processing while the app is suspended or terminated because this phase does not add a background-task mechanism.
+- `NWPathMonitor` only triggers pending-work discovery. The original recording stays safe locally, while server transcription and analysis can continue even when the app is suspended, terminated, or already recording the next interview.
 - Retry and location work are foreground-only. The app does not declare a background execution mode; a reachability callback received while inactive is ignored until a later foreground trigger.
 
 ---
@@ -172,6 +162,19 @@ SURVEY_PACKAGE_STORAGE_DIR=./survey_session_packages
 SESSION_JSON_MAX_BYTES=26214400
 
 AUDIO_MAX_BYTES=209715200
+
+# Server-only OpenAI credentials and model choices.
+OPENAI_API_KEY=your-openai-api-key
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
+OPENAI_ANALYSIS_MODEL=gpt-4o-mini
+OPENAI_REQUEST_TIMEOUT_SECONDS=180
+
+# OpenAI transcription uploads are limited separately from legacy package audio.
+TRANSCRIPTION_AUDIO_MAX_BYTES=26214400
+PROCESSING_JOB_MAX_ATTEMPTS=5
+PROCESSING_JOB_LEASE_SECONDS=600
+PROCESSING_WORKER_IDLE_SECONDS=3
 ```
 
 `SURVEY_PACKAGE_STORAGE_DIR` is read by the server from `.env`; it is not hardcoded in the iOS app. When it is set to `./survey_session_packages` and the FastAPI service runs from the `server/` directory, packages are saved under:
@@ -186,16 +189,21 @@ For a production VM, prefer an absolute path owned by the server user, for examp
 /var/lib/ios-voice-llm-survey/session-packages/
 ```
 
-Each uploaded interview gets one cloud-session folder:
+Each submitted interview gets one cloud-session folder. Audit artifacts appear as processing advances:
 
 ```text
 survey_session_packages/
 └── <cloud-session-id>/
-    ├── session.json
-    └── recording_....m4a
+    ├── processing_input.json
+    ├── recording_....m4a
+    ├── transcript.txt
+    ├── raw_transcription_response.json
+    ├── raw_analysis_response.json
+    ├── draft_analysis.json
+    └── session.json
 ```
 
-The `.m4a` recording is stored beside `session.json` in this package folder.
+`session.json` is created only after analysis is accepted or all clarification requests are resolved. The original `.m4a` is never replaced by a derived file.
 
 ### 2. Install and run
 
@@ -205,6 +213,14 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+Run the durable worker as a separate long-running service from the same release and environment:
+
+```bash
+python -m app.processing_worker
+```
+
+In production, manage the API and worker as separate `systemd`, container, or process-manager services. Do not replace the worker with a FastAPI in-process background task; queued rows and expired leases are what make processing recoverable across restarts.
 
 Verify:
 
@@ -249,6 +265,12 @@ For durable idempotent cloud-session creation, run the additive local-session ma
 python3 scripts/add_session_idempotency_schema.py
 ```
 
+For an existing database, add the durable server processing queue:
+
+```bash
+python3 scripts/add_server_processing_schema.py
+```
+
 New clients send optional `local_session_id` to `POST /sessions`. Repeating the same request returns the original respondent/session identity. Older clients may omit the field.
 
 To let the web admin dashboard attach a location to packages that originally recorded no location, run the additive admin-location migration:
@@ -261,7 +283,7 @@ The admin override is stored only in the `session_packages` index. FastAPI retur
 
 ### 4. Questionnaire rows
 
-The admin dashboard is the intended place to create, edit, publish, archive, and delete test questionnaire versions. The iOS app downloads published questionnaire versions, caches them for field use, and stores the selected questionnaire identity plus its question snapshot in each schema-v2 `session.json` so historical answers remain interpretable.
+The admin dashboard is the intended place to create, edit, publish, archive, and delete test questionnaire versions. The iOS app downloads published questionnaire versions, caches them for field use, and sends the selected questionnaire identity plus its question snapshot in the frozen processing input so each schema-v3 `session.json` remains historically interpretable.
 
 Use the seed script to publish the bundled app questionnaire as the first server-managed questionnaire version:
 
@@ -296,6 +318,11 @@ python3 scripts/backfill_analysis_answers.py
 | `POST` | `/interviewers/resolve` | Resolve/register interviewer name and normalized email; email is used as `interviewer_id` |
 | `POST` | `/sessions` | Create respondent + session |
 | `POST` | `/sessions/{session_id}/package` | Upload `session.json` plus the audio file into one server folder; MySQL stores the package index and extracted analysis rows |
+| `POST` | `/sessions/{session_id}/processing-input` | Durably upload frozen interview input plus original `.m4a` and queue server processing |
+| `GET` | `/processing-jobs/{session_id}` | Fetch lightweight queued/transcribing/analyzing/needs-review/completed/failed status |
+| `POST` | `/processing-jobs/{session_id}/retry` | Requeue a failed job after an interviewer retry |
+| `GET` | `/processing-jobs/{session_id}/result` | Return the completed canonical `session.json` |
+| `POST` | `/processing-jobs/{session_id}/clarifications` | Save interviewer corrections against an expected JSON revision |
 
 Authenticated requests send header `X-API-Key: <API_KEY>` when `API_KEY` is set in `.env`.
 Read-only admin requests use the same `X-API-Key: <API_KEY>` header when `API_KEY` is set.
@@ -317,13 +344,11 @@ The iOS app includes a native **Dashboard** button on the main screen. It is int
 - The dashboard opens immediately with sessions already available on the device.
 - The Dashboard remains accessible when there are no local or cached sessions. Its empty state explains that the device has no saved sessions and keeps Refresh available for checking the server.
 - Unfinished local work appears in a separate **Unprocessed Sessions** section. Completed/uploaded device and cached-server copies remain under **Sessions on this device**, and server-only rows remain under **Available on server**.
-- Local sessions come from `Documents/SurveySessions/<local-session-id>/session_state.json` and/or `session.json`, so recordings awaiting transcription or analysis remain visible after relaunch.
-- Rows and detail views derive truthful status from the manifest: locally saved recording, missing/low-accuracy/manual location, pending transcription/analysis/clarification/upload, scheduled retry, uploaded, or action-required failure. Local saving alone is never labeled **Uploaded** or **Analysis complete**.
-- A pending local session shows **Retry Now** when it has eligible recoverable work. Manual retry bypasses its scheduled backoff but remains protected against duplicate concurrent processing.
-- **Retry All** processes every eligible unfinished session sequentially with one confirmation. Select mode remains available when the interviewer wants to retry only a subset. It never starts concurrent Speech/LLM jobs; sessions requiring interviewer clarification remain unprocessed and must be opened individually.
-- Sequential batch transcription retains partial Speech segments until each recording reaches its final result, then fully releases that request before starting the next recording. This prevents a final callback containing only the last answer from replacing the earlier interview transcript.
-- Users never choose between retry and re-transcription. **Retry Now** and **Retry All** inspect durable state automatically: transcripts from before the corrected cumulative Speech pipeline are rebuilt once from the original `.m4a`; current transcripts resume at analysis; human clarification is preserved; and finalized current packages retry upload only.
-- When a batch retry completes analysis without needing clarification, durable processing atomically creates the same schema-v2 `session.json` package used by the interactive flow and continues directly to the existing idempotent upload path. A missing final package or pending clarification always remains actionable in the session detail view.
+- Local sessions come from `Documents/SurveySessions/<local-session-id>/session_state.json` and/or a completed `session.json`, so recordings awaiting upload or server processing remain visible after relaunch.
+- Rows and detail views show the server-backed state: not submitted, queued, transcribing, analyzing, clarification required, completed, retryable failure, or terminal failure. Local saving alone is never labeled **Uploaded** or **Analysis complete**.
+- **Retry Now**, **Retry All**, and selected-session retry submit eligible recordings sequentially and synchronize existing jobs. They never run Apple Speech or an LLM on the device.
+- A clarification-required session opens the server's question, proposed answer, and transcript segment. The interviewer can choose a structured Yes/No or multiple-choice answer, enter a custom answer, and add a note. Submission is revision-checked so stale screens cannot overwrite a newer result.
+- Completed results are downloaded from `GET /processing-jobs/{session_id}/result` and atomically cached as the same schema-v3 `session.json` used by the server package index.
 - Detail views explicitly say when the original recording is safe on the device and preserve nullable/pending location state without mislabeling searched places as GPS. Location correction is handled by the separate authenticated web admin dashboard.
 - Session rows and detail pages show the interviewer saved in `interviewer_info`.
 - Tapping the dashboard refresh button calls `GET /admin/sessions` and fetches only the lightweight server session list.
@@ -339,18 +364,9 @@ The route map is rendered natively with MapKit from `trajectory_points` in `sess
 
 ---
 
-## Self-hosted LLM on a VM (outline)
+## Server processing deployment
 
-This repo does not include the LLM proxy itself; the iOS app expects an **OpenAI-compatible** HTTP API. A typical GCP setup:
-
-1. **VM** with Ollama (or similar) listening on an internal port (e.g. `11434`).
-2. **Small proxy** (FastAPI/Flask) that exposes `POST /v1/chat/completions`, forwards to Ollama, and maps model `gpt-4o-mini` to your local model name.
-3. **Firewall**: open the proxy port to your study devices (or use VPN), not necessarily the raw Ollama port.
-4. **iOS**: Custom LLM Base URL = `http://VM_IP:PROXY_PORT/v1`, provider = OpenAI, placeholder API key if unused.
-
-Use a **different port** than the Survey API unless a reverse proxy routes `/v1` vs `/sessions` on one host.
-
-**HTTP on device:** iOS blocks cleartext HTTP unless allowed in App Transport Security. `Info.plist` may list specific VM IPs; for a new host, add an ATS exception in Xcode or serve the LLM over HTTPS.
+Run the FastAPI web process and `python -m app.processing_worker` as independent services against the same MySQL database and package directory. Only the server receives the OpenAI key. The public API should use HTTPS; if a development VM uses cleartext HTTP, its address must be covered by the app's App Transport Security configuration.
 
 ---
 
@@ -358,14 +374,14 @@ Use a **different port** than the Survey API unless a reverse proxy routes `/v1`
 
 1. **Start Interview** — configure the current interviewer if needed, confirm the visible Location Mode, and submit respondent info. Device Location attempts fresh GPS and preserves the existing fallback flow. Fixed Survey Location and No Location skip GPS prompts and trajectory tracking.
 2. **Review Recording** — after Stop & Review, play the audio without closing the review popup, then analyze or discard the recording.
-3. **Analyze Answers** — from the review popup, transcribes the recording (English locale), sends the transcript to the configured LLM, and shows matched questions and extracted answers.
-4. **Clarify Answers** — for medium/low-confidence answers or answers marked as needing clarification, select or type the final answer and optionally add a note. The JSON keeps both the original LLM answer and the manual correction.
-5. **Durable save and retry** — after analysis/clarification atomically saves `session.json`, the main screen returns to **Start Interview**. Immediate upload is attempted when configured; failures remain pending with bounded backoff and can be retried from Session Tools.
-6. **Session Tools / Dashboard** — export or share saved packages, review the separate Unprocessed Sessions section, process one session interactively, or select eligible sessions for sequential processing.
+3. **Send for Processing** — from the review popup, the app freezes interview inputs, uploads them with the original audio, and returns to **Start Interview**. The worker transcribes and analyzes independently on the server.
+4. **Clarify Answers** — Dashboard sessions marked as needing review show server-generated clarification requests. The interviewer selects or types a final answer and may add a note; the server applies it and writes the canonical JSON.
+5. **Durable save and retry** — upload failures remain safe and actionable on the device; server failures remain in the durable queue with bounded attempts and an explicit retry API.
+6. **Session Tools / Dashboard** — export or share completed packages, review Unprocessed Sessions, synchronize status, clarify one session, or retry selected uploads sequentially.
 7. **Dashboard** — reviews local/cached sessions, refreshes the lightweight server session list on demand, and downloads a full server `session.json` only when a server row is opened.
 8. **Aggregate** — summarizes analyzed local `SurveySessions/*/session.json` packages on device.
 
-If Survey API is configured, the outbox uploads the complete session package after any required clarification is resolved. It creates/reuses a cloud session keyed by the local session ID, persists those IDs, and marks upload complete only after validating the server response. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for `session.json` and the audio file. MySQL `session_packages` stores the lookup/index row, and `analysis_answers` stores one extracted row per matched question.
+The outbox creates/reuses a cloud session keyed by the local session ID and uploads immutable processing input plus audio. On the VM, look under `SURVEY_PACKAGE_STORAGE_DIR/<cloud-session-id>/` for the input, audit artifacts, final `session.json`, and audio file. MySQL `processing_jobs` holds durable workflow state, `session_packages` stores the completed package index, and `analysis_answers` stores one extracted row per matched question.
 
 The generated schema-v3 `session.json` is ordered for human review: metadata and IDs appear first, respondent/audio/location context comes next, and the transcript plus matched answers appear at the bottom. The v3 respondent shape uses optional `email` and does not emit `phone`. Every new package adds a typed `location_info` snapshot with `mode`, `collection_method`, place identity/address when applicable, and nullable coordinates. Older packages without `location_info` remain readable. Device interview paths are saved in `trajectory_points`; fixed and intentionally disabled sessions use an empty trajectory and explain why in `location_info` rather than creating fake points.
 
@@ -378,9 +394,9 @@ ios-voice-llm-survey/
 ├── CounterApp.xcodeproj
 ├── CounterApp/
 │   ├── ViewController.swift           # Main voice survey UI
-│   ├── LLMService.swift               # OpenAI / Gemini / custom base URL
-│   ├── SurveyAPIClient.swift          # FastAPI client
-│   ├── DeferredSessionOutbox.swift     # Folder scanner, backoff, cloud identity + package retry
+│   ├── LLMService.swift               # Legacy/local compatibility; not used by the active interview flow
+│   ├── SurveyAPIClient.swift          # Processing-input, status, clarification, result, and admin API client
+│   ├── DeferredSessionOutbox.swift     # Durable audio submission, status sync, and result caching
 │   ├── LocalSessionManifest.swift      # Atomic session_state.json recovery model
 │   ├── SurveyLocationSettings.swift    # Location modes, saved-place model, UserDefaults store
 │   ├── SurveyLocationViewControllers.swift # UIKit settings, MapKit search/confirmation, manual entry
@@ -393,13 +409,16 @@ ios-voice-llm-survey/
 ├── CounterAppTests/
 ├── CounterAppUITests/
 ├── server/
-│   ├── app/main.py                    # FastAPI Survey API
-│   ├── schema.sql                     # package index + questionnaire/analysis tables
+│   ├── app/main.py                    # FastAPI intake, processing-job, result, and admin API
+│   ├── app/processing_worker.py       # Separate durable queue worker process
+│   ├── app/server_processing.py       # OpenAI transcription, analysis, and package generation
+│   ├── schema.sql                     # processing queue + package/questionnaire/analysis tables
 │   ├── scripts/seed_questions.py
 │   ├── scripts/drop_legacy_storage.sql # optional post-deployment legacy table cleanup
 │   ├── scripts/add_questionnaire_schema.py
 │   ├── scripts/add_session_idempotency_schema.py
 │   ├── scripts/add_admin_location_override_schema.py
+│   ├── scripts/add_server_processing_schema.py
 │   ├── requirements.txt
 │   ├── .env.example
 │   ├── survey_session_packages/       # runtime only: uploaded session packages, ignored by Git
@@ -415,24 +434,25 @@ ios-voice-llm-survey/
 
 | Issue | What to check |
 |-------|----------------|
-| LLM timeout / failure | VM proxy running; model name mapping for `gpt-4o-mini`; timeout ≥ 180s on proxy chain |
+| Server transcription/analysis does not start | Worker process is running; `OPENAI_API_KEY` is set only on the server; `processing_jobs` migration is applied |
+| OpenAI transcription fails | Audio is below `TRANSCRIPTION_AUDIO_MAX_BYTES`; worker can reach `OPENAI_BASE_URL`; `OPENAI_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe` |
 | Survey API 401 | `X-API-Key` in app matches `API_KEY` in `.env` |
 | Dashboard server refresh fails | Survey API Base URL/Key are configured in app Settings; FastAPI is reachable; `/admin/sessions` returns 200 |
 | Dashboard server row does not open | `/admin/sessions/{session_id}` can read the server package `session.json`; `SURVEY_PACKAGE_STORAGE_DIR` points to the package folders |
-| Package upload fails with schema error | Apply `server/schema.sql` so `session_packages` and `analysis_answers` exist |
+| Processing upload fails with schema error | Apply `server/schema.sql` on a new DB or run `scripts/add_server_processing_schema.py` on an existing DB |
 | Questionnaire manager/API fails with missing columns | Run `server/scripts/add_questionnaire_schema.py` on existing databases, then seed/publish a questionnaire |
 | Cannot find answers/transcript on server | Open `SURVEY_PACKAGE_STORAGE_DIR/<session-id>/session.json`; new uploads no longer store full answers/transcripts as MySQL rows |
 | iOS cannot reach HTTP server | ATS / use HTTPS; VM firewall allows device IP |
 | Package/audio not uploading | `SURVEY_PACKAGE_STORAGE_DIR` writable on server; Survey API configured; cloud session created |
-| Retried transcript contains only the last answer | Install a build containing the batch Speech fix and press the normal **Retry Now** or **Retry All** action. The app automatically rebuilds transcripts created by the older transcription pipeline from their original audio. |
-| Session says `Final Package missing` after Retry All | Install a build containing the durable package-finalization fix and press **Retry Now** or **Retry All** again. Analysis-complete sessions now rebuild `session.json` from their manifest, transcript, matches, and original audio before upload; the recovery action is no longer hidden. |
+| Job stays queued | Start `python -m app.processing_worker` and confirm it points to the same MySQL database and `SURVEY_PACKAGE_STORAGE_DIR` as FastAPI |
+| Clarification submission returns a conflict | Refresh the Dashboard; another client or worker revision changed the job, so the stale clarification screen must not overwrite it |
 | Cleartext blocked | Add VM host to `NSAppTransportSecurity` in `Info.plist` or use TLS |
 
 ---
 
 ## Tech stack
 
-- **iOS:** Swift, UIKit, AVFoundation, Speech, Core Location, MapKit
+- **iOS:** Swift, UIKit, AVFoundation, Core Location, MapKit (the Speech framework remains only in legacy compatibility code, not the active interview path)
 - **Server:** FastAPI, uvicorn, PyMySQL, python-dotenv
 - **Database:** MySQL 8+ (Cloud SQL compatible)
 

@@ -842,6 +842,7 @@ final class LocalSessionDashboardViewController: UITableViewController {
         refreshButton.isEnabled = false
         Task { [weak self] in
             do {
+                _ = await DeferredSessionOutbox.shared.run(trigger: .foreground)
                 let response = try await SurveyAPIClient.shared.listAdminSessions()
                 LocalSessionDashboardLibrary.saveServerSummaries(response)
                 await MainActor.run {
@@ -1355,8 +1356,11 @@ final class LocalSessionDetailViewController: UITableViewController {
                 cell.accessoryType = hasMapLocation ? .disclosureIndicator : .none
                 cell.selectionStyle = hasMapLocation ? .default : .none
             case .retry:
-                content.text = "Retry Now"
-                content.secondaryText = "Resume this saved interview from its earliest incomplete stage."
+                let needsReview = session.statusSummary.primary == "Clarification required"
+                content.text = needsReview ? "Resolve Clarifications" : "Check Server / Retry Upload"
+                content.secondaryText = needsReview
+                    ? "Review the server transcript and answer analysis before final JSON is saved."
+                    : "Upload saved audio or refresh this session's server processing status."
                 content.textProperties.color = .systemBlue
             case .share:
                 content.text = "Share session.json"
@@ -1479,10 +1483,8 @@ final class LocalSessionDetailViewController: UITableViewController {
     }
 
     private func retryNow() {
-        let uploadOnly = session.packageURL != nil
-            && session.statusSummary.messages.contains("Waiting for upload")
-        if !uploadOnly {
-            onProcessRequested(session)
+        if session.statusSummary.primary == "Clarification required" {
+            resolveServerClarifications()
             return
         }
         SessionLocationRetryPresenter.resolveIfNeeded(
@@ -1492,6 +1494,152 @@ final class LocalSessionDetailViewController: UITableViewController {
             guard shouldContinue else { return }
             self?.performUploadOnlyRetry()
         }
+    }
+
+    private func resolveServerClarifications() {
+        guard let sessionId = session.serverSessionId else {
+            showStatusAlert("This saved session does not have a server processing identifier yet.")
+            return
+        }
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Loading…", style: .plain, target: nil, action: nil)
+        Task { [weak self] in
+            do {
+                let job = try await SurveyAPIClient.shared.fetchProcessingJob(sessionId: sessionId)
+                await MainActor.run {
+                    guard let self else { return }
+                    self.navigationItem.rightBarButtonItem = nil
+                    guard job.status == "needs_review", !job.clarifications.isEmpty else {
+                        self.showStatusAlert("The server is no longer waiting for clarification. Refresh the session status.")
+                        return
+                    }
+                    self.presentClarification(
+                        job: job,
+                        position: 0,
+                        answers: []
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    self?.navigationItem.rightBarButtonItem = nil
+                    self?.showStatusAlert(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func presentClarification(
+        job: SurveyAPIClient.ProcessingJobResponse,
+        position: Int,
+        answers: [SurveyAPIClient.ClarificationAnswerRequest]
+    ) {
+        guard position < job.clarifications.count else {
+            submitClarifications(job: job, answers: answers)
+            return
+        }
+        let item = job.clarifications[position]
+        let options = item.allowedAnswers.isEmpty
+            ? ""
+            : "\n\nAllowed answers:\n" + item.allowedAnswers.joined(separator: "\n")
+        let alert = UIAlertController(
+            title: "Clarification \(position + 1) of \(job.clarifications.count)",
+            message: """
+            Question:
+            \(item.questionText ?? "Unknown question")
+
+            Server answer:
+            \(item.modelAnswer ?? "No answer")
+
+            Transcript:
+            \(item.transcriptSegment)
+            \(options)
+            """,
+            preferredStyle: .alert
+        )
+        alert.addTextField { field in
+            field.placeholder = "Final answer"
+        }
+        alert.addTextField { field in
+            field.placeholder = "Optional interviewer note"
+        }
+
+        let continueWith: (String, [String]?, [String]?) -> Void = { [weak self, weak alert] answer, codes, labels in
+            guard let self else { return }
+            let custom = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let finalAnswer = custom?.isEmpty == false ? custom! : answer
+            let note = alert?.textFields?.dropFirst().first?.text
+            let request = SurveyAPIClient.ClarificationAnswerRequest(
+                clarificationId: item.clarificationId,
+                matchedIndex: item.matchedIndex,
+                finalAnswer: finalAnswer,
+                note: note,
+                selectedOptionCodes: codes,
+                selectedOptionLabels: labels
+            )
+            presentClarification(job: job, position: position + 1, answers: answers + [request])
+        }
+
+        if item.answerType.lowercased() == "yes-no" {
+            for answer in ["Yes", "No", "Not sure"] {
+                alert.addAction(UIAlertAction(title: answer, style: .default) { _ in
+                    continueWith(answer, nil, nil)
+                })
+            }
+        } else if item.answerType.lowercased() == "multiple-choice", !item.allowsMultiple {
+            for option in item.allowedAnswers.prefix(10) {
+                let components = option.split(separator: ".", maxSplits: 1).map(String.init)
+                let code = components.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? option
+                let label = components.count > 1
+                    ? components[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                    : option
+                alert.addAction(UIAlertAction(title: option, style: .default) { _ in
+                    continueWith(label, [code], [label])
+                })
+            }
+        }
+        alert.addAction(UIAlertAction(title: "Use Entered Answer", style: .default) { _ in
+            let entered = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !entered.isEmpty else {
+                self.showStatusAlert("Enter a final answer before continuing.")
+                return
+            }
+            continueWith(entered, nil, nil)
+        })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
+    }
+
+    private func submitClarifications(
+        job: SurveyAPIClient.ProcessingJobResponse,
+        answers: [SurveyAPIClient.ClarificationAnswerRequest]
+    ) {
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "Saving…", style: .plain, target: nil, action: nil)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await SurveyAPIClient.shared.submitProcessingClarifications(
+                    sessionId: job.sessionId,
+                    expectedRevision: job.revision,
+                    answers: answers
+                )
+                _ = await DeferredSessionOutbox.shared.retryNow(localSessionId: session.localSessionId)
+                if let refreshed = LocalSessionDashboardLibrary.localSession(id: session.localSessionId) {
+                    session = refreshed
+                }
+                onChanged()
+                navigationItem.rightBarButtonItem = nil
+                tableView.reloadData()
+                showStatusAlert("Clarifications were saved on the server. The canonical session JSON has been refreshed when processing completed.")
+            } catch {
+                navigationItem.rightBarButtonItem = nil
+                showStatusAlert(error.localizedDescription)
+            }
+        }
+    }
+
+    private func showStatusAlert(_ message: String) {
+        let alert = UIAlertController(title: "Session", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
     }
 
     private func performUploadOnlyRetry() {

@@ -19,6 +19,11 @@ class APISurfaceTests(unittest.TestCase):
 
         self.assertIn(("/sessions", "POST"), route_methods)
         self.assertIn(("/sessions/{session_id}/package", "POST"), route_methods)
+        self.assertIn(("/sessions/{session_id}/processing-input", "POST"), route_methods)
+        self.assertIn(("/processing-jobs/{session_id}", "GET"), route_methods)
+        self.assertIn(("/processing-jobs/{session_id}/result", "GET"), route_methods)
+        self.assertIn(("/processing-jobs/{session_id}/retry", "POST"), route_methods)
+        self.assertIn(("/processing-jobs/{session_id}/clarifications", "POST"), route_methods)
         self.assertIn(("/questionnaires/active", "GET"), route_methods)
         self.assertIn(("/admin/sessions", "GET"), route_methods)
         self.assertIn(("/admin/sessions/{session_id}/audio", "GET"), route_methods)

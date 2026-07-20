@@ -1,6 +1,5 @@
 import UIKit
 import AVFoundation
-import Speech
 
 class ViewController: UIViewController, AVAudioPlayerDelegate {
 
@@ -49,7 +48,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     override func viewDidLoad() {
         super.viewDidLoad()
         loadQuestionnaire()
-        requestSpeechPermission()
         setupUI()
         initializeSessionAndPurge()
         resetInactivityTimer()
@@ -78,7 +76,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     // MARK: - UI Setup
     private func setupUI() {
         // Set title
-        title = "Voice Recognition"
+        title = "Interview Recorder"
 
         // Add settings button to navigation bar
         let settingsButton = UIBarButtonItem(
@@ -227,23 +225,30 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         animateButton(sender)
     }
 
-    private func runLLMRecognition(
-        statusMessage: String = "Resuming saved interview processing...\nPlease wait"
-    ) {
-        guard let recordingURL, let sessionDirectoryURL else {
+    private func submitRecordingForServerProcessing() {
+        guard recordingURL != nil, sessionDirectoryURL != nil else {
             showMessage("No recording available. Please record first.")
             return
         }
         invalidateInactivityTimer()
-        statusLabel.text = statusMessage
+        let completedLocalSessionId = sessionId
+        statusLabel.text = "Recording saved locally\nSending to server for processing"
         statusLabel.textColor = .systemBlue
+        startNextParticipant()
         Task { [weak self] in
-            guard let self else { return }
-            let outcome = await DurableInterviewProcessingCoordinator.shared.resume(
-                sessionDirectoryURL: sessionDirectoryURL,
-                audioURL: recordingURL
-            )
-            self.handleDurableProcessingOutcome(outcome, recordingURL: recordingURL)
+            let summary = await DeferredSessionOutbox.shared.run(trigger: .sessionReady)
+            guard let self, let completedLocalSessionId else { return }
+            if summary.uploadedSessionIds.contains(completedLocalSessionId) {
+                statusLabel.text = "Recording uploaded\nServer transcription and analysis queued"
+                statusLabel.textColor = .systemGreen
+            } else if summary.failedSessionIds.contains(completedLocalSessionId) {
+                statusLabel.text = "Recording safe locally\nServer upload pending retry"
+                statusLabel.textColor = .systemOrange
+            } else {
+                statusLabel.text = "Recording safe locally\nOpen Dashboard to check processing"
+                statusLabel.textColor = .systemOrange
+            }
+            resetInactivityTimer()
         }
     }
 
@@ -332,7 +337,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: "Try Again", style: .default) { [weak self] _ in
-            self?.runLLMRecognition()
+            self?.submitRecordingForServerProcessing()
         })
         alert.addAction(UIAlertAction(title: "Process Later", style: .cancel) { [weak self] _ in
             self?.finishAndProcessLater(stage: stage)
@@ -510,7 +515,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     Int(key).map { ($0, value) }
                 }
             )
-            runLLMRecognition()
+            submitRecordingForServerProcessing()
         } catch {
             showBlockingRecordingError(
                 title: "Saved Interview Could Not Be Resumed",
@@ -703,11 +708,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         }
 
         let sessions = LocalSessionDashboardLibrary.loadSessions()
-        let vc = LocalSessionDashboardViewController(sessions: sessions) { [weak self] directoryURL in
-            self?.dismiss(animated: true) {
-                self?.resumeRecoverableInterview(in: directoryURL)
-            }
-        }
+        let vc = LocalSessionDashboardViewController(sessions: sessions)
         let nav = UINavigationController(rootViewController: vc)
         present(nav, animated: true)
     }
@@ -1296,21 +1297,6 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                     if !granted {
                         self.showMessage("Microphone permission is required to record")
                     }
-                }
-            }
-        }
-    }
-
-    private func requestSpeechPermission() {
-        SFSpeechRecognizer.requestAuthorization { status in
-            DispatchQueue.main.async {
-                switch status {
-                case .authorized:
-                    print("Speech recognition authorized")
-                case .denied, .restricted, .notDetermined:
-                    self.showMessage("Speech recognition permission is required for transcription")
-                @unknown default:
-                    break
                 }
             }
         }
@@ -1953,9 +1939,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
                 self?.recordingReviewViewController = nil
                 self?.audioPlayer?.stop()
                 self?.audioPlayer = nil
-                self?.runLLMRecognition(
-                    statusMessage: "Analyzing and uploading interview...\nPlease wait"
-                )
+                self?.submitRecordingForServerProcessing()
             }
         }
         review.onDiscard = { [weak self, weak review] in
@@ -3638,10 +3622,8 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     }
 
     private func checkAPIKeyStatus() {
-        let currentProvider = LLMService.shared.currentProvider
-        if !LLMService.shared.hasAPIKey() {
-            let providerName = currentProvider == .openai ? "OpenAI" : "Gemini"
-            statusLabel.text = "⚠️ Please configure \(providerName) API key in Settings"
+        if !SurveyAPIClient.shared.isConfigured() {
+            statusLabel.text = "⚠️ Please configure the Survey API in Settings"
             statusLabel.textColor = .systemOrange
         }
     }
@@ -3650,7 +3632,7 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
         let interviewer = InterviewerProfileStore.shared.currentProfile
         let alert = UIAlertController(
             title: "Settings",
-            message: "Current LLM: \(LLMService.shared.currentProvider.displayName)\nCurrent interviewer: \(interviewer?.name ?? "Not set")\nLocation Mode: \(SavedSurveyLocationStore.shared.mode.title)",
+            message: "Processing: Survey server\nCurrent interviewer: \(interviewer?.name ?? "Not set")\nLocation Mode: \(SavedSurveyLocationStore.shared.mode.title)",
             preferredStyle: .alert
         )
 
@@ -3671,22 +3653,9 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
     private func showAppConfigurationSettings() {
         let alert = UIAlertController(
             title: "App Settings",
-            message: "Current LLM: \(LLMService.shared.currentProvider.displayName)",
+            message: "Transcription and answer analysis run on the configured Survey server.",
             preferredStyle: .alert
         )
-
-        alert.addAction(UIAlertAction(title: "Select API Provider", style: .default) { [weak self] _ in
-            self?.showAPIProviderSelection()
-        })
-        alert.addAction(UIAlertAction(title: "Configure OpenAI API Key", style: .default) { [weak self] _ in
-            self?.showAPIKeyInput(for: .openai)
-        })
-        alert.addAction(UIAlertAction(title: "Configure Gemini API Key", style: .default) { [weak self] _ in
-            self?.showAPIKeyInput(for: .gemini)
-        })
-        alert.addAction(UIAlertAction(title: "Configure Custom LLM Base URL", style: .default) { [weak self] _ in
-            self?.showCustomLLMBaseURLInput()
-        })
         alert.addAction(UIAlertAction(title: "Configure Survey API Base URL", style: .default) { [weak self] _ in
             self?.showSurveyAPIBaseURLInput()
         })

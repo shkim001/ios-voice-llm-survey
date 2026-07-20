@@ -6,7 +6,9 @@ import os
 import hashlib
 import mimetypes
 import shutil
+import socket
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from uuid import UUID, uuid4
@@ -21,6 +23,16 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
+from .server_processing import (
+    ServerProcessingError,
+    analyze_transcript,
+    build_session_package,
+    clarification_requests,
+    needs_clarification,
+    transcribe_audio,
+    validate_matches,
+)
+
 MYSQL_HOST = os.environ["MYSQL_HOST"]
 MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
 MYSQL_USER = os.environ["MYSQL_USER"]
@@ -31,7 +43,15 @@ SURVEY_PACKAGE_STORAGE_DIR = Path(
     os.environ.get("SURVEY_PACKAGE_STORAGE_DIR", "survey_session_packages")
 ).expanduser()
 AUDIO_MAX_BYTES = int(os.environ.get("AUDIO_MAX_BYTES", str(200 * 1024 * 1024)))
+TRANSCRIPTION_AUDIO_MAX_BYTES = int(
+    os.environ.get("TRANSCRIPTION_AUDIO_MAX_BYTES", str(25 * 1024 * 1024))
+)
 SESSION_JSON_MAX_BYTES = int(os.environ.get("SESSION_JSON_MAX_BYTES", str(25 * 1024 * 1024)))
+PROCESSING_INPUT_MAX_BYTES = int(
+    os.environ.get("PROCESSING_INPUT_MAX_BYTES", str(25 * 1024 * 1024))
+)
+PROCESSING_JOB_MAX_ATTEMPTS = int(os.environ.get("PROCESSING_JOB_MAX_ATTEMPTS", "5"))
+PROCESSING_JOB_LEASE_SECONDS = int(os.environ.get("PROCESSING_JOB_LEASE_SECONDS", "600"))
 
 logger = logging.getLogger(__name__)
 
@@ -610,6 +630,36 @@ def write_upload_file(upload: UploadFile, destination: Path, max_bytes: int) -> 
         upload.file.close()
 
     return bytes_written, sha256.hexdigest()
+
+
+def write_json_atomic(destination: Path, payload: Any) -> tuple[int, str]:
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    sha256 = hashlib.sha256(data).hexdigest()
+    temporary_destination = destination.with_name(f".{destination.name}.{uuid4().hex}.writing")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with temporary_destination.open("xb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary_destination, destination)
+    finally:
+        temporary_destination.unlink(missing_ok=True)
+    return len(data), sha256
+
+
+def write_text_atomic(destination: Path, value: str) -> None:
+    data = value.encode("utf-8")
+    temporary_destination = destination.with_name(f".{destination.name}.{uuid4().hex}.writing")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with temporary_destination.open("xb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary_destination, destination)
+    finally:
+        temporary_destination.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -1653,3 +1703,545 @@ def upload_session_package(
         "audio_sha256": audio_sha256,
         "analysis_answer_count": analysis_answer_count,
     }
+
+
+class ClarificationAnswerPayload(BaseModel):
+    clarification_id: str = Field(min_length=1, max_length=64)
+    matched_index: int = Field(ge=0)
+    final_answer: str = Field(min_length=1, max_length=4000)
+    note: str | None = Field(default=None, max_length=4000)
+    selected_option_codes: list[str] | None = None
+    selected_option_labels: list[str] | None = None
+
+
+class ClarificationSubmissionPayload(BaseModel):
+    expected_revision: int = Field(ge=1)
+    answers: list[ClarificationAnswerPayload] = Field(min_length=1)
+
+
+def _processing_job_row(session_bytes: bytes) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM processing_jobs WHERE session_id = %s", (session_bytes,))
+            return cur.fetchone()
+
+
+def _processing_job_payload(row: dict[str, Any]) -> dict[str, Any]:
+    status = str(row.get("status") or "queued")
+    payload: dict[str, Any] = {
+        "session_id": bytes_to_uuid_hex(row["session_id"]),
+        "respondent_id": bytes_to_uuid_hex(row["respondent_id"]),
+        "local_session_id": row.get("local_session_id"),
+        "status": status,
+        "revision": int(row.get("revision") or 1),
+        "attempt_count": int(row.get("attempt_count") or 0),
+        "updated_at": row.get("updated_at").isoformat() if row.get("updated_at") else None,
+        "completed_at": row.get("completed_at").isoformat() if row.get("completed_at") else None,
+        "error_category": row.get("error_category"),
+        "error_message": row.get("error_message"),
+        "result_available": bool(row.get("result_json_path")),
+        "clarifications": [],
+    }
+    if status == "needs_review" and row.get("draft_analysis_path"):
+        draft_path = safe_package_path(row["draft_analysis_path"])
+        if draft_path and draft_path.is_file():
+            draft = json.loads(draft_path.read_text(encoding="utf-8"))
+            payload["clarifications"] = clarification_requests(
+                str(draft.get("transcript") or ""),
+                draft.get("matches") if isinstance(draft.get("matches"), list) else [],
+                draft.get("questions") if isinstance(draft.get("questions"), list) else [],
+            )
+    return payload
+
+
+@app.post("/sessions/{session_id}/processing-input", status_code=202)
+def upload_processing_input(
+    session_id: str,
+    input_manifest: UploadFile = File(...),
+    audio: UploadFile = File(...),
+    local_session_id: str | None = Form(default=None),
+    _: None = Depends(verify_api_key),
+):
+    try:
+        sid = UUID(hex=session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from exc
+    session_bytes = uuid_to_bytes(sid)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, respondent_id FROM survey_sessions WHERE id = %s", (session_bytes,)
+            )
+            session_row = cur.fetchone()
+    if not session_row:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    session_dir = SURVEY_PACKAGE_STORAGE_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    incoming_manifest = session_dir / f".processing_input.{uuid4().hex}.json"
+    incoming_audio = session_dir / f".processing_audio.{uuid4().hex}.m4a"
+    try:
+        manifest_bytes, manifest_sha256 = write_upload_file(
+            input_manifest, incoming_manifest, PROCESSING_INPUT_MAX_BYTES
+        )
+        try:
+            manifest_data = json.loads(incoming_manifest.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="input_manifest must be valid JSON") from exc
+        if not isinstance(manifest_data, dict):
+            raise HTTPException(status_code=400, detail="input_manifest must be a JSON object")
+        manifest_local_id = manifest_data.get("local_session_id")
+        if not local_session_id:
+            local_session_id = manifest_local_id
+        if not isinstance(local_session_id, str) or not local_session_id.strip():
+            raise HTTPException(status_code=400, detail="local_session_id is required")
+        if manifest_local_id and manifest_local_id != local_session_id:
+            raise HTTPException(status_code=409, detail="local_session_id does not match input_manifest")
+
+        audio_bytes, audio_sha256 = write_upload_file(
+            audio, incoming_audio, min(AUDIO_MAX_BYTES, TRANSCRIPTION_AUDIO_MAX_BYTES)
+        )
+        existing = _processing_job_row(session_bytes)
+        if existing:
+            same_input = (
+                existing.get("input_manifest_sha256") == manifest_sha256
+                and existing.get("audio_sha256") == audio_sha256
+                and existing.get("local_session_id") == local_session_id
+            )
+            if not same_input:
+                raise HTTPException(
+                    status_code=409,
+                    detail="this session already has different processing input",
+                )
+            return _processing_job_payload(existing)
+
+        canonical_manifest = session_dir / "processing_input.json"
+        audio_filename = sanitize_filename(audio.filename or "recording.m4a")
+        canonical_audio = session_dir / audio_filename
+        os.replace(incoming_manifest, canonical_manifest)
+        os.replace(incoming_audio, canonical_audio)
+        manifest_relative = str(Path(session_id) / canonical_manifest.name)
+        audio_relative = str(Path(session_id) / canonical_audio.name)
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO processing_jobs (
+                        session_id, respondent_id, local_session_id, status,
+                        input_manifest_path, input_manifest_sha256,
+                        audio_path, audio_original_filename, audio_file_size_bytes, audio_sha256
+                    ) VALUES (%s, %s, %s, 'queued', %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        session_bytes,
+                        session_row["respondent_id"],
+                        local_session_id,
+                        manifest_relative,
+                        manifest_sha256,
+                        audio_relative,
+                        audio_filename,
+                        audio_bytes,
+                        audio_sha256,
+                    ),
+                )
+        row = _processing_job_row(session_bytes)
+        if not row:
+            raise HTTPException(status_code=500, detail="processing job was not persisted")
+        return _processing_job_payload(row)
+    except HTTPException:
+        raise
+    except (IntegrityError, OperationalError) as exc:
+        logger.exception("processing input could not be indexed")
+        raise HTTPException(
+            status_code=500,
+            detail="processing job index failed; apply the server processing schema",
+        ) from exc
+    finally:
+        incoming_manifest.unlink(missing_ok=True)
+        incoming_audio.unlink(missing_ok=True)
+
+
+@app.get("/processing-jobs/{session_id}")
+def get_processing_job(session_id: str, _: None = Depends(verify_api_key)):
+    try:
+        session_bytes = uuid_to_bytes(UUID(hex=session_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from exc
+    row = _processing_job_row(session_bytes)
+    if not row:
+        raise HTTPException(status_code=404, detail="processing job not found")
+    return _processing_job_payload(row)
+
+
+@app.get("/processing-jobs/{session_id}/result")
+def get_processing_result(session_id: str, _: None = Depends(verify_api_key)):
+    try:
+        session_bytes = uuid_to_bytes(UUID(hex=session_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from exc
+    row = _processing_job_row(session_bytes)
+    if not row:
+        raise HTTPException(status_code=404, detail="processing job not found")
+    if row.get("status") != "completed" or not row.get("result_json_path"):
+        raise HTTPException(status_code=409, detail="processing result is not ready")
+    return read_package_json(row["result_json_path"])
+
+
+@app.post("/processing-jobs/{session_id}/retry", status_code=202)
+def retry_processing_job(session_id: str, _: None = Depends(verify_api_key)):
+    try:
+        session_bytes = uuid_to_bytes(UUID(hex=session_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from exc
+    row = _processing_job_row(session_bytes)
+    if not row:
+        raise HTTPException(status_code=404, detail="processing job not found")
+    if row.get("status") not in {"failed_retryable", "failed_terminal"}:
+        return _processing_job_payload(row)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE processing_jobs
+                SET status = 'queued', attempt_count = 0, next_attempt_at = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    error_category = NULL, error_message = NULL
+                WHERE session_id = %s
+                """,
+                (session_bytes,),
+            )
+    return _processing_job_payload(_processing_job_row(session_bytes))
+
+
+def _index_generated_package(
+    *,
+    cur,
+    session_bytes: bytes,
+    respondent_bytes: bytes,
+    package_data: dict[str, Any],
+    package_dir_relative: str,
+    json_relative: str,
+    json_bytes: int,
+    json_sha256: str,
+    audio_relative: str,
+    audio_filename: str,
+    audio_bytes: int,
+    audio_sha256: str,
+) -> int:
+    summary = safe_json_summary(package_data)
+    cur.execute(
+        """
+        INSERT INTO session_packages (
+            session_id, respondent_id, local_session_id, package_dir,
+            json_path, json_file_size_bytes, json_sha256,
+            audio_path, audio_original_filename, audio_file_size_bytes, audio_sha256,
+            recorded_at_ms, location_label, interviewer_id, interviewer_name,
+            interviewer_email, questionnaire_id, questionnaire_version, questionnaire_hash,
+            gps_lat, gps_lon, answer_count, transcript_chars
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            local_session_id = VALUES(local_session_id), package_dir = VALUES(package_dir),
+            json_path = VALUES(json_path), json_file_size_bytes = VALUES(json_file_size_bytes),
+            json_sha256 = VALUES(json_sha256), audio_path = VALUES(audio_path),
+            audio_original_filename = VALUES(audio_original_filename),
+            audio_file_size_bytes = VALUES(audio_file_size_bytes), audio_sha256 = VALUES(audio_sha256),
+            recorded_at_ms = VALUES(recorded_at_ms), location_label = VALUES(location_label),
+            interviewer_id = VALUES(interviewer_id), interviewer_name = VALUES(interviewer_name),
+            interviewer_email = VALUES(interviewer_email), questionnaire_id = VALUES(questionnaire_id),
+            questionnaire_version = VALUES(questionnaire_version), questionnaire_hash = VALUES(questionnaire_hash),
+            gps_lat = VALUES(gps_lat), gps_lon = VALUES(gps_lon), answer_count = VALUES(answer_count),
+            transcript_chars = VALUES(transcript_chars), uploaded_at = CURRENT_TIMESTAMP(6)
+        """,
+        (
+            session_bytes,
+            respondent_bytes,
+            summary.get("local_session_id"),
+            package_dir_relative,
+            json_relative,
+            json_bytes,
+            json_sha256,
+            audio_relative,
+            audio_filename,
+            audio_bytes,
+            audio_sha256,
+            summary.get("recorded_at_ms"),
+            summary.get("location_label"),
+            summary.get("interviewer_id"),
+            summary.get("interviewer_name"),
+            summary.get("interviewer_email"),
+            summary.get("questionnaire_id"),
+            summary.get("questionnaire_version"),
+            summary.get("questionnaire_hash"),
+            summary.get("gps_lat"),
+            summary.get("gps_lon"),
+            summary.get("answer_count"),
+            summary.get("transcript_chars"),
+        ),
+    )
+    return replace_analysis_answers(
+        cur,
+        session_bytes=session_bytes,
+        respondent_bytes=respondent_bytes,
+        package_data=package_data,
+        source_json_path=json_relative,
+    )
+
+
+def _finalize_processing_job(row: dict[str, Any], draft: dict[str, Any], revision: int) -> None:
+    session_id = bytes_to_uuid_hex(row["session_id"])
+    session_dir = SURVEY_PACKAGE_STORAGE_DIR / session_id
+    audio_path = safe_package_path(row["audio_path"])
+    if not audio_path or not audio_path.is_file():
+        raise ServerProcessingError("stored processing audio is missing")
+    package = build_session_package(
+        draft["input_manifest"],
+        cloud_session_id=session_id,
+        cloud_respondent_id=bytes_to_uuid_hex(row["respondent_id"]),
+        audio_file_name=row["audio_original_filename"],
+        audio_file_size=int(row["audio_file_size_bytes"]),
+        transcript=draft["transcript"],
+        matches=draft["matches"],
+        revision=revision,
+    )
+    result_path = session_dir / "session.json"
+    json_bytes, json_sha256 = write_json_atomic(result_path, package)
+    json_relative = str(Path(session_id) / "session.json")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            _index_generated_package(
+                cur=cur,
+                session_bytes=row["session_id"],
+                respondent_bytes=row["respondent_id"],
+                package_data=package,
+                package_dir_relative=session_id,
+                json_relative=json_relative,
+                json_bytes=json_bytes,
+                json_sha256=json_sha256,
+                audio_relative=row["audio_path"],
+                audio_filename=row["audio_original_filename"],
+                audio_bytes=int(row["audio_file_size_bytes"]),
+                audio_sha256=row["audio_sha256"],
+            )
+            cur.execute(
+                """
+                UPDATE processing_jobs
+                SET status = 'completed', revision = %s, result_json_path = %s,
+                    result_json_sha256 = %s, completed_at = CURRENT_TIMESTAMP(6),
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    error_category = NULL, error_message = NULL
+                WHERE session_id = %s
+                """,
+                (revision, json_relative, json_sha256, row["session_id"]),
+            )
+            cur.execute(
+                "UPDATE survey_sessions SET status = 'completed' WHERE id = %s",
+                (row["session_id"],),
+            )
+
+
+@app.post("/processing-jobs/{session_id}/clarifications")
+def submit_processing_clarifications(
+    session_id: str,
+    body: ClarificationSubmissionPayload,
+    _: None = Depends(verify_api_key),
+):
+    try:
+        session_bytes = uuid_to_bytes(UUID(hex=session_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from exc
+    row = _processing_job_row(session_bytes)
+    if not row:
+        raise HTTPException(status_code=404, detail="processing job not found")
+    if row.get("status") != "needs_review":
+        raise HTTPException(status_code=409, detail="processing job is not awaiting clarification")
+    if int(row.get("revision") or 1) != body.expected_revision:
+        raise HTTPException(status_code=409, detail="processing result revision changed; refresh first")
+    draft_path = safe_package_path(row.get("draft_analysis_path"))
+    if not draft_path or not draft_path.is_file():
+        raise HTTPException(status_code=500, detail="clarification draft is missing")
+    draft = json.loads(draft_path.read_text(encoding="utf-8"))
+    matches = draft.get("matches")
+    if not isinstance(matches, list):
+        raise HTTPException(status_code=500, detail="clarification draft is invalid")
+    for answer in body.answers:
+        if answer.matched_index >= len(matches):
+            raise HTTPException(status_code=400, detail="clarification matched_index is invalid")
+        match = matches[answer.matched_index]
+        if not isinstance(match, dict):
+            raise HTTPException(status_code=500, detail="clarification match is invalid")
+        match["final_answer"] = answer.final_answer.strip()
+        match["manually_clarified"] = True
+        match["clarification_note"] = answer.note.strip() if answer.note else None
+        match["answer_source"] = "manual_clarification"
+        if answer.selected_option_codes is not None:
+            match["selected_option_codes"] = answer.selected_option_codes
+        if answer.selected_option_labels is not None:
+            match["selected_option_labels"] = answer.selected_option_labels
+    next_revision = body.expected_revision + 1
+    draft["matches"] = matches
+    write_json_atomic(draft_path, draft)
+    unresolved = any(needs_clarification(match) for match in matches if isinstance(match, dict))
+    if unresolved:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE processing_jobs SET revision = %s WHERE session_id = %s",
+                    (next_revision, session_bytes),
+                )
+    else:
+        row["revision"] = next_revision
+        _finalize_processing_job(row, draft, next_revision)
+    refreshed = _processing_job_row(session_bytes)
+    return _processing_job_payload(refreshed)
+
+
+def claim_next_processing_job(worker_id: str | None = None) -> dict[str, Any] | None:
+    worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    lease_until = now + timedelta(seconds=PROCESSING_JOB_LEASE_SECONDS)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM processing_jobs
+                WHERE (
+                    status IN ('queued', 'failed_retryable')
+                    OR (status IN ('transcribing', 'analyzing') AND lease_expires_at < %s)
+                )
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= %s)
+                  AND attempt_count < %s
+                ORDER BY created_at
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+                """,
+                (now, now, PROCESSING_JOB_MAX_ATTEMPTS),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cur.execute(
+                """
+                UPDATE processing_jobs
+                SET status = 'transcribing', lease_owner = %s, lease_expires_at = %s,
+                    attempt_count = attempt_count + 1, error_category = NULL, error_message = NULL
+                WHERE session_id = %s
+                """,
+                (worker_id, lease_until, row["session_id"]),
+            )
+            row["lease_owner"] = worker_id
+            row["attempt_count"] = int(row.get("attempt_count") or 0) + 1
+            return row
+
+
+def process_claimed_job(row: dict[str, Any]) -> None:
+    session_id = bytes_to_uuid_hex(row["session_id"])
+    session_dir = SURVEY_PACKAGE_STORAGE_DIR / session_id
+    manifest_path = safe_package_path(row["input_manifest_path"])
+    audio_path = safe_package_path(row["audio_path"])
+    if not manifest_path or not manifest_path.is_file() or not audio_path or not audio_path.is_file():
+        raise ServerProcessingError("stored processing input is missing")
+    input_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    questionnaire = input_manifest.get("questionnaire_snapshot")
+    questions = questionnaire.get("questions") if isinstance(questionnaire, dict) else None
+    if not isinstance(questions, list) or not questions:
+        raise ServerProcessingError("processing input has no questionnaire questions")
+
+    transcript_path = session_dir / "transcript.txt"
+    raw_transcription_path = session_dir / "raw_transcription_response.json"
+    if transcript_path.is_file() and transcript_path.stat().st_size > 0:
+        transcript = transcript_path.read_text(encoding="utf-8").strip()
+    else:
+        transcript, raw_transcription = transcribe_audio(audio_path)
+        write_text_atomic(transcript_path, transcript)
+        write_json_atomic(raw_transcription_path, raw_transcription)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE processing_jobs
+                SET status = 'analyzing', transcript_path = %s, raw_transcription_path = %s,
+                    lease_expires_at = %s
+                WHERE session_id = %s
+                """,
+                (
+                    str(Path(session_id) / transcript_path.name),
+                    str(Path(session_id) / raw_transcription_path.name),
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    + timedelta(seconds=PROCESSING_JOB_LEASE_SECONDS),
+                    row["session_id"],
+                ),
+            )
+
+    raw_analysis_path = session_dir / "raw_analysis_response.json"
+    draft_path = session_dir / "draft_analysis.json"
+    if draft_path.is_file() and draft_path.stat().st_size > 0:
+        draft = json.loads(draft_path.read_text(encoding="utf-8"))
+    else:
+        raw_matches, raw_analysis = analyze_transcript(transcript, questions)
+        matches = validate_matches(
+            raw_matches,
+            questions,
+            input_manifest.get("interviewer_checked_option_codes_by_question_id")
+            if isinstance(input_manifest.get("interviewer_checked_option_codes_by_question_id"), dict)
+            else {},
+        )
+        draft = {
+            "input_manifest": input_manifest,
+            "transcript": transcript,
+            "questions": questions,
+            "matches": matches,
+        }
+        write_json_atomic(raw_analysis_path, raw_analysis)
+        write_json_atomic(draft_path, draft)
+
+    relative_raw_analysis = str(Path(session_id) / raw_analysis_path.name)
+    relative_draft = str(Path(session_id) / draft_path.name)
+    if any(needs_clarification(match) for match in draft["matches"]):
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE processing_jobs
+                    SET status = 'needs_review', raw_analysis_path = %s,
+                        draft_analysis_path = %s, lease_owner = NULL, lease_expires_at = NULL
+                    WHERE session_id = %s
+                    """,
+                    (relative_raw_analysis, relative_draft, row["session_id"]),
+                )
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE processing_jobs SET raw_analysis_path = %s, draft_analysis_path = %s WHERE session_id = %s",
+                (relative_raw_analysis, relative_draft, row["session_id"]),
+            )
+    row["draft_analysis_path"] = relative_draft
+    _finalize_processing_job(row, draft, int(row.get("revision") or 1))
+
+
+def fail_processing_job(row: dict[str, Any], error: Exception) -> None:
+    attempts = int(row.get("attempt_count") or 1)
+    terminal = attempts >= PROCESSING_JOB_MAX_ATTEMPTS
+    status = "failed_terminal" if terminal else "failed_retryable"
+    delay_seconds = min(7200, 30 * (2 ** max(0, attempts - 1)))
+    next_attempt = None if terminal else (
+        datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=delay_seconds)
+    )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE processing_jobs
+                SET status = %s, next_attempt_at = %s, lease_owner = NULL,
+                    lease_expires_at = NULL, error_category = %s, error_message = %s
+                WHERE session_id = %s
+                """,
+                (
+                    status,
+                    next_attempt,
+                    error.__class__.__name__[:64],
+                    str(error)[:4000],
+                    row["session_id"],
+                ),
+            )

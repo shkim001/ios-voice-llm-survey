@@ -69,6 +69,14 @@ struct DeferredPackageUploadReceipt: Equatable {
     let audioSHA256: String?
 }
 
+struct DeferredProcessingJobReceipt: Equatable {
+    let sessionId: String
+    let respondentId: String
+    let status: String
+    let revision: Int
+    let resultAvailable: Bool
+}
+
 protocol DeferredSessionAPIClient {
     var deferredProcessingIsConfigured: Bool { get }
 
@@ -84,6 +92,19 @@ protocol DeferredSessionAPIClient {
         audioURL: URL,
         localSessionId: String
     ) async throws -> DeferredPackageUploadReceipt
+
+    func uploadDeferredProcessingInput(
+        sessionId: String,
+        inputManifestURL: URL,
+        audioURL: URL,
+        localSessionId: String
+    ) async throws -> DeferredProcessingJobReceipt
+
+    func fetchDeferredProcessingJob(sessionId: String) async throws -> DeferredProcessingJobReceipt
+
+    func fetchDeferredProcessingResult(sessionId: String) async throws -> Data
+
+    func retryDeferredProcessingJob(sessionId: String) async throws -> DeferredProcessingJobReceipt
 }
 
 extension SurveyAPIClient: DeferredSessionAPIClient {
@@ -131,6 +152,76 @@ extension SurveyAPIClient: DeferredSessionAPIClient {
             audioSHA256: response.audioSha256
         )
     }
+
+    func uploadDeferredProcessingInput(
+        sessionId: String,
+        inputManifestURL: URL,
+        audioURL: URL,
+        localSessionId: String
+    ) async throws -> DeferredProcessingJobReceipt {
+        let response = try await uploadProcessingInput(
+            sessionId: sessionId,
+            inputManifestURL: inputManifestURL,
+            audioURL: audioURL,
+            localSessionId: localSessionId
+        )
+        return DeferredProcessingJobReceipt(
+            sessionId: response.sessionId,
+            respondentId: response.respondentId,
+            status: response.status,
+            revision: response.revision,
+            resultAvailable: response.resultAvailable
+        )
+    }
+
+    func fetchDeferredProcessingJob(sessionId: String) async throws -> DeferredProcessingJobReceipt {
+        let response = try await fetchProcessingJob(sessionId: sessionId)
+        return DeferredProcessingJobReceipt(
+            sessionId: response.sessionId,
+            respondentId: response.respondentId,
+            status: response.status,
+            revision: response.revision,
+            resultAvailable: response.resultAvailable
+        )
+    }
+
+    func fetchDeferredProcessingResult(sessionId: String) async throws -> Data {
+        try await fetchProcessingResult(sessionId: sessionId)
+    }
+
+    func retryDeferredProcessingJob(sessionId: String) async throws -> DeferredProcessingJobReceipt {
+        let response = try await retryProcessingJob(sessionId: sessionId)
+        return DeferredProcessingJobReceipt(
+            sessionId: response.sessionId,
+            respondentId: response.respondentId,
+            status: response.status,
+            revision: response.revision,
+            resultAvailable: response.resultAvailable
+        )
+    }
+}
+
+extension DeferredSessionAPIClient {
+    func uploadDeferredProcessingInput(
+        sessionId: String,
+        inputManifestURL: URL,
+        audioURL: URL,
+        localSessionId: String
+    ) async throws -> DeferredProcessingJobReceipt {
+        throw DeferredSessionOutboxError.serverProcessingUnavailable
+    }
+
+    func fetchDeferredProcessingJob(sessionId: String) async throws -> DeferredProcessingJobReceipt {
+        throw DeferredSessionOutboxError.serverProcessingUnavailable
+    }
+
+    func fetchDeferredProcessingResult(sessionId: String) async throws -> Data {
+        throw DeferredSessionOutboxError.serverProcessingUnavailable
+    }
+
+    func retryDeferredProcessingJob(sessionId: String) async throws -> DeferredProcessingJobReceipt {
+        throw DeferredSessionOutboxError.serverProcessingUnavailable
+    }
 }
 
 @MainActor
@@ -158,6 +249,7 @@ enum DeferredSessionOutboxError: LocalizedError {
     case invalidUploadReceipt
     case missingAudio
     case missingPackage
+    case serverProcessingUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -169,6 +261,8 @@ enum DeferredSessionOutboxError: LocalizedError {
             return "The original audio file is missing, unreadable, or empty."
         case .missingPackage:
             return "The finalized session.json package is missing or empty."
+        case .serverProcessingUnavailable:
+            return "The Survey API does not support server-side interview processing."
         }
     }
 }
@@ -290,7 +384,7 @@ final class DeferredSessionOutbox: NSObject {
         summary.scannedCount = directories.count
 
         for directoryURL in directories {
-            guard var manifest = try? LocalSessionManifestStore.loadOrSynthesize(from: directoryURL) else {
+            guard let manifest = try? LocalSessionManifestStore.loadOrSynthesize(from: directoryURL) else {
                 continue
             }
             if let requestedLocalSessionIds,
@@ -301,8 +395,18 @@ final class DeferredSessionOutbox: NSObject {
                 try? LocalSessionManifestStore.save(manifest, to: directoryURL)
             }
             guard manifest.audioStatus == .recordedLocally,
-                  manifest.uploadStatus != .uploaded,
                   let audioFileName = manifest.audioFileName else { continue }
+            let localResultExists = FileManager.default.fileExists(
+                atPath: directoryURL.appendingPathComponent("session.json").path
+            )
+            if manifest.serverProcessingStatus == .completed && localResultExists {
+                continue
+            }
+            if manifest.serverProcessingStatus == .notSubmitted,
+               manifest.uploadStatus == .uploaded,
+               localResultExists {
+                continue
+            }
             guard trigger.bypassesBackoff || isDue(manifest) else {
                 summary.deferredSessionIds.append(manifest.localSessionId)
                 continue
@@ -317,62 +421,46 @@ final class DeferredSessionOutbox: NSObject {
             summary.attemptedCount += 1
             let audioURL = directoryURL.appendingPathComponent(audioFileName)
 
-            if trigger.allowsInterviewProcessing {
-                do {
-                    if try LocalSessionManifestStore.prepareForUserRetry(in: directoryURL, now: now()) {
-                        manifest = try LocalSessionManifestStore.load(from: directoryURL)
-                    }
-                } catch {
-                    summary.failedSessionIds.append(manifest.localSessionId)
-                    continue
-                }
-            }
-
-            if !isFinalPackageReady(manifest, in: directoryURL) {
-                guard trigger.allowsInterviewProcessing else {
-                    summary.deferredSessionIds.append(manifest.localSessionId)
-                    continue
-                }
-                let outcome = await stageProcessor.resume(
-                    sessionDirectoryURL: directoryURL,
-                    audioURL: audioURL,
-                    localeIdentifier: Locale.current.identifier
-                )
-                switch outcome {
-                case .readyToUpload:
-                    manifest = (try? LocalSessionManifestStore.load(from: directoryURL)) ?? manifest
-                case .analysisCompleted(let transcript, let matchedQuestions):
-                    do {
-                        _ = try DurableSessionPackageFinalizer.finalize(
-                            sessionDirectoryURL: directoryURL,
-                            transcript: transcript,
-                            matchedQuestions: matchedQuestions,
-                            now: now()
-                        )
-                        manifest = try LocalSessionManifestStore.load(from: directoryURL)
-                    } catch {
-                        summary.failedSessionIds.append(manifest.localSessionId)
-                        continue
-                    }
-                case .failed(_, let category, _):
-                    if category != .audioUnavailable {
-                        scheduleExistingProcessingFailure(in: directoryURL)
-                    }
-                    summary.failedSessionIds.append(manifest.localSessionId)
-                    continue
-                case .deferred, .needsClarification, .alreadyRunning:
-                    summary.deferredSessionIds.append(manifest.localSessionId)
-                    continue
-                }
-            }
-
             guard apiClient.deferredProcessingIsConfigured else {
                 summary.deferredSessionIds.append(manifest.localSessionId)
                 continue
             }
             do {
-                try await uploadSession(in: directoryURL, audioURL: audioURL)
-                summary.uploadedSessionIds.append(manifest.localSessionId)
+                if manifest.serverProcessingStatus != .notSubmitted {
+                    if trigger == .manual,
+                       manifest.serverProcessingStatus == .failedRetryable
+                        || manifest.serverProcessingStatus == .failedTerminal,
+                       let cloudSessionId = manifest.cloudSessionId {
+                        let retried = try await apiClient.retryDeferredProcessingJob(
+                            sessionId: cloudSessionId
+                        )
+                        guard let retriedStatus = LocalSessionServerProcessingStatus(rawValue: retried.status) else {
+                            throw DeferredSessionOutboxError.invalidUploadReceipt
+                        }
+                        try LocalSessionManifestStore.update(in: directoryURL, now: now()) { value in
+                            value.serverProcessingStatus = retriedStatus
+                            value.serverProcessingRevision = retried.revision
+                            value.retry = LocalSessionRetryMetadata()
+                        }
+                        summary.deferredSessionIds.append(manifest.localSessionId)
+                        continue
+                    }
+                    let completed = try await synchronizeServerProcessing(
+                        manifest: manifest,
+                        in: directoryURL
+                    )
+                    if completed {
+                        summary.uploadedSessionIds.append(manifest.localSessionId)
+                    } else {
+                        summary.deferredSessionIds.append(manifest.localSessionId)
+                    }
+                } else if isFinalPackageReady(manifest, in: directoryURL) {
+                    try await uploadLegacyFinalPackage(in: directoryURL, audioURL: audioURL)
+                    summary.uploadedSessionIds.append(manifest.localSessionId)
+                } else {
+                    try await submitServerProcessing(in: directoryURL, audioURL: audioURL)
+                    summary.uploadedSessionIds.append(manifest.localSessionId)
+                }
             } catch {
                 persistUploadFailure(error, in: directoryURL)
                 summary.failedSessionIds.append(manifest.localSessionId)
@@ -391,13 +479,36 @@ final class DeferredSessionOutbox: NSObject {
         return directories.reduce(into: 0) { count, directoryURL in
             guard let manifest = try? LocalSessionManifestStore.loadOrSynthesize(from: directoryURL),
                   manifest.audioStatus == .recordedLocally,
-                  manifest.uploadStatus != .uploaded,
+                  (manifest.serverProcessingStatus != .completed || manifest.uploadStatus != .uploaded),
                   manifest.audioFileName != nil else { return }
             count += 1
         }
     }
 
-    private func uploadSession(in directoryURL: URL, audioURL: URL) async throws {
+    private func ensureCloudIdentity(
+        for manifest: LocalSessionManifest,
+        in directoryURL: URL
+    ) async throws -> LocalSessionManifest {
+        var current = manifest
+        if current.cloudSessionId == nil || current.cloudRespondentId == nil {
+            let identity = try await apiClient.createDeferredCloudSession(
+                for: current,
+                appVersion: appVersionString(),
+                locale: Locale.current.identifier
+            )
+            guard !identity.sessionId.isEmpty, !identity.respondentId.isEmpty else {
+                throw DeferredSessionOutboxError.invalidCloudIdentity
+            }
+            try LocalSessionManifestStore.update(in: directoryURL, now: now()) { value in
+                value.cloudRespondentId = identity.respondentId
+                value.cloudSessionId = identity.sessionId
+            }
+            current = try LocalSessionManifestStore.load(from: directoryURL)
+        }
+        return current
+    }
+
+    private func uploadLegacyFinalPackage(in directoryURL: URL, audioURL: URL) async throws {
         try verifyNonemptyReadableFile(audioURL, missingError: .missingAudio)
         let packageURL = directoryURL.appendingPathComponent("session.json")
         try verifyNonemptyReadableFile(packageURL, missingError: .missingPackage)
@@ -409,21 +520,7 @@ final class DeferredSessionOutbox: NSObject {
             value.retry.lastError = nil
         }
 
-        if manifest.cloudSessionId == nil || manifest.cloudRespondentId == nil {
-            let identity = try await apiClient.createDeferredCloudSession(
-                for: manifest,
-                appVersion: appVersionString(),
-                locale: Locale.current.identifier
-            )
-            guard !identity.sessionId.isEmpty, !identity.respondentId.isEmpty else {
-                throw DeferredSessionOutboxError.invalidCloudIdentity
-            }
-            try LocalSessionManifestStore.update(in: directoryURL, now: now()) { value in
-                value.cloudRespondentId = identity.respondentId
-                value.cloudSessionId = identity.sessionId
-            }
-            manifest = try LocalSessionManifestStore.load(from: directoryURL)
-        }
+        manifest = try await ensureCloudIdentity(for: manifest, in: directoryURL)
 
         guard let cloudSessionId = manifest.cloudSessionId,
               let cloudRespondentId = manifest.cloudRespondentId else {
@@ -452,6 +549,143 @@ final class DeferredSessionOutbox: NSObject {
             value.uploadStatus = .uploaded
             value.retry = LocalSessionRetryMetadata()
         }
+    }
+
+    private func submitServerProcessing(in directoryURL: URL, audioURL: URL) async throws {
+        try verifyNonemptyReadableFile(audioURL, missingError: .missingAudio)
+        var manifest = try LocalSessionManifestStore.load(from: directoryURL)
+        try LocalSessionManifestStore.update(in: directoryURL, now: now()) { value in
+            value.uploadStatus = .inProgress
+            value.retry.lastAttemptAt = now().timeIntervalSince1970
+            value.retry.lastError = nil
+        }
+        manifest = try await ensureCloudIdentity(for: manifest, in: directoryURL)
+        guard let cloudSessionId = manifest.cloudSessionId,
+              let cloudRespondentId = manifest.cloudRespondentId else {
+            throw DeferredSessionOutboxError.invalidCloudIdentity
+        }
+        let inputURL = try processingInputURL(for: manifest, in: directoryURL)
+        let receipt = try await apiClient.uploadDeferredProcessingInput(
+            sessionId: cloudSessionId,
+            inputManifestURL: inputURL,
+            audioURL: audioURL,
+            localSessionId: manifest.localSessionId
+        )
+        guard receipt.sessionId == cloudSessionId,
+              receipt.respondentId == cloudRespondentId,
+              let status = LocalSessionServerProcessingStatus(rawValue: receipt.status) else {
+            throw DeferredSessionOutboxError.invalidUploadReceipt
+        }
+        try LocalSessionManifestStore.update(in: directoryURL, now: now()) { value in
+            value.uploadStatus = .uploaded
+            value.serverProcessingStatus = status
+            value.serverProcessingRevision = receipt.revision
+            value.transcriptionStatus = status == .transcribing ? .inProgress : .pending
+            value.analysisStatus = status == .analyzing ? .inProgress : .pending
+            value.clarificationStatus = status == .completed ? .notRequired : .pending
+            value.retry = LocalSessionRetryMetadata()
+        }
+        if receipt.resultAvailable || status == .completed {
+            _ = try await synchronizeServerProcessing(
+                manifest: try LocalSessionManifestStore.load(from: directoryURL),
+                in: directoryURL
+            )
+        }
+    }
+
+    private func processingInputURL(
+        for manifest: LocalSessionManifest,
+        in directoryURL: URL
+    ) throws -> URL {
+        let fileName = manifest.processingInputFileName ?? "processing_input.json"
+        let url = directoryURL.appendingPathComponent(fileName)
+        if FileManager.default.fileExists(atPath: url.path) {
+            try verifyNonemptyReadableFile(url, missingError: .missingPackage)
+            return url
+        }
+        var input = manifest
+        input.schemaVersion = LocalSessionManifest.currentSchemaVersion
+        input.transcriptionStatus = .pending
+        input.transcriptionPipelineVersion = 0
+        input.transcriptFileName = nil
+        input.transcription = nil
+        input.transcriptionErrorCategory = nil
+        input.analysisStatus = .pending
+        input.matchedQuestions = []
+        input.analysisErrorCategory = nil
+        input.clarificationStatus = .pending
+        input.uploadStatus = .notReady
+        input.serverProcessingStatus = .notSubmitted
+        input.serverProcessingRevision = nil
+        input.processingInputFileName = nil
+        input.retry = LocalSessionRetryMetadata()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try encoder.encode(input).write(to: url, options: [.atomic])
+        try LocalSessionManifestStore.update(in: directoryURL, now: now()) { value in
+            value.processingInputFileName = fileName
+        }
+        return url
+    }
+
+    private struct ServerProcessingResult: Decodable {
+        let transcription: String
+        let matchedQuestions: [MatchedQuestion]
+
+        enum CodingKeys: String, CodingKey {
+            case transcription
+            case matchedQuestions = "matched_questions"
+        }
+    }
+
+    private func synchronizeServerProcessing(
+        manifest: LocalSessionManifest,
+        in directoryURL: URL
+    ) async throws -> Bool {
+        guard let cloudSessionId = manifest.cloudSessionId else {
+            throw DeferredSessionOutboxError.invalidCloudIdentity
+        }
+        let receipt = try await apiClient.fetchDeferredProcessingJob(sessionId: cloudSessionId)
+        guard receipt.sessionId == cloudSessionId,
+              let status = LocalSessionServerProcessingStatus(rawValue: receipt.status) else {
+            throw DeferredSessionOutboxError.invalidUploadReceipt
+        }
+        if status == .completed || receipt.resultAvailable {
+            let resultData = try await apiClient.fetchDeferredProcessingResult(sessionId: cloudSessionId)
+            let result = try JSONDecoder().decode(ServerProcessingResult.self, from: resultData)
+            try resultData.write(
+                to: directoryURL.appendingPathComponent("session.json"),
+                options: [.atomic]
+            )
+            try Data(result.transcription.utf8).write(
+                to: directoryURL.appendingPathComponent(FileTranscriptStore.fileName),
+                options: [.atomic]
+            )
+            try LocalSessionManifestStore.update(in: directoryURL, now: now()) { value in
+                value.serverProcessingStatus = .completed
+                value.serverProcessingRevision = receipt.revision
+                value.transcriptionStatus = .completed
+                value.transcriptionPipelineVersion = LocalSessionManifest.currentTranscriptionPipelineVersion
+                value.transcriptFileName = FileTranscriptStore.fileName
+                value.transcription = result.transcription
+                value.analysisStatus = .completed
+                value.matchedQuestions = result.matchedQuestions
+                value.clarificationStatus = .completed
+                value.uploadStatus = .uploaded
+                value.retry = LocalSessionRetryMetadata()
+            }
+            return true
+        }
+        try LocalSessionManifestStore.update(in: directoryURL, now: now()) { value in
+            value.serverProcessingStatus = status
+            value.serverProcessingRevision = receipt.revision
+            value.uploadStatus = .uploaded
+            value.transcriptionStatus = status == .transcribing ? .inProgress : value.transcriptionStatus
+            value.analysisStatus = status == .analyzing ? .inProgress : value.analysisStatus
+            value.clarificationStatus = status == .needsReview ? .pending : value.clarificationStatus
+            value.retry.lastError = status == .failedTerminal ? "Server processing failed; review and retry." : nil
+        }
+        return false
     }
 
     private func persistUploadFailure(_ error: Error, in directoryURL: URL) {

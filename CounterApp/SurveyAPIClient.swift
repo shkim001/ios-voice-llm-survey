@@ -158,6 +158,86 @@ final class SurveyAPIClient {
         }
     }
 
+    struct ProcessingClarification: Codable, Equatable {
+        let clarificationId: String
+        let matchedIndex: Int
+        let questionId: Int?
+        let questionText: String?
+        let answerType: String
+        let modelAnswer: String?
+        let confidence: String?
+        let transcriptSegment: String
+        let allowedAnswers: [String]
+        let allowsMultiple: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case clarificationId = "clarification_id"
+            case matchedIndex = "matched_index"
+            case questionId = "question_id"
+            case questionText = "question_text"
+            case answerType = "answer_type"
+            case modelAnswer = "model_answer"
+            case confidence
+            case transcriptSegment = "transcript_segment"
+            case allowedAnswers = "allowed_answers"
+            case allowsMultiple = "allows_multiple"
+        }
+    }
+
+    struct ProcessingJobResponse: Codable, Equatable {
+        let sessionId: String
+        let respondentId: String
+        let localSessionId: String
+        let status: String
+        let revision: Int
+        let attemptCount: Int
+        let errorCategory: String?
+        let errorMessage: String?
+        let resultAvailable: Bool
+        let clarifications: [ProcessingClarification]
+
+        enum CodingKeys: String, CodingKey {
+            case sessionId = "session_id"
+            case respondentId = "respondent_id"
+            case localSessionId = "local_session_id"
+            case status
+            case revision
+            case attemptCount = "attempt_count"
+            case errorCategory = "error_category"
+            case errorMessage = "error_message"
+            case resultAvailable = "result_available"
+            case clarifications
+        }
+    }
+
+    struct ClarificationAnswerRequest: Encodable {
+        let clarificationId: String
+        let matchedIndex: Int
+        let finalAnswer: String
+        let note: String?
+        let selectedOptionCodes: [String]?
+        let selectedOptionLabels: [String]?
+
+        enum CodingKeys: String, CodingKey {
+            case clarificationId = "clarification_id"
+            case matchedIndex = "matched_index"
+            case finalAnswer = "final_answer"
+            case note
+            case selectedOptionCodes = "selected_option_codes"
+            case selectedOptionLabels = "selected_option_labels"
+        }
+    }
+
+    private struct ClarificationSubmissionRequest: Encodable {
+        let expectedRevision: Int
+        let answers: [ClarificationAnswerRequest]
+
+        enum CodingKeys: String, CodingKey {
+            case expectedRevision = "expected_revision"
+            case answers
+        }
+    }
+
     struct AdminSessionListResponse: Codable {
         let sessions: [AdminSessionSummary]
         let count: Int
@@ -269,6 +349,80 @@ final class SurveyAPIClient {
         }
     }
 
+    func uploadProcessingInput(
+        sessionId: String,
+        inputManifestURL: URL,
+        audioURL: URL,
+        localSessionId: String
+    ) async throws -> ProcessingJobResponse {
+        let url = try makeURL(path: "/sessions/\(sessionId)/processing-input")
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var body = Data()
+        appendFormField(name: "local_session_id", value: localSessionId, to: &body, boundary: boundary)
+        appendFileField(
+            name: "input_manifest",
+            filename: inputManifestURL.lastPathComponent,
+            contentType: "application/json",
+            data: try Data(contentsOf: inputManifestURL),
+            to: &body,
+            boundary: boundary
+        )
+        appendFileField(
+            name: "audio",
+            filename: audioURL.lastPathComponent,
+            contentType: "audio/mp4",
+            data: try Data(contentsOf: audioURL),
+            to: &body,
+            boundary: boundary
+        )
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        if !apiKey.isEmpty { request.setValue(apiKey, forHTTPHeaderField: "X-API-Key") }
+        request.timeoutInterval = 180
+        let (data, response) = try await URLSession.shared.upload(for: request, from: body)
+        return try decodeResponse(ProcessingJobResponse.self, data: data, response: response)
+    }
+
+    func fetchProcessingJob(sessionId: String) async throws -> ProcessingJobResponse {
+        let data = try await requestData(method: "GET", path: "/processing-jobs/\(sessionId)")
+        do {
+            return try JSONDecoder().decode(ProcessingJobResponse.self, from: data)
+        } catch {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.decodingFailed(rawPreview: String(raw.prefix(300)))
+        }
+    }
+
+    func fetchProcessingResult(sessionId: String) async throws -> Data {
+        try await requestData(method: "GET", path: "/processing-jobs/\(sessionId)/result")
+    }
+
+    func retryProcessingJob(sessionId: String) async throws -> ProcessingJobResponse {
+        let data = try await requestData(method: "POST", path: "/processing-jobs/\(sessionId)/retry")
+        do {
+            return try JSONDecoder().decode(ProcessingJobResponse.self, from: data)
+        } catch {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.decodingFailed(rawPreview: String(raw.prefix(300)))
+        }
+    }
+
+    func submitProcessingClarifications(
+        sessionId: String,
+        expectedRevision: Int,
+        answers: [ClarificationAnswerRequest]
+    ) async throws -> ProcessingJobResponse {
+        try await requestJSON(
+            method: "POST",
+            path: "/processing-jobs/\(sessionId)/clarifications",
+            body: ClarificationSubmissionRequest(expectedRevision: expectedRevision, answers: answers),
+            responseType: ProcessingJobResponse.self
+        )
+    }
+
     func listAdminSessions() async throws -> AdminSessionListResponse {
         let data = try await requestData(method: "GET", path: "/admin/sessions")
         do {
@@ -359,6 +513,26 @@ final class SurveyAPIClient {
             throw SurveyAPIError.httpError(statusCode: http.statusCode, bodyPreview: String(raw.prefix(500)))
         }
         return data
+    }
+
+    private func decodeResponse<T: Decodable>(
+        _ type: T.Type,
+        data: Data,
+        response: URLResponse
+    ) throws -> T {
+        guard let http = response as? HTTPURLResponse else {
+            throw SurveyAPIError.invalidHTTPResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.httpError(statusCode: http.statusCode, bodyPreview: String(raw.prefix(500)))
+        }
+        do {
+            return try JSONDecoder().decode(type, from: data)
+        } catch {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw SurveyAPIError.decodingFailed(rawPreview: String(raw.prefix(300)))
+        }
     }
 
     private func appendFormField(name: String, value: String?, to body: inout Data, boundary: String) {

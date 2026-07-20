@@ -110,10 +110,13 @@ struct SavedSurveyLocationStoreTests {
             )
         )
         manifest.audioStatus = .recordedLocally
+        manifest.processingInputFileName = "processing_input.json"
         try LocalSessionManifestStore.save(manifest, to: directory)
         try Data([0x01, 0x02]).write(to: directory.appendingPathComponent("recording.m4a"))
         let packageURL = directory.appendingPathComponent("session.json")
         try Data("{\"location_info\":{}}".utf8).write(to: packageURL)
+        let processingInputURL = directory.appendingPathComponent("processing_input.json")
+        try Data("{\"location_info\":{}}".utf8).write(to: processingInputURL)
 
         let candidate = SurveyLocationAddressCandidate(
             name: "Resolved Research Site",
@@ -136,7 +139,9 @@ struct SavedSurveyLocationStoreTests {
         #expect(updated.locationCoordinates.longitude == -73.9632)
         #expect(updated.placeSnapshot?.formattedAddress == candidate.formattedAddress)
         #expect(updated.locationInfo?.savedLocationId == unresolved.id)
+        #expect(updated.processingInputFileName == nil)
         #expect(!FileManager.default.fileExists(atPath: packageURL.path))
+        #expect(!FileManager.default.fileExists(atPath: processingInputURL.path))
 
         let rebuiltURL = try DurableSessionPackageFinalizer.finalize(
             sessionDirectoryURL: directory,
