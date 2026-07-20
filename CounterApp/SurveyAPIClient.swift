@@ -217,6 +217,7 @@ final class SurveyAPIClient {
         let note: String?
         let selectedOptionCodes: [String]?
         let selectedOptionLabels: [String]?
+        let useOriginalAnswer: Bool
 
         enum CodingKeys: String, CodingKey {
             case clarificationId = "clarification_id"
@@ -225,6 +226,7 @@ final class SurveyAPIClient {
             case note
             case selectedOptionCodes = "selected_option_codes"
             case selectedOptionLabels = "selected_option_labels"
+            case useOriginalAnswer = "use_original_answer"
         }
     }
 

@@ -396,4 +396,22 @@ struct MatchedQuestion: Codable {
             answerSource: "manual_clarification"
         )
     }
+
+    func withAcceptedOriginalAnswer(note: String?) -> MatchedQuestion {
+        let cleanedNote = note?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return MatchedQuestion(
+            matchedQuestionId: matchedQuestionId,
+            matchedQuestion: matchedQuestion,
+            extractedAnswer: extractedAnswer,
+            selectedOptionCodes: selectedOptionCodes,
+            selectedOptionLabels: selectedOptionLabels,
+            confidence: confidence,
+            clarificationNeeded: clarificationNeeded,
+            finalAnswer: extractedAnswer,
+            manuallyClarified: true,
+            clarificationNote: cleanedNote?.isEmpty == false ? cleanedNote : nil,
+            answerSource: "accepted_model_answer"
+        )
+    }
 }

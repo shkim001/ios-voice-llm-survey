@@ -2909,19 +2909,23 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             textField.placeholder = "Optional clarification note"
         }
 
-        let continueWithUpdate: (String?) -> Void = { [weak self] selectedAnswer in
+        let continueWithUpdate: (String?, Bool) -> Void = { [weak self] selectedAnswer, useOriginalAnswer in
             guard let self else { return }
             var updatedQuestions = currentMatchedQuestions
             let customAnswer = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines)
             let note = alert.textFields?.dropFirst().first?.text
-            let finalAnswer = customAnswer?.isEmpty == false ? customAnswer : selectedAnswer
-            let selectedOptions = self.selectedOptions(from: finalAnswer, question: question)
-            updatedQuestions[matchedIndex] = matched.withManualClarification(
-                finalAnswer: finalAnswer,
-                note: note,
-                selectedOptionCodes: selectedOptions.codes,
-                selectedOptionLabels: selectedOptions.labels
-            )
+            if useOriginalAnswer {
+                updatedQuestions[matchedIndex] = matched.withAcceptedOriginalAnswer(note: note)
+            } else {
+                let finalAnswer = customAnswer?.isEmpty == false ? customAnswer : selectedAnswer
+                let selectedOptions = self.selectedOptions(from: finalAnswer, question: question)
+                updatedQuestions[matchedIndex] = matched.withManualClarification(
+                    finalAnswer: finalAnswer,
+                    note: note,
+                    selectedOptionCodes: selectedOptions.codes,
+                    selectedOptionLabels: selectedOptions.labels
+                )
+            }
 
             do {
                 try self.updateCurrentManifest { manifest in
@@ -2947,21 +2951,25 @@ class ViewController: UIViewController, AVAudioPlayerDelegate {
             )
         }
 
+        alert.addAction(UIAlertAction(title: "Use Original Answer", style: .default) { _ in
+            continueWithUpdate(matched.extractedAnswer, true)
+        })
+
         if question?.type.lowercased() == "yes-no" {
-            alert.addAction(UIAlertAction(title: "Yes", style: .default) { _ in continueWithUpdate("Yes") })
-            alert.addAction(UIAlertAction(title: "No", style: .default) { _ in continueWithUpdate("No") })
-            alert.addAction(UIAlertAction(title: "Not sure", style: .default) { _ in continueWithUpdate("Not sure") })
+            alert.addAction(UIAlertAction(title: "Yes", style: .default) { _ in continueWithUpdate("Yes", false) })
+            alert.addAction(UIAlertAction(title: "No", style: .default) { _ in continueWithUpdate("No", false) })
+            alert.addAction(UIAlertAction(title: "Not sure", style: .default) { _ in continueWithUpdate("Not sure", false) })
         }
 
         if let question, question.type.lowercased() == "multiple-choice", !question.allowsMultiple {
             for option in question.options.prefix(10) {
                 let code = option.code.uppercased()
-                alert.addAction(UIAlertAction(title: "\(code). \(option.text)", style: .default) { _ in continueWithUpdate(code) })
+                alert.addAction(UIAlertAction(title: "\(code). \(option.text)", style: .default) { _ in continueWithUpdate(code, false) })
             }
         }
 
         alert.addAction(UIAlertAction(title: "Use Custom Text", style: .default) { _ in
-            continueWithUpdate(nil)
+            continueWithUpdate(nil, false)
         })
         alert.addAction(UIAlertAction(title: "Leave Unresolved", style: .cancel) { [weak self] _ in
             guard let self else { return }

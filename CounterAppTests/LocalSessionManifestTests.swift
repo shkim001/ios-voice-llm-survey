@@ -561,6 +561,24 @@ struct LocalSessionManifestTests {
         #expect(LocalRecordingStoragePolicy.hasSufficientCapacity(100 * 1_024 * 1_024))
     }
 
+    @Test func acceptingOriginalAnswerPreservesModelOutputAndReviewProvenance() {
+        let original = MatchedQuestion(
+            matchedQuestionId: 4,
+            matchedQuestion: "Describe the sidewalk condition.",
+            extractedAnswer: "The sidewalk is mostly smooth with one cracked section.",
+            confidence: "medium",
+            clarificationNeeded: true
+        )
+
+        let accepted = original.withAcceptedOriginalAnswer(note: "  Good enough after review.  ")
+
+        #expect(accepted.extractedAnswer == original.extractedAnswer)
+        #expect(accepted.finalAnswer == original.extractedAnswer)
+        #expect(accepted.manuallyClarified == true)
+        #expect(accepted.clarificationNote == "Good enough after review.")
+        #expect(accepted.answerSource == "accepted_model_answer")
+    }
+
     @Test func fourPrimaryConnectivityAndLocationStatesRemainRecoverable() {
         func manifest(hasGPS: Bool, processingComplete: Bool) -> LocalSessionManifest {
             var value = LocalSessionManifest(localSessionId: UUID().uuidString, audioFileName: "recording.m4a")

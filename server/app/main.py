@@ -1712,6 +1712,7 @@ class ClarificationAnswerPayload(BaseModel):
     note: str | None = Field(default=None, max_length=4000)
     selected_option_codes: list[str] | None = None
     selected_option_labels: list[str] | None = None
+    use_original_answer: bool = False
 
 
 class ClarificationSubmissionPayload(BaseModel):
@@ -2069,10 +2070,16 @@ def submit_processing_clarifications(
         match = matches[answer.matched_index]
         if not isinstance(match, dict):
             raise HTTPException(status_code=500, detail="clarification match is invalid")
-        match["final_answer"] = answer.final_answer.strip()
+        original_answer = match.get("extracted_answer")
+        if answer.use_original_answer:
+            if not isinstance(original_answer, str) or not original_answer.strip():
+                raise HTTPException(status_code=400, detail="clarification has no original answer to accept")
+            match["final_answer"] = original_answer.strip()
+        else:
+            match["final_answer"] = answer.final_answer.strip()
         match["manually_clarified"] = True
         match["clarification_note"] = answer.note.strip() if answer.note else None
-        match["answer_source"] = "manual_clarification"
+        match["answer_source"] = "accepted_model_answer" if answer.use_original_answer else "manual_clarification"
         if answer.selected_option_codes is not None:
             match["selected_option_codes"] = answer.selected_option_codes
         if answer.selected_option_labels is not None:

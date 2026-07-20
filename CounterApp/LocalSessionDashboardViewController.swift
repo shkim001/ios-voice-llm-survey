@@ -1591,10 +1591,10 @@ final class LocalSessionDetailViewController: UITableViewController {
             field.placeholder = "Optional interviewer note"
         }
 
-        let continueWith: (String, [String]?, [String]?) -> Void = { [weak self, weak alert] answer, codes, labels in
+        let continueWith: (String, [String]?, [String]?, Bool) -> Void = { [weak self, weak alert] answer, codes, labels, useOriginalAnswer in
             guard let self else { return }
             let custom = alert?.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let finalAnswer = custom?.isEmpty == false ? custom! : answer
+            let finalAnswer = useOriginalAnswer ? answer : (custom?.isEmpty == false ? custom! : answer)
             let note = alert?.textFields?.dropFirst().first?.text
             let request = SurveyAPIClient.ClarificationAnswerRequest(
                 clarificationId: item.clarificationId,
@@ -1602,15 +1602,23 @@ final class LocalSessionDetailViewController: UITableViewController {
                 finalAnswer: finalAnswer,
                 note: note,
                 selectedOptionCodes: codes,
-                selectedOptionLabels: labels
+                selectedOptionLabels: labels,
+                useOriginalAnswer: useOriginalAnswer
             )
             presentClarification(job: job, position: position + 1, answers: answers + [request])
+        }
+
+        if let originalAnswer = item.modelAnswer?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !originalAnswer.isEmpty {
+            alert.addAction(UIAlertAction(title: "Use Original Answer", style: .default) { _ in
+                continueWith(originalAnswer, nil, nil, true)
+            })
         }
 
         if item.answerType.lowercased() == "yes-no" {
             for answer in ["Yes", "No", "Not sure"] {
                 alert.addAction(UIAlertAction(title: answer, style: .default) { _ in
-                    continueWith(answer, nil, nil)
+                    continueWith(answer, nil, nil, false)
                 })
             }
         } else if item.answerType.lowercased() == "multiple-choice", !item.allowsMultiple {
@@ -1621,7 +1629,7 @@ final class LocalSessionDetailViewController: UITableViewController {
                     ? components[1].trimmingCharacters(in: .whitespacesAndNewlines)
                     : option
                 alert.addAction(UIAlertAction(title: option, style: .default) { _ in
-                    continueWith(label, [code], [label])
+                    continueWith(label, [code], [label], false)
                 })
             }
         }
@@ -1631,7 +1639,7 @@ final class LocalSessionDetailViewController: UITableViewController {
                 self.showStatusAlert("Enter a final answer before continuing.")
                 return
             }
-            continueWith(entered, nil, nil)
+            continueWith(entered, nil, nil, false)
         })
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         present(alert, animated: true)
